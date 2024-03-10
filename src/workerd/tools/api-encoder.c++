@@ -5,20 +5,44 @@
 // Encodes JSG RTTI for all APIs defined in `src/workerd/api` to a capnp binary
 // for consumption by other tools (e.g. TypeScript type generation).
 
+// When creating type definitions, only include the API headers to reduce the clang AST dump size.
+#if !API_ENCODER_HDRS_ONLY
 #include <capnp/serialize-packed.h>
 #include <initializer_list>
 #include <kj/filesystem.h>
 #include <kj/main.h>
+#include <workerd/io/compatibility-date.h>
+#include <workerd/jsg/rtti.h>
+#endif // !API_ENCODER_HDRS_ONLY
+
 #include <workerd/api/actor.h>
+#include <workerd/api/actor-state.h>
 #include <workerd/api/analytics-engine.h>
+#include <workerd/api/cache.h>
+#include <workerd/api/crypto.h>
+#include <workerd/api/encoding.h>
 #include <workerd/api/global-scope.h>
+#include <workerd/api/html-rewriter.h>
 #include <workerd/api/kv.h>
 #include <workerd/api/queue.h>
 #include <workerd/api/r2.h>
 #include <workerd/api/r2-admin.h>
+#include <workerd/api/sockets.h>
+#include <workerd/api/scheduled.h>
+#include <workerd/api/sql.h>
+#include <workerd/api/streams/standard.h>
+#include <workerd/api/trace.h>
+#include <workerd/api/urlpattern.h>
 #include <workerd/api/node/node.h>
-#include <workerd/io/compatibility-date.h>
-#include <workerd/jsg/rtti.h>
+#include <workerd/api/hyperdrive.h>
+
+#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
+#include <workerd/api/gpu/gpu.h>
+#else
+#define EW_WEBGPU_ISOLATE_TYPES
+#endif
+
+#if !API_ENCODER_HDRS_ONLY
 
 #define EW_TYPE_GROUP_FOR_EACH(F)                                              \
   F("dom-exception", jsg::DOMException)                                        \
@@ -34,10 +58,12 @@
   F("form-data", EW_FORMDATA_ISOLATE_TYPES)                                    \
   F("html-rewriter", EW_HTML_REWRITER_ISOLATE_TYPES)                           \
   F("http", EW_HTTP_ISOLATE_TYPES)                                             \
+  F("hyperdrive", EW_HYPERDRIVE_ISOLATE_TYPES)                                 \
   F("kv", EW_KV_ISOLATE_TYPES)                                                 \
   F("queue", EW_QUEUE_ISOLATE_TYPES)                                           \
   F("r2-admin", EW_R2_PUBLIC_BETA_ADMIN_ISOLATE_TYPES)                         \
   F("r2", EW_R2_PUBLIC_BETA_ISOLATE_TYPES)                                     \
+  F("worker-rpc", EW_WORKER_RPC_ISOLATE_TYPES)                                 \
   F("scheduled", EW_SCHEDULED_ISOLATE_TYPES)                                   \
   F("streams", EW_STREAMS_ISOLATE_TYPES)                                       \
   F("trace", EW_TRACE_ISOLATE_TYPES)                                           \
@@ -47,22 +73,13 @@
   F("websocket", EW_WEBSOCKET_ISOLATE_TYPES)                                   \
   F("sql", EW_SQL_ISOLATE_TYPES)                                               \
   F("sockets", EW_SOCKETS_ISOLATE_TYPES)                                       \
-  F("node", EW_NODE_ISOLATE_TYPES)
+  F("node", EW_NODE_ISOLATE_TYPES)                                             \
+  F("webgpu", EW_WEBGPU_ISOLATE_TYPES)
 
 namespace workerd::api {
 namespace {
 
 using namespace jsg;
-
-struct ApiEncoderErrorReporterImpl : public Worker::ValidationErrorReporter {
-  void addError(kj::String error) override { errors.add(kj::mv(error)); }
-  void addHandler(kj::Maybe<kj::StringPtr> exportName,
-                  kj::StringPtr type) override {
-    KJ_UNREACHABLE;
-  }
-
-  kj::Vector<kj::String> errors;
-};
 
 struct ApiEncoderMain {
   explicit ApiEncoderMain(kj::ProcessContext &context) : context(context) {}
@@ -102,7 +119,7 @@ struct ApiEncoderMain {
     }
 
     auto output = message.initRoot<CompatibilityFlags>();
-    ApiEncoderErrorReporterImpl errorReporter;
+    SimpleWorkerErrorReporter errorReporter;
 
     compileCompatibilityFlags(compatDate, flagList.asReader(), output,
                               errorReporter, experimental,
@@ -158,8 +175,8 @@ struct ApiEncoderMain {
 
     capnp::MallocMessageBuilder flagsMessage;
     CompatibilityFlags::Reader flags;
-    KJ_IF_MAYBE (date, compatibilityDate) {
-      flags = compileFlags(flagsMessage, *date, false, {});
+    KJ_IF_SOME (date, compatibilityDate) {
+      flags = compileFlags(flagsMessage, date, false, {});
     } else {
       flags = compileAllFlags(flagsMessage);
     }
@@ -184,9 +201,9 @@ struct ApiEncoderMain {
 #undef EW_TYPE_GROUP_WRITE
 
     // Write structure groups to a file or stdout if none specifed
-    KJ_IF_MAYBE (value, output) {
+    KJ_IF_SOME (value, output) {
       auto fs = kj::newDiskFilesystem();
-      auto path = kj::Path::parse(*value);
+      auto path = kj::Path::parse(value);
       auto writeMode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY |
                        kj::WriteMode::CREATE_PARENT;
       auto file = fs->getCurrent().openFile(path, writeMode);
@@ -234,3 +251,6 @@ private:
 } // namespace workerd::api
 
 KJ_MAIN(workerd::api::ApiEncoderMain);
+
+#endif // !API_ENCODER_HDRS_ONLY
+

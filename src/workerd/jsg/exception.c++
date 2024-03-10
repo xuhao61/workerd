@@ -1,3 +1,7 @@
+// Copyright (c) 2023 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
 #include "exception.h"
 
 #include <kj/debug.h>
@@ -15,9 +19,7 @@ kj::StringPtr stripRemoteExceptionPrefix(kj::StringPtr internalMessage) {
 namespace {
   constexpr auto ERROR_PREFIX_DELIM = "; "_kj;
   constexpr auto ERROR_REMOTE_PREFIX = "remote."_kj;
-  constexpr auto ERROR_TUNNELED_PREFIX_CFJS = "cfjs."_kj;
   constexpr auto ERROR_TUNNELED_PREFIX_JSG = "jsg."_kj;
-  constexpr auto ERROR_INTERNAL_SOURCE_PREFIX_CFJS = "cfjs-internal."_kj;
   constexpr auto ERROR_INTERNAL_SOURCE_PREFIX_JSG = "jsg-internal."_kj;
 }
 
@@ -45,7 +47,7 @@ TunneledErrorType tunneledErrorType(kj::StringPtr internalMessage) {
   Properties properties;
 
   // Remove `remote.` (if present). Note that there are cases where we return a tunneled error
-  // through multiple workers, so let's be paranoid and allow for multiple "remote." prefxies.
+  // through multiple workers, so let's be paranoid and allow for multiple "remote." prefixes.
   while (internalMessage.startsWith(ERROR_REMOTE_PREFIX)) {
     properties.isFromRemote = true;
     internalMessage = internalMessage.slice(ERROR_REMOTE_PREFIX.size());
@@ -53,39 +55,19 @@ TunneledErrorType tunneledErrorType(kj::StringPtr internalMessage) {
 
   auto findDelim = [](kj::StringPtr msg) -> size_t {
     // Either return 0 if no matches or the index past the first delim if there are.
-    auto match = strstr(msg.cStr(), ERROR_PREFIX_DELIM.cStr());
-    if (!match) {
-      return 0;
-    } else {
-      return (match - msg.cStr()) + ERROR_PREFIX_DELIM.size();
+    KJ_IF_SOME(i, msg.find(ERROR_PREFIX_DELIM)) {
+      return i + ERROR_PREFIX_DELIM.size();
     }
+    return 0;
   };
 
   auto tryExtractError = [](kj::StringPtr msg, Properties properties)
       -> kj::Maybe<TunneledErrorType> {
-    if (msg.startsWith(ERROR_TUNNELED_PREFIX_CFJS)) {
-      return TunneledErrorType{
-        .message = msg.slice(ERROR_TUNNELED_PREFIX_CFJS.size()),
-        .isJsgError = true,
-        .isInternal = false,
-        .isFromRemote = properties.isFromRemote,
-        .isDurableObjectReset = properties.isDurableObjectReset,
-      };
-    }
     if (msg.startsWith(ERROR_TUNNELED_PREFIX_JSG)) {
       return TunneledErrorType{
         .message = msg.slice(ERROR_TUNNELED_PREFIX_JSG.size()),
         .isJsgError = true,
         .isInternal = false,
-        .isFromRemote = properties.isFromRemote,
-        .isDurableObjectReset = properties.isDurableObjectReset,
-      };
-    }
-    if (msg.startsWith(ERROR_INTERNAL_SOURCE_PREFIX_CFJS)) {
-      return TunneledErrorType{
-        .message = msg.slice(ERROR_INTERNAL_SOURCE_PREFIX_CFJS.size()),
-        .isJsgError = true,
-        .isInternal = true,
         .isFromRemote = properties.isFromRemote,
         .isDurableObjectReset = properties.isDurableObjectReset,
       };
@@ -100,7 +82,7 @@ TunneledErrorType tunneledErrorType(kj::StringPtr internalMessage) {
       };
     }
 
-    return nullptr;
+    return kj::none;
   };
 
   auto makeDefaultError = [](kj::StringPtr msg, Properties properties) {
@@ -119,8 +101,8 @@ TunneledErrorType tunneledErrorType(kj::StringPtr internalMessage) {
     auto idx = findDelim(internalMessage);
     while(idx) {
       internalMessage = internalMessage.slice(idx);
-      KJ_IF_MAYBE(e, tryExtractError(internalMessage, properties)) {
-        return kj::mv(*e);
+      KJ_IF_SOME(e, tryExtractError(internalMessage, properties)) {
+        return kj::mv(e);
       }
       idx = findDelim(internalMessage);
     }
@@ -137,8 +119,8 @@ TunneledErrorType tunneledErrorType(kj::StringPtr internalMessage) {
   }
 
   // There are no prefixes left, just try to extract the error.
-  KJ_IF_MAYBE(e, tryExtractError(internalMessage, properties)) {
-    return kj::mv(*e);
+  KJ_IF_SOME(e, tryExtractError(internalMessage, properties)) {
+    return kj::mv(e);
   } else {
     return makeDefaultError(internalMessage, properties);
   }
@@ -149,13 +131,13 @@ bool isTunneledException(kj::StringPtr internalMessage) {
 }
 
 bool isDoNotLogException(kj::StringPtr internalMessage) {
-  return strstr(internalMessage.cStr(), "worker_do_not_log") != nullptr;
+  return internalMessage.contains("worker_do_not_log"_kjc);
 }
 
-kj::String annotateBroken(kj::StringPtr internalMessage, kj::StringPtr brokenessReason) {
+kj::String annotateBroken(kj::StringPtr internalMessage, kj::StringPtr brokennessReason) {
   // TODO(soon) Once we support multiple brokenness reasons, we can make this much simpler.
 
-  KJ_LOG(INFO, "Annotating with brokenness", internalMessage, brokenessReason);
+  KJ_LOG(INFO, "Annotating with brokenness", internalMessage, brokennessReason);
   auto tunneledInfo = tunneledErrorType(internalMessage);
 
   kj::StringPtr remotePrefix;
@@ -174,7 +156,7 @@ kj::String annotateBroken(kj::StringPtr internalMessage, kj::StringPtr brokeness
   }
 
   return kj::str(
-      remotePrefix, brokenessReason, ERROR_PREFIX_DELIM, prefixType, internalErrorType,
+      remotePrefix, brokennessReason, ERROR_PREFIX_DELIM, prefixType, internalErrorType,
       tunneledInfo.message);
 }
 

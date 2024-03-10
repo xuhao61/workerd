@@ -8,8 +8,6 @@
 
 namespace workerd::api {
 
-using kj::uint;
-
 constexpr uint MAX_INDEXES_LENGTH = 1;
 constexpr size_t MAX_INDEX_SIZE_IN_BYTES = 96;
 constexpr uint MAX_ARRAY_MEMBERS = 20;
@@ -100,8 +98,8 @@ void setBlobs(
   uint index = 1;
   size_t sizeSum = 0;
   for (auto& item: arr) {
-    KJ_IF_MAYBE(*i, item) {
-      KJ_SWITCH_ONEOF(*i) {
+    KJ_IF_SOME(i, item) {
+      KJ_SWITCH_ONEOF(i) {
         KJ_CASE_ONEOF(val, kj::Array<kj::byte>) {
           value = val.asBytes();
         }
@@ -192,8 +190,8 @@ void setIndexes(
   }
   auto item = kj::mv(arr[0]);
   kj::ArrayPtr<kj::byte> value;
-  KJ_IF_MAYBE(*i, item) {
-    KJ_SWITCH_ONEOF(*i) {
+  KJ_IF_SOME(i, item) {
+    KJ_SWITCH_ONEOF(i) {
       KJ_CASE_ONEOF(val, kj::Array<kj::byte>) {
         value = val.asBytes();
       }

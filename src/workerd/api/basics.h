@@ -8,18 +8,20 @@
 // TODO(cleanp): Rename to events.h?
 
 #include <workerd/jsg/jsg.h>
+#include <workerd/io/io-context.h>
 #include <workerd/util/canceler.h>
 #include <kj/function.h>
 #include <kj/map.h>
 #include <workerd/io/compatibility-date.capnp.h>
-#include "actor-state.h"
 
 namespace workerd::api {
 
 class EventTarget;
 class AbortSignal;
 class AbortController;
+class ActorState;
 
+// An implementation of the Web Platform Standard Event API
 class Event: public jsg::Object {
 public:
   struct Init final {
@@ -29,30 +31,30 @@ public:
     JSG_STRUCT(bubbles, cancelable, composed);
   };
 
-  explicit Event(kj::String ownType, Init init = Init(), bool trusted = true)
+  inline explicit Event(kj::String ownType, Init init = Init(), bool trusted = true)
       : type(ownType),
         ownType(kj::mv(ownType)),
         init(init),
         trusted(trusted) {}
 
-  explicit Event(kj::StringPtr type, Init init = Init(), bool trusted = true)
+  inline explicit Event(kj::StringPtr type, Init init = Init(), bool trusted = true)
       : type(type),
         init(init),
         trusted(trusted) {}
 
-  bool isPreventDefault() { return preventedDefault; }
-  void clearPreventDefault() { preventedDefault = false; }
+  inline bool isPreventDefault() const { return preventedDefault; }
+  inline void clearPreventDefault() { preventedDefault = false; }
 
   void beginDispatch(jsg::Ref<EventTarget> target);
-  void endDispatch() { isBeingDispatched = false; }
+  inline void endDispatch() { isBeingDispatched = false; }
 
-  bool isStopped() { return stopped; }
+  inline bool isStopped() const { return stopped; }
 
   static jsg::Ref<Event> constructor(kj::String type, jsg::Optional<Init> init);
   kj::StringPtr getType();
 
-  void stopImmediatePropagation() { stopped = true; }
-  void preventDefault() { preventedDefault = true; }
+  inline void stopImmediatePropagation() { stopped = true; }
+  inline void preventDefault() { preventedDefault = true; }
 
   // The only phases we actually use are NONE and AT_TARGET but we provide
   // all of them to meet spec compliance.
@@ -63,47 +65,47 @@ public:
     BUBBLING_PHASE,
   };
 
-  int getEventPhase() const { return isBeingDispatched ? AT_TARGET : NONE; }
+  inline int getEventPhase() const { return isBeingDispatched ? AT_TARGET : NONE; }
 
   // Much of the following is not used in our implementation of Event
   // simply because we do not support the notion of bubbled events
   // (events propagated up through a hierarchy of objects). They are
   // provided to fill-out Event spec compliance.
 
-  bool getCancelBubble() { return propagationStopped; }
-  void setCancelBubble(bool stopped) { propagationStopped = stopped; }
-  void stopPropagation() { propagationStopped = true; }
-  bool getComposed() { return init.composed.orDefault(false); }
-  bool getBubbles() { return init.bubbles.orDefault(false); }
-  bool getCancelable() { return init.cancelable.orDefault(false); }
-  bool getDefaultPrevented() { return getCancelable() && preventedDefault; }
-  bool getReturnValue() { return !getDefaultPrevented(); }
+  inline bool getCancelBubble() const { return propagationStopped; }
+  inline void setCancelBubble(bool stopped) { propagationStopped = stopped; }
+  inline void stopPropagation() { propagationStopped = true; }
+  inline bool getComposed() const { return init.composed.orDefault(false); }
+  inline bool getBubbles() const { return init.bubbles.orDefault(false); }
+  inline bool getCancelable() const { return init.cancelable.orDefault(false); }
+  inline bool getDefaultPrevented() const { return getCancelable() && preventedDefault; }
+  inline bool getReturnValue() const { return !getDefaultPrevented(); }
 
-  double getTimestamp() { return 0.0; }
   // We provide the timeStamp property for spec compliance but we force
   // the value to 0.0 always because we really don't want users to rely
   // on this property for timing details.
+  inline double getTimestamp() const { return 0.0; }
 
-  bool getIsTrusted() { return trusted; }
   // What makes an Event trusted? It's pretty simple... any Event created
   // by EW internally is Trusted, any Event created using new Event() in JS
   // is not trusted.
+  inline bool getIsTrusted() const { return trusted; }
 
-  jsg::Optional<jsg::Ref<EventTarget>> getCurrentTarget();
   // The currentTarget is the EventTarget on which the Event is being
   // dispatched. This will be set every time dispatchEvent() is called
   // successfully and will remain set after dispatching is completed.
+  jsg::Optional<jsg::Ref<EventTarget>> getCurrentTarget();
 
-  kj::Array<jsg::Ref<EventTarget>> composedPath();
   // For our implementation, since we do not support hierarchical EventTargets,
   // the composedPath is always either an empty array if the Event is currently
   // not being dispatched, or an array containing only the currentTarget if
   // it is being dispatched.
+  kj::Array<jsg::Ref<EventTarget>> composedPath();
 
   JSG_RESOURCE_TYPE(Event, CompatibilityFlags::Reader flags) {
     // Previously, we were setting all properties as instance properties,
     // which broke the ability to subclass the Event object. With the
-    // feature flag set, we instead attach the properties to the
+    // compatibility flag set, we instead attach the properties to the
     // prototype.
     if (flags.getJsgPropertyOnPrototypeTemplate()) {
       JSG_READONLY_PROTOTYPE_PROPERTY(type, getType);
@@ -146,6 +148,11 @@ public:
     JSG_STATIC_CONSTANT(BUBBLING_PHASE);
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("type", ownType);
+    tracker.trackField("target", target);
+  }
+
 private:
   kj::StringPtr type;
   kj::String ownType;
@@ -166,14 +173,14 @@ class ExtendableEvent: public Event {
 public:
   using Event::Event;
 
-  static jsg::Ref<ExtendableEvent> constructor(kj::String type) = delete;
   // While ExtendableEvent is defined by the spec to be constructable, there's really not a
   // lot of reason currently to do so, especially with the restriction that waitUntil can
   // only be called on trusted events (which have to originate from within the system).
+  static jsg::Ref<ExtendableEvent> constructor(kj::String type) = delete;
 
   void waitUntil(kj::Promise<void> promise);
 
-  jsg::Optional<jsg::Ref<ActorState>> getActorState(v8::Isolate* isolate);
+  jsg::Optional<jsg::Ref<ActorState>> getActorState();
 
   JSG_RESOURCE_TYPE(ExtendableEvent) {
     JSG_INHERIT(Event);
@@ -188,78 +195,45 @@ public:
   }
 };
 
-class EventTarget: public jsg::Object {
+// An implementation of the Web Platform Standard CustomEvent API
+class CustomEvent: public Event {
 public:
+  struct CustomEventInit final {
+    jsg::Optional<bool> bubbles;
+    jsg::Optional<bool> cancelable;
+    jsg::Optional<bool> composed;
+    jsg::Optional<jsg::JsRef<jsg::JsValue>> detail;
+    JSG_STRUCT(bubbles, cancelable, composed, detail);
 
-  class NativeHandler {
-    // RAII-style listener that can be attached to an EventTarget.
-  public:
-    using Signature = void(jsg::Ref<Event>);
-
-    inline explicit NativeHandler(
-        jsg::Lock& js,
-        EventTarget& target,
-        kj::String type,
-        jsg::Function<Signature> func,
-        bool once = false)
-        : type(kj::mv(type)),
-          target(target),
-          func(kj::mv(func)),
-          once(once) {
-      KJ_ASSERT_NONNULL(this->target).addNativeListener(js, *this);
-    }
-
-    inline ~NativeHandler() noexcept(false) { detach(); }
-
-    NativeHandler(NativeHandler&&) = default;
-    NativeHandler& operator=(NativeHandler&&) = default;
-
-    inline void detach(bool deferClearData = false) {
-      KJ_IF_MAYBE(t, target) {
-        t->removeNativeListener(*this);
-        target = nullptr;
-        // If deferClearData is true, we're going to wait to clear
-        // the maybeData field until after the func is invoked. This
-        // is because detach will be called immediately before the
-        // operator() using the maybeData is called.
-        if (!deferClearData) {
-          auto drop KJ_UNUSED = kj::mv(func);
-        }
-      }
-    }
-
-    inline void operator()(jsg::Lock& js, jsg::Ref<Event> event) {
-      if (once && !isAttached()) {
-        // Arrange to drop the func after running it. Note that the function itself is allowed to
-        // delete the NativeHandler, so we have to pull it off in advance, rather than after the
-        // call.
-        auto funcToDrop = kj::mv(func);
-        funcToDrop(js, kj::mv(event));
-      } else {
-        func(js, kj::mv(event));
-      }
-    }
-
-    inline bool isAttached() { return target != nullptr; }
-
-    inline uint hashCode() const {
-      return kj::hashCode(this);
-    }
-
-    // The visitForGc here must be called from EventTarget's visitForGc implementation.
-    inline void visitForGc(jsg::GcVisitor& visitor) {
-      visitor.visit(func);
-    }
-
-  private:
-    kj::String type;
-    kj::Maybe<EventTarget&> target;
-    jsg::Function<Signature> func;
-    bool once;
-
-    friend class EventTarget;
+    operator Event::Init();
   };
 
+  explicit CustomEvent(kj::String ownType, CustomEventInit init = CustomEventInit());
+
+  static jsg::Ref<CustomEvent> constructor(jsg::Lock& js, kj::String type,
+                                           jsg::Optional<CustomEventInit> init);
+
+  jsg::Optional<jsg::JsValue> getDetail(jsg::Lock& js);
+
+  JSG_RESOURCE_TYPE(CustomEvent) {
+    JSG_INHERIT(Event);
+    JSG_READONLY_PROTOTYPE_PROPERTY(detail, getDetail);
+    JSG_TS_OVERRIDE(<T = any> {
+      get detail(): T;
+    });
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("detail", detail);
+  }
+
+private:
+  jsg::Optional<jsg::JsRef<jsg::JsValue>> detail;
+};
+
+// An implementation of the Web Platform Standard EventTarget API
+class EventTarget: public jsg::Object {
+public:
   ~EventTarget() noexcept(false);
 
   size_t getHandlerCount(kj::StringPtr type) const;
@@ -268,9 +242,9 @@ public:
 
   bool dispatchEventImpl(jsg::Lock& js, jsg::Ref<Event> event);
 
-  void removeAllHandlers() { typeMap.clear(); }
+  inline void removeAllHandlers() { typeMap.clear(); }
 
-  void enableWarningOnSpecialEvents() { warnOnSpecialEvents = true; }
+  inline void enableWarningOnSpecialEvents() { warnOnSpecialEvents = true; }
 
   // ---------------------------------------------------------------------------
   // JS API
@@ -333,7 +307,52 @@ public:
 
   static jsg::Ref<EventTarget> constructor();
 
+  // Registers a lambda that will be called when the given event type is emitted.
+  // The handler will be registered for as long as the returned kj::Own<void>
+  // handle is held. If the EventTarget is destroyed while the native handler handle
+  // is held, it will be automatically detached.
+  //
+  // The caller must not do anything with the returned Own<void> except drop it. This is why it
+  // is Own<void> and not Own<NativeHandler>.
+  kj::Own<void> newNativeHandler(jsg::Lock& js,
+      kj::String type,
+      jsg::Function<void(jsg::Ref<Event>)> func,
+      bool once = false);
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
+
 private:
+  // RAII-style listener that can be attached to an EventTarget.
+  class NativeHandler {
+  public:
+    using Signature = void(jsg::Ref<Event>);
+    NativeHandler(jsg::Lock& js, EventTarget& target, kj::String type,
+        jsg::Function<Signature> func, bool once = false);
+    ~NativeHandler() noexcept(false);
+    KJ_DISALLOW_COPY_AND_MOVE(NativeHandler);
+
+    void operator()(jsg::Lock&js, jsg::Ref<Event> event);
+
+    uint hashCode() const;
+
+    void visitForGc(jsg::GcVisitor& visitor);
+  private:
+    void detach();
+
+    kj::String type;
+    struct State {
+      // target's destructor will null out `state`, so this is OK to be a bare reference.
+      EventTarget& target;
+
+      jsg::Function<Signature> func;
+    };
+
+    kj::Maybe<State> state;
+    bool once;
+
+    friend class EventTarget;
+  };
+
   void addNativeListener(jsg::Lock& js, NativeHandler& handler);
   bool removeNativeListener(NativeHandler& handler);
 
@@ -341,103 +360,75 @@ private:
     struct JavaScriptHandler {
       jsg::HashableV8Ref<v8::Object> identity;
       HandlerFunction callback;
-      kj::Maybe<kj::Own<NativeHandler>> abortHandler;
-      // If the event handler is registered with an AbortSignal, then the abortHandler
-      // is set and will ensure that the handler is removed correctly.
+
+      // If the event handler is registered with an AbortSignal, then the abortHandler points
+      // at the NativeHandler representing that registration, so that if this object is GC'd before
+      // the AbortSignal is signaleled, we unregister ourselves from listening on it. Note that
+      // this is Own<void> for the same reason newNativeHandler() returns Own<void>: We are not
+      // supposed to do anything with this except drop it.
+      kj::Maybe<kj::Own<void>> abortHandler;
 
       void visitForGc(jsg::GcVisitor& visitor) {
         visitor.visit(identity, callback);
+
+        // Note that we intentionally do NOT visit `abortHandler`. This is because the JS handles
+        // held by `abortHandler` are not ever accessed by this path. Instead, they are accessed
+        // by the AbortSignal, if and when it fires. So it is the AbortSignal's responsibility to
+        // visit the NativeHandler's content.
       }
+
+      kj::StringPtr jsgGetMemoryName() const { return "JavaScriptHandler"_kjc; }
+      size_t jsgGetMemorySelfSize() const;
+      void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const;
     };
 
     struct NativeHandlerRef {
       NativeHandler& handler;
     };
 
-    using Handler = kj::OneOf<JavaScriptHandler, NativeHandlerRef>;
     // An EventHandler can be backed by either a JavaScript Handler (which is either a
     // function or an object) or a native handler. The insertion order matters here so
     // we maintain a single table.
+    using Handler = kj::OneOf<JavaScriptHandler, NativeHandlerRef>;
 
     Handler handler;
 
-    bool once = false;
     // When once is true, the handler will be removed after it is invoked one time.
+    bool once = false;
+
+    EventHandler(Handler handler, bool once)
+        : handler(kj::mv(handler)), once(once) {}
+    KJ_DISALLOW_COPY_AND_MOVE(EventHandler);
+
+    kj::StringPtr jsgGetMemoryName() const { return "EventHandler"_kjc; }
+    size_t jsgGetMemorySelfSize() const;
+    void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const;
   };
 
   struct EventHandlerHashCallbacks {
-    auto& keyForRow(const EventHandler& row) const {
-      // The key for each EventHandler struct is the handler, which is a kj::OneOf
-      // of either a JavaScriptHandler or NativeHandler.
-      return row.handler;
-    }
-
-    inline bool matches(const EventHandler& a, const jsg::HashableV8Ref<v8::Object>& b) const {
-      KJ_IF_MAYBE(jsA, a.handler.tryGet<EventHandler::JavaScriptHandler>()) {
-        return jsA->identity == b;
-      }
-      return false;
-    }
-
-    inline bool matches(const EventHandler& a, const NativeHandler& b) const {
-      KJ_IF_MAYBE(ref, a.handler.tryGet<EventHandler::NativeHandlerRef>()) {
-        return &ref->handler == &b;
-      }
-      return false;
-    }
-
-    inline bool matches(const EventHandler& a, const EventHandler::NativeHandlerRef& b) const {
-      return matches(a, b.handler);
-    }
-
-    inline bool matches(const EventHandler& a, const EventHandler::Handler& b) const {
-      KJ_SWITCH_ONEOF(b) {
-        KJ_CASE_ONEOF(jsB, EventHandler::JavaScriptHandler) {
-          return matches(a, jsB.identity);
-        }
-        KJ_CASE_ONEOF(nativeB, EventHandler::NativeHandlerRef) {
-          return matches(a, nativeB);
-        }
-      }
-      KJ_UNREACHABLE;
-    }
-
-    inline uint hashCode(const jsg::HashableV8Ref<v8::Object>& obj) const {
-      return obj.hashCode();
-    }
-
-    inline uint hashCode(const NativeHandler& handler) const {
-      return handler.hashCode();
-    }
-
-    inline uint hashCode(const EventHandler::NativeHandlerRef& handler) const {
-      return hashCode(handler.handler);
-    }
-
-    inline uint hashCode(const EventHandler::JavaScriptHandler& handler) const {
-      return hashCode(handler.identity);
-    }
-
-    inline uint hashCode(const EventHandler::Handler& handler) const {
-      KJ_SWITCH_ONEOF(handler) {
-        KJ_CASE_ONEOF(js, EventHandler::JavaScriptHandler) {
-          return hashCode(js);
-        }
-        KJ_CASE_ONEOF(native, EventHandler::NativeHandlerRef) {
-          return hashCode(native);
-        }
-      }
-      KJ_UNREACHABLE;
-    }
+    const EventHandler::Handler& keyForRow(const kj::Own<EventHandler>& row) const;
+    bool matches(const kj::Own<EventHandler>& a, const jsg::HashableV8Ref<v8::Object>& b) const;
+    bool matches(const kj::Own<EventHandler>& a, const NativeHandler& b) const;
+    bool matches(const kj::Own<EventHandler>& a, const EventHandler::NativeHandlerRef& b) const;
+    bool matches(const kj::Own<EventHandler>& a, const EventHandler::Handler& b) const;
+    uint hashCode(const jsg::HashableV8Ref<v8::Object>& obj) const;
+    uint hashCode(const NativeHandler& handler) const;
+    uint hashCode(const EventHandler::NativeHandlerRef& handler) const;
+    uint hashCode(const EventHandler::JavaScriptHandler& handler) const;
+    uint hashCode(const EventHandler::Handler& handler) const;
   };
 
   struct EventHandlerSet {
-    kj::Table<EventHandler,
+    kj::Table<kj::Own<EventHandler>,
               kj::HashIndex<EventHandlerHashCallbacks>,
               kj::InsertionOrderIndex> handlers;
 
     EventHandlerSet()
         : handlers(EventHandlerHashCallbacks(), {}) {}
+
+    kj::StringPtr jsgGetMemoryName() const { return "EventHandlerSet"_kjc; }
+    size_t jsgGetMemorySelfSize() const;
+    void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const;
   };
 
   EventHandlerSet& getOrCreate(kj::StringPtr str) KJ_LIFETIMEBOUND;
@@ -445,35 +436,30 @@ private:
   jsg::PropertyReflection<kj::OneOf<HandlerFunction, jsg::Value>> onEvents;
 
   kj::HashMap<kj::String, EventHandlerSet> typeMap;
-  bool warnOnSpecialEvents = false;
+
   // When using module syntax, the "fetch", "scheduled", "trace", etc.
   // events are handled by exports rather than events. When warnOnSpecialEvents is true,
   // when using module syntax, attempts to register event handlers for these special
   // types of events will result in a warning being emitted.
+  bool warnOnSpecialEvents = false;
 
-  bool warnOnHandlerReturn = true;
   // Event handlers are not supposed to return values. The first time one does, we'll
   // emit a warning to help users debug things but we'll otherwise ignore it.
+  bool warnOnHandlerReturn = true;
 
   void visitForGc(jsg::GcVisitor& visitor);
 
   friend class NativeHandler;
 };
 
+// An implementation of the Web Platform Standard AbortSignal API
 class AbortSignal final: public EventTarget {
 public:
   enum class Flag { NONE, NEVER_ABORTS };
 
-  AbortSignal(kj::Maybe<kj::Exception> exception = nullptr,
-              jsg::Optional<jsg::V8Ref<v8::Value>> maybeReason = nullptr,
-              Flag flag = Flag::NONE) :
-      canceler(IoContext::current().addObject(
-          kj::refcounted<RefcountedCanceler>(kj::cp(exception)))),
-      flag(flag) {
-    KJ_IF_MAYBE(r, maybeReason) {
-      reason = kj::mv(*r);
-    }
-  }
+  AbortSignal(kj::Maybe<kj::Exception> exception = kj::none,
+              jsg::Optional<jsg::JsRef<jsg::JsValue>> maybeReason = kj::none,
+              Flag flag = Flag::NONE);
 
   // The AbortSignal explicitly does not expose a constructor(). It is
   // illegal for user code to create an AbortSignal directly.
@@ -481,30 +467,26 @@ public:
 
   bool getAborted() { return canceler->isCanceled(); }
 
-  v8::Local<v8::Value> getReason(jsg::Lock& js) {
-    KJ_IF_MAYBE(r, reason) {
-      return r->getHandle(js);
-    }
-    return js.v8Undefined();
-  }
+  jsg::JsValue getReason(jsg::Lock& js);
 
-  void throwIfAborted(jsg::Lock& js);
   // Will synchronously throw an error if the abort signal has been triggered.
+  void throwIfAborted(jsg::Lock& js);
 
-  bool getNeverAborts() const { return flag == Flag::NEVER_ABORTS; }
+  inline bool getNeverAborts() const { return flag == Flag::NEVER_ABORTS; }
 
-  static jsg::Ref<AbortSignal> abort(
-      jsg::Lock& js,
-      jsg::Optional<v8::Local<v8::Value>> reason);
   // The static abort() function here returns an AbortSignal that
   // has been pre-emptively aborted. It's useful when it might still
   // be desirable to kick off an async process while communicating
   // that it shouldn't continue.
+  static jsg::Ref<AbortSignal> abort(
+      jsg::Lock& js,
+      jsg::Optional<jsg::JsValue> reason);
 
-  static jsg::Ref<AbortSignal> timeout(jsg::Lock& js, double delay);
   // Returns an AbortSignal that is triggered after delay milliseconds.
+  static jsg::Ref<AbortSignal> timeout(jsg::Lock& js, double delay);
 
-  void triggerAbort(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> maybeReason);
+  void triggerAbort(jsg::Lock& js,
+                    jsg::Optional<kj::OneOf<kj::Exception, jsg::JsValue>> maybeReason);
 
   static jsg::Ref<AbortSignal> any(
       jsg::Lock& js,
@@ -537,8 +519,8 @@ public:
   static kj::Promise<T> maybeCancelWrap(
       kj::Maybe<jsg::Ref<AbortSignal>>& signal,
       kj::Promise<T> promise) {
-    KJ_IF_MAYBE(s, signal) {
-      return (*s)->wrap(kj::mv(promise));
+    KJ_IF_SOME(s, signal) {
+      return s->wrap(kj::mv(promise));
     } else {
       return kj::mv(promise);
     }
@@ -546,20 +528,28 @@ public:
 
   static kj::Exception abortException(
       jsg::Lock& js,
-      jsg::Optional<v8::Local<v8::Value>> reason = nullptr);
+      jsg::Optional<kj::OneOf<kj::Exception, jsg::JsValue>> reason = kj::none);
 
   RefcountedCanceler& getCanceler();
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    EventTarget::visitForMemoryInfo(tracker);
+    tracker.trackInlineFieldWithSize("IoOwn<RefcountedCanceler>",
+        sizeof(IoOwn<RefcountedCanceler>));
+    tracker.trackField("reason", reason);
+  }
 
 private:
   IoOwn<RefcountedCanceler> canceler;
   Flag flag;
-  kj::Maybe<jsg::V8Ref<v8::Value>> reason;
+  kj::Maybe<jsg::JsRef<jsg::JsValue>> reason;
 
   void visitForGc(jsg::GcVisitor& visitor);
 
   friend class AbortController;
 };
 
+// An implementation of the Web Platform Standard AbortController API
 class AbortController final: public jsg::Object {
 public:
   explicit AbortController()
@@ -571,7 +561,7 @@ public:
 
   jsg::Ref<AbortSignal> getSignal() { return signal.addRef(); }
 
-  void abort(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> reason);
+  void abort(jsg::Lock& js, jsg::Optional<jsg::JsValue> reason);
 
   JSG_RESOURCE_TYPE(AbortController, CompatibilityFlags::Reader flags) {
     if (flags.getJsgPropertyOnPrototypeTemplate()) {
@@ -580,6 +570,10 @@ public:
       JSG_READONLY_INSTANCE_PROPERTY(signal, getSignal);
     }
     JSG_METHOD(abort);
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("signal", signal);
   }
 
 private:
@@ -592,23 +586,23 @@ private:
   }
 };
 
+// The scheduler class is an emerging web platform standard API that is meant
+// to be global and provides task scheduling APIs. We currently only implement
+// a subset of the API that is being defined.
 class Scheduler final: public jsg::Object {
-  // The scheduler class is an emerging web platform standard API that is meant
-  // to be global and provides task scheduling APIs. We currently only implement
-  // a subset of the API that is being defined.
 public:
   struct WaitOptions {
     jsg::Optional<jsg::Ref<AbortSignal>> signal;
     JSG_STRUCT(signal);
   };
 
+  // Returns a promise that resolves after the `delay` milliseconds.
+  // Essentially an awaitable alternative to setTimeout(). The wait
+  // can be canceled using an AbortSignal.
   kj::Promise<void> wait(
       jsg::Lock& js,
       double delay,
       jsg::Optional<WaitOptions> maybeOptions);
-  // Returns a promise that resolves after the `delay` milliseconds.
-  // Essentially an awaitable alternative to setTimeout(). The wait
-  // can be canceled using an AbortSignal.
 
   JSG_RESOURCE_TYPE(Scheduler) {
     JSG_METHOD(wait);
@@ -628,7 +622,9 @@ private:
     api::AbortSignal,                          \
     api::Scheduler,                            \
     api::Scheduler::WaitOptions,               \
-    api::ExtendableEvent
+    api::ExtendableEvent,                      \
+    api::CustomEvent,                          \
+    api::CustomEvent::CustomEventInit
 // The list of basics.h types that are added to worker.c++'s JSG_DECLARE_ISOLATE_TYPE
 
 }  // namespace workerd::api

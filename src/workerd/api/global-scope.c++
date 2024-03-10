@@ -6,121 +6,74 @@
 
 #include <kj/encoding.h>
 
+#include <workerd/api/cache.h>
+#include <workerd/api/crypto.h>
+#include <workerd/api/scheduled.h>
 #include <workerd/api/system-streams.h>
+#include <workerd/api/trace.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/util.h>
 #include <workerd/io/io-context.h>
+#include <workerd/io/features.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/thread-scopes.h>
 #include <workerd/api/hibernatable-web-socket.h>
+#include <workerd/api/util.h>
+#include <workerd/util/stream-utils.h>
+#include <workerd/util/use-perfetto-categories.h>
+#include <workerd/util/uncaught-exception-source.h>
 
 namespace workerd::api {
 
 namespace {
 
-class NeuterableInputStream: public kj::AsyncInputStream, public kj::Refcounted {
-  // An InputStream that can be disconnected. Used for request body, which becomes invalid as
-  // soon as the response is returned.
-
-public:
-  NeuterableInputStream(kj::AsyncInputStream& inner): inner(&inner) {}
-
-  enum NeuterReason {
-    SENT_RESPONSE,
-    THREW_EXCEPTION,
-    CLIENT_DISCONNECTED
-  };
-
-  void neuter(NeuterReason reason) {
-    if (inner.is<kj::AsyncInputStream*>()) {
-      inner = reason;
-      if (!canceler.isEmpty()) {
-        canceler.cancel(makeException(reason));
-      }
-    }
-  }
-
-  kj::Promise<size_t> read(void* buffer, size_t minBytes, size_t maxBytes) override {
-    return canceler.wrap(getStream().read(buffer, minBytes, maxBytes));
-  }
-  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
-    return canceler.wrap(getStream().tryRead(buffer, minBytes, maxBytes));
-  }
-  kj::Maybe<uint64_t> tryGetLength() override {
-    return getStream().tryGetLength();
-  }
-  kj::Promise<uint64_t> pumpTo(kj::AsyncOutputStream& output, uint64_t amount) override {
-    return canceler.wrap(getStream().pumpTo(output, amount));
-  }
-
-private:
-  kj::OneOf<kj::AsyncInputStream*, NeuterReason> inner;
-  kj::Canceler canceler;
-
-  kj::AsyncInputStream& getStream() {
-    KJ_SWITCH_ONEOF(inner) {
-      KJ_CASE_ONEOF(stream, kj::AsyncInputStream*) {
-        return *stream;
-      }
-      KJ_CASE_ONEOF(reason, NeuterReason) {
-        kj::throwFatalException(makeException(reason));
-      }
-    }
-    KJ_UNREACHABLE;
-  }
-
-  kj::Exception makeException(NeuterReason reason) {
-    switch (reason) {
-      case SENT_RESPONSE:
-        return JSG_KJ_EXCEPTION(FAILED, TypeError,
-            "Can't read from request stream after response has been sent.");
-      case THREW_EXCEPTION:
-        return JSG_KJ_EXCEPTION(FAILED, TypeError,
-            "Can't read from request stream after responding with an exception.");
-      case CLIENT_DISCONNECTED:
-        return JSG_KJ_EXCEPTION(DISCONNECTED, TypeError,
-            "Can't read from request stream because client disconnected.");
-    }
-    KJ_UNREACHABLE;
-  }
+enum class NeuterReason {
+  SENT_RESPONSE,
+  THREW_EXCEPTION,
+  CLIENT_DISCONNECTED
 };
 
-void handleDefaultBotManagement(v8::Isolate* isolate, v8::Local<v8::Object> cf) {
-  // When the cfBotManagementNoOp compatibility flag is set, we'll check the
-  // request cf blob to see if it contains a botManagement field. If it does
-  // *not* we will add it using the following default fields.
-  // Note that if the botManagement team changes any of the fields they provide,
-  // this default value may need to be changed also.
-  static constexpr auto DEFAULT_BM = R"DATA({
-    "corporateProxy": false,
-    "verifiedBot": false,
-    "jsDetection": { "passed": false },
-    "staticResource": false,
-    "detectionIds": {},
-    "score": 99
-  })DATA"_kj;
+kj::Exception makeNeuterException(NeuterReason reason) {
+  switch (reason) {
+    case NeuterReason::SENT_RESPONSE:
+      return JSG_KJ_EXCEPTION(FAILED, TypeError,
+          "Can't read from request stream after response has been sent.");
+    case NeuterReason::THREW_EXCEPTION:
+      return JSG_KJ_EXCEPTION(FAILED, TypeError,
+          "Can't read from request stream after responding with an exception.");
+    case NeuterReason::CLIENT_DISCONNECTED:
+      return JSG_KJ_EXCEPTION(DISCONNECTED, TypeError,
+          "Can't read from request stream because client disconnected.");
+  }
+  KJ_UNREACHABLE;
+}
 
-  auto context = isolate->GetCurrentContext();
-  auto name = jsg::v8StrIntern(isolate, "botManagement"_kj);
-  if (!jsg::check(cf->Has(context, name))) {
-    auto sym = v8::Private::ForApi(isolate, name);
-    // For performance reasons, we only want to construct the default values
-    // once per isolate so we cache the constructed value using an internal
-    // private field on the global scope. Whenever we need to use it again we
-    // pull the exact same value.
-    auto defaultBm = jsg::check(context->Global()->GetPrivate(context, sym));
-    if (defaultBm->IsUndefined()) {
-      defaultBm = jsg::check(v8::JSON::Parse(context, jsg::v8Str(isolate, DEFAULT_BM)));
-      KJ_ASSERT(defaultBm->IsObject());
-      jsg::recursivelyFreeze(context, defaultBm);
-      jsg::check(context->Global()->SetPrivate(context, sym, defaultBm));
-    }
-    jsg::check(cf->Set(context, name, defaultBm));
+kj::String getEventName(v8::PromiseRejectEvent type) {
+  switch (type) {
+    case v8::PromiseRejectEvent::kPromiseRejectWithNoHandler:
+      return kj::str("unhandledrejection");
+    case v8::PromiseRejectEvent::kPromiseHandlerAddedAfterReject:
+      return kj::str("rejectionhandled");
+    default:
+      // Events are not emitted for the other reject types.
+      KJ_UNREACHABLE;
   }
 }
 
 }  // namespace
+
+PromiseRejectionEvent::PromiseRejectionEvent(
+    v8::PromiseRejectEvent type,
+    jsg::V8Ref<v8::Promise> promise,
+    jsg::Value reason)
+    : Event(getEventName(type)),
+      promise(kj::mv(promise)),
+      reason(kj::mv(reason)) {}
+
+void PromiseRejectionEvent::visitForGc(jsg::GcVisitor& visitor) {
+  visitor.visit(promise, reason);
+}
 
 void ExecutionContext::waitUntil(kj::Promise<void> promise) {
   IoContext::current().addWaitUntil(kj::mv(promise));
@@ -128,6 +81,20 @@ void ExecutionContext::waitUntil(kj::Promise<void> promise) {
 
 void ExecutionContext::passThroughOnException() {
   IoContext::current().setFailOpen();
+}
+
+void ExecutionContext::abort(jsg::Lock& js, jsg::Optional<jsg::Value> reason) {
+  // TODO(someday): Maybe instead of throwing we should TerminateExecution() here? But that
+  //   requires some more extensive changes.
+  KJ_IF_SOME(r, reason) {
+    IoContext::current().abort(js.exceptionToKj(r.addRef(js)));
+    js.throwException(kj::mv(r));
+  } else {
+    auto e = JSG_KJ_EXCEPTION(FAILED, Error,
+        "Worker execution was aborted due to call to ctx.abort().");
+    IoContext::current().abort(kj::cp(e));
+    kj::throwFatalException(kj::mv(e));
+  }
 }
 
 ServiceWorkerGlobalScope::ServiceWorkerGlobalScope(v8::Isolate* isolate)
@@ -152,44 +119,24 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
     kj::AsyncInputStream& requestBody, kj::HttpService::Response& response,
     kj::Maybe<kj::StringPtr> cfBlobJson,
     Worker::Lock& lock, kj::Maybe<ExportedHandler&> exportedHandler) {
+  TRACE_EVENT("workerd", "ServiceWorkerGlobalScope::request()");
   // To construct a ReadableStream object, we're supposed to pass in an Own<AsyncInputStream>, so
   // that it can drop the reference whenever it gets GC'd. But in this case the stream's lifetime
   // is not under our control -- it's attached to the request. So, we wrap it in a
   // NeuterableInputStream which allows us to disconnect the stream before it becomes invalid.
-  auto ownRequestBody = kj::refcounted<NeuterableInputStream>(requestBody);
+  auto ownRequestBody = newNeuterableInputStream(requestBody);
   auto deferredNeuter = kj::defer([ownRequestBody = kj::addRef(*ownRequestBody)]() mutable {
     // Make sure to cancel the request body stream since the native stream is no longer valid once
     // the returned promise completes. Note that the KJ HTTP library deals with the fact that we
     // haven't consumed the entire request body.
-    ownRequestBody->neuter(NeuterableInputStream::CLIENT_DISCONNECTED);
+    ownRequestBody->neuter(makeNeuterException(NeuterReason::CLIENT_DISCONNECTED));
   });
-  KJ_ON_SCOPE_FAILURE(ownRequestBody->neuter(NeuterableInputStream::THREW_EXCEPTION));
+  KJ_ON_SCOPE_FAILURE(ownRequestBody->neuter(makeNeuterException(NeuterReason::THREW_EXCEPTION)));
 
   auto& ioContext = IoContext::current();
-  auto isolate = lock.getIsolate();
+  jsg::Lock& js = lock;
 
-  kj::Maybe<jsg::V8Ref<v8::Object>> cf;
-
-  KJ_IF_MAYBE(c, cfBlobJson) {
-    auto jsonString = jsg::v8Str(isolate, *c);
-    auto context = isolate->GetCurrentContext();
-
-    auto handle = jsg::check(v8::JSON::Parse(context, jsonString));
-    KJ_ASSERT(handle->IsObject());
-
-    if (!lock.getWorker()
-             .getIsolate()
-             .getApiIsolate()
-             .getFeatureFlags()
-             .getNoCfBotManagementDefault()) {
-      handleDefaultBotManagement(isolate, handle.As<v8::Object>());
-    }
-
-    // For the inbound request, we make the `cf` blob immutable.
-    jsg::recursivelyFreeze(isolate->GetCurrentContext(), handle);
-
-    cf = jsg::V8Ref(isolate, handle.As<v8::Object>());
-  }
+  CfProperty cf(cfBlobJson);
 
   auto jsHeaders = jsg::alloc<Headers>(headers, Headers::Guard::REQUEST);
   // We do not automatically decode gzipped request bodies because the fetch() standard doesn't
@@ -218,17 +165,34 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
   // TODO(cleanup): Should KJ HTTP interfaces explicitly communicate the difference between a
   //   missing body and an empty one?
   kj::Maybe<Body::ExtractedBody> body;
-  if (headers.get(kj::HttpHeaderId::CONTENT_LENGTH) != nullptr ||
-      headers.get(kj::HttpHeaderId::TRANSFER_ENCODING) != nullptr ||
+  if (headers.get(kj::HttpHeaderId::CONTENT_LENGTH) != kj::none ||
+      headers.get(kj::HttpHeaderId::TRANSFER_ENCODING) != kj::none ||
       requestBody.tryGetLength().orDefault(1) > 0) {
     body = Body::ExtractedBody(jsStream.addRef());
+  }
+
+  // If the request doesn't specify "Content-Length" or "Transfer-Encoding", set "Content-Length"
+  // to the body length if it's known. This ensures handlers for worker-to-worker requests can
+  // access known body lengths if they're set, without buffering bodies.
+  if (body != kj::none &&
+      headers.get(kj::HttpHeaderId::CONTENT_LENGTH) == kj::none &&
+      headers.get(kj::HttpHeaderId::TRANSFER_ENCODING) == kj::none) {
+    // We can't use headers.set() here as headers is marked const. Instead, we call set() on the
+    // JavaScript headers object, ignoring the REQUEST guard that usually makes them immutable.
+    KJ_IF_SOME(l, requestBody.tryGetLength()) {
+      jsHeaders->setUnguarded(jsg::ByteString(kj::str("Content-Length")),
+                              jsg::ByteString(kj::str(l)));
+    } else {
+      jsHeaders->setUnguarded(jsg::ByteString(kj::str("Transfer-Encoding")),
+                              jsg::ByteString(kj::str("chunked")));
+    }
   }
 
   auto jsRequest = jsg::alloc<Request>(
       method, url, Request::Redirect::MANUAL, kj::mv(jsHeaders),
       jsg::alloc<Fetcher>(IoContext::NEXT_CLIENT_CHANNEL,
                            Fetcher::RequiresHostAndProtocol::YES),
-      nullptr /** AbortSignal **/, kj::mv(cf), kj::mv(body));
+      kj::none /** AbortSignal **/, kj::mv(cf), kj::mv(body));
   // I set the redirect mode to manual here, so that by default scripts that just pass requests
   // through to a fetch() call will behave the same as scripts which don't call .respondWith(): if
   // the request results in a redirect, the visitor will see that redirect.
@@ -237,10 +201,12 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
 
   uint tasksBefore = ioContext.taskCount();
 
+  // We'll drop our span once the promise (fetch handler result) resolves.
+  kj::Maybe<SpanBuilder> span = ioContext.makeTraceSpan("fetch_handler"_kjc);
   bool useDefaultHandling;
-  KJ_IF_MAYBE(h, exportedHandler) {
-    KJ_IF_MAYBE(f, h->fetch) {
-      auto promise = (*f)(lock, event->getRequest(), h->env.addRef(isolate), h->getCtx(isolate));
+  KJ_IF_SOME(h, exportedHandler) {
+    KJ_IF_SOME(f, h.fetch) {
+      auto promise = f(lock, event->getRequest(), h.env.addRef(js), h.getCtx());
       event->respondWith(lock, kj::mv(promise));
       useDefaultHandling = false;
     } else {
@@ -271,20 +237,20 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
     if (jsStream->isDisturbed()) {
       lock.logUncaughtException(
           "Script consumed request body but didn't call respondWith(). Can't forward request.");
-      response.sendError(500, "Internal Server Error", ioContext.getHeaderTable());
-      return addNoopDeferredProxy(kj::READY_NOW);
+      return addNoopDeferredProxy(
+        response.sendError(500, "Internal Server Error", ioContext.getHeaderTable()));
     } else {
       auto client = ioContext.getHttpClient(
           IoContext::NEXT_CLIENT_CHANNEL, false,
           cfBlobJson.map([](kj::StringPtr s) { return kj::str(s); }),
-          "fetch_default"_kj);
+          "fetch_default"_kjc);
       auto adapter = kj::newHttpService(*client);
       auto promise = adapter->request(method, url, headers, requestBody, response);
       // Default handling doesn't rely on the IoContext at all so we can return it as a
       // deferred proxy task.
       return DeferredProxy<void> { promise.attach(kj::mv(adapter), kj::mv(client)) };
     }
-  } else KJ_IF_MAYBE(promise, event->getResponsePromise(lock)) {
+  } else KJ_IF_SOME(promise, event->getResponsePromise(lock)) {
     auto body2 = kj::addRef(*ownRequestBody);
 
     // HACK: If the client disconnects, the `response` reference is no longer valid. But our
@@ -297,13 +263,15 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
     };
     auto canceled = kj::refcounted<RefcountedBool>(false);
 
-    return ioContext.awaitJs(promise->then(kj::implicitCast<jsg::Lock&>(lock),
+    return ioContext.awaitJs(lock ,promise.then(kj::implicitCast<jsg::Lock&>(lock),
         ioContext.addFunctor(
             [&response, allowWebSocket = headers.isWebSocket(),
-             canceled = kj::addRef(*canceled), &headers]
-            (jsg::Lock& js, jsg::Ref<Response> innerResponse)
+             canceled = kj::addRef(*canceled), &headers, span = kj::mv(span)]
+            (jsg::Lock& js, jsg::Ref<Response> innerResponse) mutable
             -> IoOwn<kj::Promise<DeferredProxy<void>>> {
       auto& context = IoContext::current();
+      // Drop our fetch_handler span now that the promise has resolved.
+      span = kj::none;
       if (canceled->value) {
         // Oops, the client disconnected before the response was ready to send. `response` is
         // a dangling reference, let's not use it.
@@ -320,9 +288,9 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
       // task finishes.
       deferredProxy.proxyTask = deferredProxy.proxyTask
           .then([body = kj::addRef(*ownRequestBody)]() mutable {
-        body->neuter(NeuterableInputStream::SENT_RESPONSE);
+        body->neuter(makeNeuterException(NeuterReason::SENT_RESPONSE));
       }, [body = kj::addRef(*ownRequestBody)](kj::Exception&& e) mutable {
-        body->neuter(NeuterableInputStream::THREW_EXCEPTION);
+        body->neuter(makeNeuterException(NeuterReason::THREW_EXCEPTION));
         kj::throwFatalException(kj::mv(e));
       }).attach(kj::mv(deferredNeuter));
 
@@ -330,7 +298,7 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(
     }, [body = kj::mv(body2)](kj::Exception&& e) mutable -> DeferredProxy<void> {
       // HACK: We depend on the fact that the success-case lambda above hasn't been destroyed yet
       //   so `deferredNeuter` hasn't been destroyed yet.
-      body->neuter(NeuterableInputStream::THREW_EXCEPTION);
+      body->neuter(makeNeuterException(NeuterReason::THREW_EXCEPTION));
       kj::throwFatalException(kj::mv(e));
     });
   } else {
@@ -344,14 +312,14 @@ void ServiceWorkerGlobalScope::sendTraces(kj::ArrayPtr<kj::Own<Trace>> traces,
     Worker::Lock& lock, kj::Maybe<ExportedHandler&> exportedHandler) {
   auto isolate = lock.getIsolate();
 
-  KJ_IF_MAYBE(h, exportedHandler) {
-    KJ_IF_MAYBE(f, h->tail) {
-      auto tailEvent = jsg::alloc<TailEvent>("tail"_kj, traces);
-      auto promise = (*f)(lock, tailEvent->getEvents(), h->env.addRef(isolate), h->getCtx(isolate));
+  KJ_IF_SOME(h, exportedHandler) {
+    KJ_IF_SOME(f, h.tail) {
+      auto tailEvent = jsg::alloc<TailEvent>(lock, "tail"_kj, traces);
+      auto promise = f(lock, tailEvent->getEvents(), h.env.addRef(isolate), h.getCtx());
       tailEvent->waitUntil(kj::mv(promise));
-    } else KJ_IF_MAYBE(f, h->trace) {
-      auto traceEvent = jsg::alloc<TailEvent>("trace"_kj, traces);
-      auto promise = (*f)(lock, traceEvent->getEvents(), h->env.addRef(isolate), h->getCtx(isolate));
+    } else KJ_IF_SOME(f, h.trace) {
+      auto traceEvent = jsg::alloc<TailEvent>(lock, "trace"_kj, traces);
+      auto promise = f(lock, traceEvent->getEvents(), h.env.addRef(isolate), h.getCtx());
       traceEvent->waitUntil(kj::mv(promise));
     } else {
       lock.logWarningOnce(
@@ -362,8 +330,8 @@ void ServiceWorkerGlobalScope::sendTraces(kj::ArrayPtr<kj::Own<Trace>> traces,
   } else {
     // Fire off the handlers.
     // We only create both events here.
-    auto tailEvent = jsg::alloc<TailEvent>("tail"_kj, traces);
-    auto traceEvent = jsg::alloc<TailEvent>("trace"_kj, traces);
+    auto tailEvent = jsg::alloc<TailEvent>(lock, "tail"_kj, traces);
+    auto traceEvent = jsg::alloc<TailEvent>(lock, "trace"_kj, traces);
     dispatchEventImpl(lock, tailEvent.addRef());
     dispatchEventImpl(lock, traceEvent.addRef());
 
@@ -383,10 +351,10 @@ void ServiceWorkerGlobalScope::startScheduled(
 
   auto isolate = lock.getIsolate();
 
-  KJ_IF_MAYBE(h, exportedHandler) {
-    KJ_IF_MAYBE(f, h->scheduled) {
-      auto promise = (*f)(lock, jsg::alloc<ScheduledController>(event.addRef()),
-                          h->env.addRef(isolate), h->getCtx(isolate));
+  KJ_IF_SOME(h, exportedHandler) {
+    KJ_IF_SOME(f, h.scheduled) {
+      auto promise = f(lock, jsg::alloc<ScheduledController>(event.addRef()),
+                       h.env.addRef(isolate), h.getCtx());
       event->waitUntil(kj::mv(promise));
     } else {
       lock.logWarningOnce(
@@ -410,6 +378,8 @@ void ServiceWorkerGlobalScope::startScheduled(
 
 kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(
     kj::Date scheduledTime,
+    kj::Duration timeout,
+    uint32_t retryCount,
     Worker::Lock& lock, kj::Maybe<ExportedHandler&> exportedHandler) {
 
   auto& context = IoContext::current();
@@ -417,9 +387,9 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(
   auto& persistent = KJ_ASSERT_NONNULL(actor.getPersistent());
   auto maybeDeferredDelete = persistent.armAlarmHandler(scheduledTime);
 
-  KJ_IF_MAYBE(deferredDelete, maybeDeferredDelete) {
+  KJ_IF_SOME(deferredDelete, maybeDeferredDelete) {
     auto& handler = KJ_REQUIRE_NONNULL(exportedHandler);
-    if (handler.alarm == nullptr) {
+    if (handler.alarm == kj::none) {
 
       lock.logWarningOnce(
           "Attempted to run a scheduled alarm without a handler, "
@@ -432,21 +402,46 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(
 
     auto& alarm = KJ_ASSERT_NONNULL(handler.alarm);
 
-    auto alarmResultPromise = context
-        .run([exportedHandler, &alarm,
+    return context
+        .run([exportedHandler, &context, timeout, retryCount, &alarm,
               maybeAsyncContext = jsg::AsyncContextFrame::currentRef(lock)]
              (Worker::Lock& lock) mutable -> kj::Promise<WorkerInterface::AlarmResult> {
       jsg::AsyncContextFrame::Scope asyncScope(lock, maybeAsyncContext);
-      return alarm(lock).then([]() -> kj::Promise<WorkerInterface::AlarmResult> {
+      // We want to limit alarm handler walltime to 15 minutes at most. If the timeout promise
+      // completes we want to cancel the alarm handler. If the alarm handler promise completes first
+      // timeout will be canceled.
+      auto timeoutPromise = context.afterLimitTimeout(timeout).then([&context]() -> kj::Promise<WorkerInterface::AlarmResult> {
+        // We don't want to delete the alarm since we have not successfully completed the alarm
+        // execution.
+        auto& actor = KJ_ASSERT_NONNULL(context.getActor());
+        auto& persistent = KJ_ASSERT_NONNULL(actor.getPersistent());
+        persistent.cancelDeferredAlarmDeletion();
+
+        LOG_NOSENTRY(WARNING, "Alarm exceeded its allowed execution time");
+        // Report alarm handler failure and log it.
+        auto e = KJ_EXCEPTION(OVERLOADED, "broken.dropped; worker_do_not_log; jsg.Error: Alarm exceeded its allowed execution time");
+        context.getMetrics().reportFailure(e);
+
+        // We don't want the handler to keep running after timeout.
+        context.abort(kj::mv(e));
+        // We want timed out alarms to be treated as user errors. As such, we'll mark them as
+        // retriable, and we'll count the retries against the alarm retries limit. This will ensure
+        // that the handler will attempt to run for a number of times before giving up and deleting
+        // the alarm.
+        return WorkerInterface::AlarmResult {
+          .retry = true,
+          .retryCountsAgainstLimit = true,
+          .outcome = EventOutcome::EXCEEDED_CPU
+        };
+      });
+
+      return alarm(lock, jsg::alloc<AlarmInvocationInfo>(retryCount)).then([]() -> kj::Promise<WorkerInterface::AlarmResult> {
         return WorkerInterface::AlarmResult {
           .retry = false,
           .outcome = EventOutcome::OK
         };
-      });
-    });
-
-    return alarmResultPromise
-        .catch_([&context, deferredDelete = kj::mv(*deferredDelete)](kj::Exception&& e) mutable {
+      }).exclusiveJoin(kj::mv(timeoutPromise));
+    }).catch_([&context, deferredDelete = kj::mv(deferredDelete)](kj::Exception&& e) mutable {
       auto& actor = KJ_ASSERT_NONNULL(context.getActor());
       auto& persistent = KJ_ASSERT_NONNULL(actor.getPersistent());
       persistent.cancelDeferredAlarmDeletion();
@@ -457,15 +452,16 @@ kj::Promise<WorkerInterface::AlarmResult> ServiceWorkerGlobalScope::runAlarm(
       context.logUncaughtExceptionAsync(UncaughtExceptionSource::ALARM_HANDLER, kj::mv(e));
 
       EventOutcome outcome = EventOutcome::EXCEPTION;
-      KJ_IF_MAYBE(status, context.getLimitEnforcer().getLimitsExceeded()) {
-        outcome = *status;
+      KJ_IF_SOME(status, context.getLimitEnforcer().getLimitsExceeded()) {
+        outcome = status;
       }
       return WorkerInterface::AlarmResult {
         .retry = true,
         .retryCountsAgainstLimit = !context.isOutputGateBroken(),
         .outcome = outcome
       };
-    }).then([&context](WorkerInterface::AlarmResult result) -> kj::Promise<WorkerInterface::AlarmResult> {
+    })
+    .then([&context](WorkerInterface::AlarmResult result) -> kj::Promise<WorkerInterface::AlarmResult> {
       return context.waitForOutputLocks().then([result]() {
         return kj::mv(result);
       }, [](kj::Exception&& e) {
@@ -502,20 +498,44 @@ jsg::Promise<void> ServiceWorkerGlobalScope::test(
   auto& testHandler = JSG_REQUIRE_NONNULL(eh.test, Error,
       "Entrypoint does not export a test() function.");
 
-  return testHandler(lock, jsg::alloc<TestController>(), eh.env.addRef(lock),
-                     eh.getCtx(lock.getIsolate()));
+  return testHandler(lock, jsg::alloc<TestController>(), eh.env.addRef(lock), eh.getCtx());
+}
+
+// This promise is used to set the timeout for hibernatable websocket events. It's expected to be
+// dropped in most cases, as long as the hibernatable websocket event promise completes before it.
+kj::Promise<void> ServiceWorkerGlobalScope::eventTimeoutPromise(uint32_t timeoutMs) {
+  auto& actor = KJ_ASSERT_NONNULL(IoContext::current().getActor());
+  co_await IoContext::current().afterLimitTimeout(timeoutMs * kj::MILLISECONDS);
+  // This is the ActorFlushReason for eviction in Cloudflare's internal implementation.
+  auto evictionCode = 2;
+  actor.shutdown(evictionCode, KJ_EXCEPTION(DISCONNECTED,
+    "broken.dropped; jsg.Error: Actor exceeded event execution time and was disconnected."));
+}
+
+kj::Promise<void> ServiceWorkerGlobalScope::setHibernatableEventTimeout(kj::Promise<void> event,
+    kj::Maybe<uint32_t> eventTimeoutMs) {
+  // If we have a maximum event duration timeout set, we should prevent the actor from running
+  // for more than the user selected duration.
+  auto timeoutMs = eventTimeoutMs.orDefault((uint32_t)0);
+  if (timeoutMs > 0) {
+    return event.exclusiveJoin(eventTimeoutPromise(timeoutMs));
+  }
+  return event;
 }
 
 void ServiceWorkerGlobalScope::sendHibernatableWebSocketMessage(
     kj::OneOf<kj::String, kj::Array<byte>> message,
+    kj::Maybe<uint32_t> eventTimeoutMs,
     kj::String websocketId,
     Worker::Lock& lock, kj::Maybe<ExportedHandler&> exportedHandler) {
   auto event = jsg::alloc<HibernatableWebSocketEvent>();
+  // Even if no handler is exported, we need to claim the websocket so it's removed from the map.
+  auto websocket = event->claimWebSocket(lock, websocketId);
 
-  KJ_IF_MAYBE(h, exportedHandler) {
-    KJ_IF_MAYBE(handler, h->webSocketMessage) {
-      auto promise = (*handler)(lock, event->claimWebSocket(lock, websocketId), kj::mv(message));
-      event->waitUntil(kj::mv(promise));
+  KJ_IF_SOME(h, exportedHandler) {
+    KJ_IF_SOME(handler, h.webSocketMessage) {
+      event->waitUntil(setHibernatableEventTimeout(
+          handler(lock, kj::mv(websocket), kj::mv(message)), eventTimeoutMs));
     }
     // We want to deliver a message, but if no webSocketMessage handler is exported, we shouldn't fail
   }
@@ -523,21 +543,25 @@ void ServiceWorkerGlobalScope::sendHibernatableWebSocketMessage(
 
 void ServiceWorkerGlobalScope::sendHibernatableWebSocketClose(
     HibernatableSocketParams::Close close,
+    kj::Maybe<uint32_t> eventTimeoutMs,
     kj::String websocketId,
     Worker::Lock& lock, kj::Maybe<ExportedHandler&> exportedHandler) {
   auto event = jsg::alloc<HibernatableWebSocketEvent>();
 
-  KJ_IF_MAYBE(h, exportedHandler) {
-    KJ_IF_MAYBE(handler, h->webSocketClose) {
-      // We won't be dispatching any further events because we've received a close, so we return the
-      // owned websocket back to the api::WebSocket.
-      auto releasePackage = event->prepareForRelease(lock, websocketId);
-      auto websocket = kj::mv(releasePackage.webSocketRef);
-      websocket->initiateHibernatableRelease(lock,
-          kj::mv(releasePackage.ownedWebSocket), api::WebSocket::HibernatableReleaseState::CLOSE);
-      auto promise = (*handler)(lock, kj::mv(websocket), close.code, kj::mv(close.reason),
-                                close.wasClean);
-      event->waitUntil(kj::mv(promise));
+  // Even if no handler is exported, we need to claim the websocket so it's removed from the map.
+  //
+  // We won't be dispatching any further events because we've received a close, so we return the
+  // owned websocket back to the api::WebSocket.
+  auto releasePackage = event->prepareForRelease(lock, websocketId);
+  auto websocket = kj::mv(releasePackage.webSocketRef);
+  websocket->initiateHibernatableRelease(lock, kj::mv(releasePackage.ownedWebSocket),
+      kj::mv(releasePackage.tags),
+      api::WebSocket::HibernatableReleaseState::CLOSE);
+  KJ_IF_SOME(h, exportedHandler) {
+    KJ_IF_SOME(handler, h.webSocketClose) {
+      event->waitUntil(setHibernatableEventTimeout(
+          handler(lock, kj::mv(websocket), close.code, kj::mv(close.reason),
+                           close.wasClean), eventTimeoutMs));
     }
     // We want to deliver close, but if no webSocketClose handler is exported, we shouldn't fail
   }
@@ -545,22 +569,28 @@ void ServiceWorkerGlobalScope::sendHibernatableWebSocketClose(
 
 void ServiceWorkerGlobalScope::sendHibernatableWebSocketError(
     kj::Exception e,
+    kj::Maybe<uint32_t> eventTimeoutMs,
     kj::String websocketId,
     Worker::Lock& lock,
     kj::Maybe<ExportedHandler&> exportedHandler) {
   auto event = jsg::alloc<HibernatableWebSocketEvent>();
 
-  KJ_IF_MAYBE(h, exportedHandler) {
-    KJ_IF_MAYBE(handler, h->webSocketError) {
-      // We won't be dispatching any further events because we've encountered an error, so we return
-      // the owned websocket back to the api::WebSocket.
-      auto releasePackage = event->prepareForRelease(lock, websocketId);
-      auto& websocket = releasePackage.webSocketRef;
-      websocket->initiateHibernatableRelease(lock,
-          kj::mv(releasePackage.ownedWebSocket), WebSocket::HibernatableReleaseState::ERROR);
-      jsg::Lock& js(lock);
-      auto promise = (*handler)(js, kj::mv(websocket), js.exceptionToJs(kj::mv(e)));
-      event->waitUntil(kj::mv(promise));
+  // Even if no handler is exported, we need to claim the websocket so it's removed from the map.
+  //
+  // We won't be dispatching any further events because we've encountered an error, so we return
+  // the owned websocket back to the api::WebSocket.
+  auto releasePackage = event->prepareForRelease(lock, websocketId);
+  auto& websocket = releasePackage.webSocketRef;
+  websocket->initiateHibernatableRelease(lock, kj::mv(releasePackage.ownedWebSocket),
+      kj::mv(releasePackage.tags),
+      WebSocket::HibernatableReleaseState::ERROR);
+  jsg::Lock& js(lock);
+
+  KJ_IF_SOME(h, exportedHandler) {
+    KJ_IF_SOME(handler, h.webSocketError) {
+      event->waitUntil(setHibernatableEventTimeout(
+          handler(js, kj::mv(websocket), js.exceptionToJs(kj::mv(e))),
+          eventTimeoutMs));
     }
     // We want to deliver an error, but if no webSocketError handler is exported, we shouldn't fail
   }
@@ -587,25 +617,23 @@ void ServiceWorkerGlobalScope::emitPromiseRejection(
   }
 }
 
-kj::String ServiceWorkerGlobalScope::btoa(v8::Local<v8::Value> data, v8::Isolate* isolate) {
-  auto str = jsg::check(data->ToString(isolate->GetCurrentContext()));
+kj::String ServiceWorkerGlobalScope::btoa(jsg::Lock& js, jsg::JsValue data) {
+  auto str = data.toJsString(js);
 
   // We could implement btoa() by accepting a kj::String, but then we'd have to check that it
   // doesn't have any multibyte code points. Easier to perform that test using v8::String's
   // ContainsOnlyOneByte() function.
-  JSG_REQUIRE(str->ContainsOnlyOneByte(), DOMInvalidCharacterError,
+  JSG_REQUIRE(str.containsOnlyOneByte(), DOMInvalidCharacterError,
       "btoa() can only operate on characters in the Latin1 (ISO/IEC 8859-1) range.");
 
   // TODO(perf): v8::String sometimes holds a char pointer rather than a uint16_t pointer, which is
   //   why v8::String::IsOneByte() is both faster than ContainsOnlyOneByte() and prone to false
   //   negatives. Conceivably we could take advantage of this fact to completely avoid the later
   //   WriteOneByte() call in some cases!
-  auto buf = kj::heapArray<kj::byte>(str->Length());
-  str->WriteOneByte(isolate, buf.begin(), 0, buf.size());
 
-  return kj::encodeBase64(buf);
+  return kj::encodeBase64(str.toArray<kj::byte>(js));
 }
-v8::Local<v8::String> ServiceWorkerGlobalScope::atob(kj::String data, v8::Isolate* isolate) {
+jsg::JsString ServiceWorkerGlobalScope::atob(jsg::Lock& js, kj::String data) {
   auto decoded = kj::decodeBase64(data.asArray());
 
   JSG_REQUIRE(!decoded.hadErrors, DOMInvalidCharacterError,
@@ -616,7 +644,7 @@ v8::Local<v8::String> ServiceWorkerGlobalScope::atob(kj::String data, v8::Isolat
   // Similar to btoa() taking a v8::Value, we return a v8::String directly, as this allows us to
   // construct a string from the non-nul-terminated array returned from decodeBase64(). This avoids
   // making a copy purely to append a nul byte.
-  return jsg::v8StrFromLatin1(isolate, decoded.asBytes());
+  return js.str(decoded.asBytes());
 }
 
 void ServiceWorkerGlobalScope::queueMicrotask(
@@ -626,23 +654,25 @@ void ServiceWorkerGlobalScope::queueMicrotask(
   // to microtasks scheduled using EnqueueMicrotask, so we have to wrap in order to propagate
   // the context to those. Once V8 is fixed to correctly associate continuation data with
   // microtasks automatically, we can remove this workaround.
-  KJ_IF_MAYBE(context, jsg::AsyncContextFrame::current(js)) {
-    task = context->wrap(js, task);
+  KJ_IF_SOME(context, jsg::AsyncContextFrame::current(js)) {
+    task = context.wrap(js, task);
   }
   js.v8Isolate->EnqueueMicrotask(task);
 }
 
-v8::Local<v8::Value> ServiceWorkerGlobalScope::structuredClone(
-    v8::Local<v8::Value> value,
-    jsg::Optional<StructuredCloneOptions> maybeOptions,
-    v8::Isolate* isolate) {
-  kj::Maybe<kj::ArrayPtr<jsg::Value>> transfers;
-  KJ_IF_MAYBE(options, maybeOptions) {
-    transfers = options->transfer.map([&](kj::Array<jsg::Value>& transfer) {
-      return transfer.asPtr();
-    });
+jsg::JsValue ServiceWorkerGlobalScope::structuredClone(
+    jsg::Lock& js,
+    jsg::JsValue value,
+    jsg::Optional<StructuredCloneOptions> maybeOptions) {
+  KJ_IF_SOME(options, maybeOptions) {
+    KJ_IF_SOME(transfer, options.transfer) {
+      auto transfers = KJ_MAP(i, transfer) {
+        return i.getHandle(js);
+      };
+      return value.structuredClone(js, kj::mv(transfers));
+    }
   }
-  return jsg::structuredClone(value, isolate, transfers);
+  return value.structuredClone(js);
 }
 
 TimeoutId::NumberType ServiceWorkerGlobalScope::setTimeoutInternal(
@@ -658,71 +688,67 @@ TimeoutId::NumberType ServiceWorkerGlobalScope::setTimeoutInternal(
 
 TimeoutId::NumberType ServiceWorkerGlobalScope::setTimeout(
     jsg::Lock& js,
-    jsg::V8Ref<v8::Function> function,
+    jsg::Function<void(jsg::Arguments<jsg::Value>)> function,
     jsg::Optional<double> msDelay,
-    jsg::Varargs args) {
-  KJ_IF_MAYBE(context, jsg::AsyncContextFrame::current(js)) {
-    function = js.v8Ref(context->wrap(js, function));
-  }
-  auto argv = kj::heapArrayFromIterable<jsg::Value>(kj::mv(args));
+    jsg::Arguments<jsg::Value> args) {
+  function.setReceiver(js.v8Ref<v8::Value>(js.v8Context()->Global()));
+  auto fn = [function=kj::mv(function),
+             args=kj::mv(args),
+             context=jsg::AsyncContextFrame::currentRef(js)](jsg::Lock& js) mutable {
+    jsg::AsyncContextFrame::Scope scope(js, context);
+    function(js, kj::mv(args));
+  };
   auto timeoutId = IoContext::current().setTimeoutImpl(
       timeoutIdGenerator,
       /* repeats = */ false,
-      [function = function.addRef(js),
-       argv = kj::mv(argv)]
-       (jsg::Lock& js) mutable {
-    auto context = js.v8Context();
-    auto localFunction = function.getHandle(js);
-    auto localArgs = KJ_MAP(arg, argv) {
-      return arg.getHandle(js);
-    };
-    auto argc = localArgs.size();
-
-    // Cast to void to discard the result value.
-    (void)jsg::check(localFunction->Call(context, context->Global(), argc, &localArgs.front()));
+      [function = kj::mv(fn)](jsg::Lock& js) mutable {
+    function(js);
   }, msDelay.orDefault(0));
   return timeoutId.toNumber();
 }
 
 void ServiceWorkerGlobalScope::clearTimeout(kj::Maybe<TimeoutId::NumberType> timeoutId) {
-  KJ_IF_MAYBE(id, timeoutId) {
-    IoContext::current().clearTimeoutImpl(TimeoutId::fromNumber(*id));
+  KJ_IF_SOME(id, timeoutId) {
+    IoContext::current().clearTimeoutImpl(TimeoutId::fromNumber(id));
   }
 }
 
 TimeoutId::NumberType ServiceWorkerGlobalScope::setInterval(
     jsg::Lock& js,
-    jsg::V8Ref<v8::Function> function,
+    jsg::Function<void(jsg::Arguments<jsg::Value>)> function,
     jsg::Optional<double> msDelay,
-    jsg::Varargs args) {
-  KJ_IF_MAYBE(context, jsg::AsyncContextFrame::current(js)) {
-    function = js.v8Ref(context->wrap(js, function));
-  }
-  auto argv = kj::heapArrayFromIterable<jsg::Value>(kj::mv(args));
+    jsg::Arguments<jsg::Value> args) {
+  function.setReceiver(js.v8Ref<v8::Value>(js.v8Context()->Global()));
+  auto fn = [function=kj::mv(function),
+             args=kj::mv(args),
+             context=jsg::AsyncContextFrame::currentRef(js)]
+             (jsg::Lock& js) mutable {
+    jsg::AsyncContextFrame::Scope scope(js, context);
+    // Because the fn is called multiple times, we will clone the args on each call.
+    auto argv = KJ_MAP(i, args) { return i.addRef(js); };
+    function(js, jsg::Arguments(kj::mv(argv)));
+  };
   auto timeoutId = IoContext::current().setTimeoutImpl(
       timeoutIdGenerator,
       /* repeats = */ true,
-      [function = function.addRef(js),
-       argv = kj::mv(argv)]
-       (jsg::Lock& js) mutable {
-    auto context = js.v8Context();
-    auto localFunction = function.getHandle(js);
-    auto localArgs = KJ_MAP(arg, argv) {
-      return arg.getHandle(js);
-    };
-    auto argc = localArgs.size();
-
-    // Cast to void to discard the result value.
-    (void)jsg::check(localFunction->Call(context, context->Global(), argc, &localArgs.front()));
+      [function = kj::mv(fn)](jsg::Lock& js) mutable {
+    function(js);
   }, msDelay.orDefault(0));
   return timeoutId.toNumber();
 }
 
+jsg::Ref<Crypto> ServiceWorkerGlobalScope::getCrypto() {
+  return jsg::alloc<Crypto>();
+}
+
+jsg::Ref<CacheStorage> ServiceWorkerGlobalScope::getCaches() {
+  return jsg::alloc<CacheStorage>();
+}
+
 jsg::Promise<jsg::Ref<Response>> ServiceWorkerGlobalScope::fetch(
     jsg::Lock& js, kj::OneOf<jsg::Ref<Request>, kj::String> requestOrUrl,
-    jsg::Optional<Request::Initializer> requestInit,
-    CompatibilityFlags::Reader featureFlags) {
-  return fetchImpl(js, nullptr, kj::mv(requestOrUrl), kj::mv(requestInit), featureFlags);
+    jsg::Optional<Request::Initializer> requestInit) {
+  return fetchImpl(js, kj::none, kj::mv(requestOrUrl), kj::mv(requestInit));
 }
 
 double Performance::now() {
@@ -731,4 +757,41 @@ double Performance::now() {
   return dateNow();
 }
 
-}  // namespace workerd::api
+#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
+jsg::Ref<api::gpu::GPU> Navigator::getGPU(CompatibilityFlags::Reader flags) {
+  // is this a durable object?
+  KJ_IF_SOME (actor, IoContext::current().getActor()) {
+    JSG_REQUIRE(actor.getPersistent() != kj::none, TypeError,
+                "webgpu api is only available in Durable Objects (no storage)");
+  } else {
+    JSG_FAIL_REQUIRE(TypeError, "webgpu api is only available in Durable Objects");
+  };
+
+  JSG_REQUIRE(flags.getWebgpu(), TypeError, "webgpu needs the webgpu compatibility flag set");
+
+  return jsg::alloc<api::gpu::GPU>();
+}
+#endif
+
+bool Navigator::sendBeacon(jsg::Lock& js, kj::String url,
+                           jsg::Optional<Body::Initializer> body) {
+  if (IoContext::hasCurrent()) {
+    auto v8Context = js.v8Context();
+    auto& global = jsg::extractInternalPointer<ServiceWorkerGlobalScope, true>(
+        v8Context, v8Context->Global());
+    auto promise = global.fetch(js, kj::mv(url), Request::InitializerDict {
+      .method = kj::str("POST"),
+      .body = kj::mv(body),
+    });
+
+    auto& context = IoContext::current();
+
+    context.addWaitUntil(context.awaitJs(js, kj::mv(promise)).ignoreResult());
+    return true;
+  }
+
+  // We cannot schedule a beacon to be sent outside of a request context.
+  return false;
+}
+
+} // namespace workerd::api

@@ -22,7 +22,7 @@ void ValueQueue::ReadRequest::resolve(jsg::Lock&, jsg::Value value) {
 }
 
 void ValueQueue::ReadRequest::reject(jsg::Lock& js, jsg::Value& value) {
-  resolver.reject(value.getHandle(js));
+  resolver.reject(js, value.getHandle(js));
 }
 
 #pragma endregion ValueQueue::ReadRequest
@@ -104,6 +104,10 @@ kj::Own<ValueQueue::Consumer> ValueQueue::Consumer::clone(
 
 bool ValueQueue::Consumer::hasReadRequests() {
   return impl.hasReadRequests();
+}
+
+void ValueQueue::Consumer::cancelPendingReads(jsg::Lock& js, jsg::JsValue reason) {
+  impl.cancelPendingReads(js, reason);
 }
 
 void ValueQueue::Consumer::visitForGc(jsg::GcVisitor& visitor) {
@@ -199,8 +203,8 @@ void ValueQueue::handleRead(
     // resolved either as soon as there is data available or the consumer closes
     // or errors.
     state.readRequests.push_back(kj::mv(request));
-    KJ_IF_MAYBE(listener, consumer.stateListener) {
-      listener->onConsumerWantsData(js);
+    KJ_IF_SOME(listener, consumer.stateListener) {
+      listener.onConsumerWantsData(js);
     }
   }
 }
@@ -238,10 +242,10 @@ void ValueQueue::visitForGc(jsg::GcVisitor& visitor) {}
 
 namespace {
 void maybeInvalidateByobRequest(kj::Maybe<ByteQueue::ByobRequest&>& req) {
-  KJ_IF_MAYBE(byobRequest, req) {
-    byobRequest->invalidate();
+  KJ_IF_SOME(byobRequest, req) {
+    byobRequest.invalidate();
     // The call to byobRequest->invalidate() should have cleared the reference.
-    KJ_ASSERT(req == nullptr);
+    KJ_ASSERT(req == kj::none);
   }
 }
 }  // namespace
@@ -287,7 +291,7 @@ void ByteQueue::ReadRequest::resolve(jsg::Lock& js) {
 }
 
 void ByteQueue::ReadRequest::reject(jsg::Lock& js, jsg::Value& value) {
-  resolver.reject(value.getHandle(js));
+  resolver.reject(js, value.getHandle(js));
   maybeInvalidateByobRequest(byobReadRequest);
 }
 
@@ -378,6 +382,10 @@ bool ByteQueue::Consumer::hasReadRequests() {
   return impl.hasReadRequests();
 }
 
+void ByteQueue::Consumer::cancelPendingReads(jsg::Lock& js, jsg::JsValue reason) {
+  impl.cancelPendingReads(js, reason);
+}
+
 void ByteQueue::Consumer::visitForGc(jsg::GcVisitor& visitor) {
   visitor.visit(impl);
 }
@@ -391,8 +399,8 @@ ByteQueue::ByobRequest::~ByobRequest() noexcept(false) {
 }
 
 void ByteQueue::ByobRequest::invalidate() {
-  KJ_IF_MAYBE(req, request) {
-    req->byobReadRequest = nullptr;
+  KJ_IF_SOME(req, request) {
+    req.byobReadRequest = nullptr;
     request = nullptr;
   }
 }
@@ -498,17 +506,17 @@ bool ByteQueue::ByobRequest::respondWithNewView(jsg::Lock& js, jsg::BufferSource
 }
 
 size_t ByteQueue::ByobRequest::getAtLeast() const {
-  KJ_IF_MAYBE(req, request) {
-    return req->pullInto.atLeast;
+  KJ_IF_SOME(req, request) {
+    return req.pullInto.atLeast;
   }
   return 0;
 }
 
 v8::Local<v8::Uint8Array> ByteQueue::ByobRequest::getView(jsg::Lock& js) {
-  KJ_IF_MAYBE(req, request) {
-    return req->pullInto.store.getTypedViewSlice<v8::Uint8Array>(
-      req->pullInto.filled,
-      req->pullInto.store.size()
+  KJ_IF_SOME(req, request) {
+    return req.pullInto.store.getTypedViewSlice<v8::Uint8Array>(
+      req.pullInto.filled,
+      req.pullInto.store.size()
     ).createHandle(js).As<v8::Uint8Array>();
   }
   return v8::Local<v8::Uint8Array>();
@@ -519,11 +527,11 @@ v8::Local<v8::Uint8Array> ByteQueue::ByobRequest::getView(jsg::Lock& js) {
 ByteQueue::ByteQueue(size_t highWaterMark) : impl(highWaterMark) {}
 
 void ByteQueue::close(jsg::Lock& js) {
-  KJ_IF_MAYBE(ready, impl.state.tryGet<ByteQueue::QueueImpl::Ready>()) {
-    while (!ready->pendingByobReadRequests.empty()) {
-      auto& req = ready->pendingByobReadRequests.front();
+  KJ_IF_SOME(ready, impl.state.tryGet<ByteQueue::QueueImpl::Ready>()) {
+    while (!ready.pendingByobReadRequests.empty()) {
+      auto& req = ready.pendingByobReadRequests.front();
       req->invalidate();
-      ready->pendingByobReadRequests.pop_front();
+      ready.pendingByobReadRequests.pop_front();
     }
   }
   impl.close(js);
@@ -536,14 +544,14 @@ void ByteQueue::error(jsg::Lock& js, jsg::Value reason) {
 }
 
 void ByteQueue::maybeUpdateBackpressure() {
-  KJ_IF_MAYBE(state, impl.getState()) {
+  KJ_IF_SOME(state, impl.getState()) {
     // Invalidated byob read requests will accumulate if we do not take
     // take of them from time to time since. Since maybeUpdateBackpressure
     // is going to be called regularly while the queue is actively in use,
     // this is as good a place to clean them out as any.
     auto pivot KJ_UNUSED = std::remove_if(
-        state->pendingByobReadRequests.begin(),
-        state->pendingByobReadRequests.end(),
+        state.pendingByobReadRequests.begin(),
+        state.pendingByobReadRequests.end(),
         [](auto& item) {
       return item->isInvalidated();
     });
@@ -721,13 +729,13 @@ void ByteQueue::handleRead(
       // state.readRequests to create the associated ByobRequest.
       // If the queue state is nullptr here, it means the queue has already
       // been closed.
-      KJ_IF_MAYBE(queueState, queue.getState()) {
-        queueState->pendingByobReadRequests.push_back(
+      KJ_IF_SOME(queueState, queue.getState()) {
+        queueState.pendingByobReadRequests.push_back(
             state.readRequests.back().makeByobReadRequest(consumer, queue));
       }
     }
-    KJ_IF_MAYBE(listener, consumer.stateListener) {
-      listener->onConsumerWantsData(js);
+    KJ_IF_SOME(listener, consumer.stateListener) {
+      listener.onConsumerWantsData(js);
     }
   };
 
@@ -1001,22 +1009,22 @@ bool ByteQueue::handleMaybeClose(
 }
 
 kj::Maybe<kj::Own<ByteQueue::ByobRequest>> ByteQueue::nextPendingByobReadRequest() {
-  KJ_IF_MAYBE(state, impl.getState()) {
-    while (!state->pendingByobReadRequests.empty()) {
-      auto request = kj::mv(state->pendingByobReadRequests.front());
-      state->pendingByobReadRequests.pop_front();
+  KJ_IF_SOME(state, impl.getState()) {
+    while (!state.pendingByobReadRequests.empty()) {
+      auto request = kj::mv(state.pendingByobReadRequests.front());
+      state.pendingByobReadRequests.pop_front();
       if (!request->isInvalidated()) {
         return kj::mv(request);
       }
     }
   }
-  return nullptr;
+  return kj::none;
 }
 
 bool ByteQueue::hasPartiallyFulfilledRead() {
-  KJ_IF_MAYBE(state, impl.getState()) {
-    if (!state->pendingByobReadRequests.empty()) {
-      auto& pending = state->pendingByobReadRequests.front();
+  KJ_IF_SOME(state, impl.getState()) {
+    if (!state.pendingByobReadRequests.empty()) {
+      auto& pending = state.pendingByobReadRequests.front();
       if (pending->isPartiallyFulfilled()) {
         return true;
       }

@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "jsg.h"
+#include "setup.h"
 
 namespace workerd::jsg {
 
@@ -15,14 +16,35 @@ void exposeGlobalScopeType(v8::Isolate* isolate, v8::Local<v8::Context> context)
     return check(value->ToObject(context));
   };
   const auto getInterned = [isolate, context](v8::Local<v8::Object> object, const char* s) {
-    auto name = v8Str(isolate, s, v8::NewStringType::kInternalized);
-    return check(object->Get(context, name));
+    return check(object->Get(context, v8StrIntern(isolate, s)));
   };
 
   auto constructor = getInterned(global, "constructor");
   auto name = getInterned(toObject(constructor), "name");
 
   KJ_ASSERT(check(global->Set(context, name, constructor)));
+}
+
+void polyfillSymbols(jsg::Lock& js, v8::Local<v8::Context> context) {
+  js.withinHandleScope([&]() {
+    JsObject obj(context->Global());
+
+    auto symbol = KJ_ASSERT_NONNULL(obj.get(js, "Symbol").tryCast<JsObject>());
+
+    KJ_DASSERT(!symbol.has(js, "dispose") && !symbol.has(js, "asyncDispose"),
+        "It looks like V8 has been updated to support the explicit resource management spec! "
+        "We should now remove our polyfill and depend on V8's version of these symbols.");
+
+    symbol.set(js, "dispose", js.symbolDispose());
+    symbol.set(js, "asyncDispose", js.symbolAsyncDispose());
+  });
+}
+
+v8::Local<v8::Symbol> getSymbolDispose(v8::Isolate* isolate) {
+  return IsolateBase::from(isolate).getSymbolDispose();
+}
+v8::Local<v8::Symbol> getSymbolAsyncDispose(v8::Isolate* isolate) {
+  return IsolateBase::from(isolate).getSymbolAsyncDispose();
 }
 
 void throwIfConstructorCalledAsFunction(
@@ -40,7 +62,7 @@ void scheduleUnimplementedConstructorError(
     const v8::FunctionCallbackInfo<v8::Value>& args,
     const std::type_info& type) {
   auto isolate = args.GetIsolate();
-  isolate->ThrowError(v8Str(isolate,
+  isolate->ThrowError(v8StrIntern(isolate,
       kj::str("Failed to construct '", typeName(type), "': the constructor is not implemented.")));
 }
 
@@ -48,7 +70,7 @@ void scheduleUnimplementedMethodError(
     const v8::FunctionCallbackInfo<v8::Value>& args,
     const std::type_info& type, const char* methodName) {
   auto isolate = args.GetIsolate();
-  isolate->ThrowError(v8Str(isolate,
+  isolate->ThrowError(v8StrIntern(isolate,
       kj::str("Failed to execute '", methodName, "' on '", typeName(type),
               "': the method is not implemented.")));
 }
@@ -57,7 +79,7 @@ void scheduleUnimplementedPropertyError(
     const v8::PropertyCallbackInfo<v8::Value>& args,
     const std::type_info& type, const char* propertyName) {
   auto isolate = args.GetIsolate();
-  isolate->ThrowError(v8Str(isolate,
+  isolate->ThrowError(v8StrIntern(isolate,
       kj::str("Failed to get the '", propertyName, "' property on '", typeName(type),
               "': the property is not implemented.")));
 }

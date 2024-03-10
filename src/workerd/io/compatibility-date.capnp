@@ -8,19 +8,6 @@ using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("workerd");
 $Cxx.allowCancellation;
 
-const supportedCompatibilityDate :Text = "2023-05-18";
-# Newest compatibility date that can safely be set using code compiled from this repo. Trying to
-# run a Worker with a newer compatibility date than this will fail.
-#
-# This should be updated to the current date on a regular basis. The reason this exists is so that
-# if you build an old version of the code and try to run a new Worker with it, you get an
-# appropriate error, rather than have the code run with the wrong compatibility mode.
-#
-# Note that the production Cloudflare Workers upload API always accepts any date up to the current
-# date regardless of this constant, on the assumption that Cloudflare is always running the latest
-# version of the code. This constant is more to protect users who are self-hosting the runtime and
-# could be running an older version.
-
 struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # Flags that change the basic behavior of the runtime API, especially for
   # backwards-compatibility with old bugs.
@@ -47,7 +34,7 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # be enabled.
 
   annotation compatEnableAllDates @0x9a1d37c8030d9418 (field) :Void;
-  # All compatability dates should start using the flag as enabled.
+  # All compatibility dates should start using the flag as enabled.
   # NOTE: This is almost NEVER what you actually want because you're most likely breaking back
   # compat. Note that workers uploaded with the flag will fail validation, so this will break
   # uploads for anyone still using the flag.
@@ -62,8 +49,9 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   annotation neededByFl @0xbd23aff9deefc308 (field) :Void;
   # A tag to tell us which fields we'll need to propagate to FL on subrequests and responses.
   #
-  # ("FL" refers to Cloudflare's HTTP proxy stack which is used for all outbound requests. Flags
-  # with this annotation have no effect when `workerd` is used outside of Cloudflare.)
+  # ("FL" refers to Cloudflare's HTTP proxy stack which is used for all outbound requests. Except
+  # for `brotliContentEncoding`, flags with this annotation have no effect when `workerd` is used
+  # outside of Cloudflare.)
 
   annotation experimental @0xe3e5a63e76284d88 (field):Void;
   # Flags with this annotation can only be used when workerd is run with the --experimental flag.
@@ -223,13 +211,15 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # Obsolete flag. Has no effect.
 
   webSocketCompression @20 :Bool
-      $compatEnableFlag("web_socket_compression");
+      $compatEnableFlag("web_socket_compression")
+      $compatEnableDate("2023-08-15")
+      $compatDisableFlag("no_web_socket_compression");
   # Enables WebSocket compression. Without this flag, all attempts to negotiate compression will
-  # be refused, so WebSockets will never use compression. With this flag, the system will
-  # automatically negotiate the use of the permesssage-deflate extension where appropriate.
-  # The Worker can also request specific compression settings by specifying a valid
-  # Sec-WebSocket-Extensions header, or setting the header to the empty string to explicitly
-  # request that no compression be used.
+  # be refused for scripts prior to the compat date, so WebSockets will never use compression.
+  # With this flag, the system will automatically negotiate the use of the permessage-deflate
+  # extension where appropriate. The Worker can also request specific compression settings by
+  # specifying a valid Sec-WebSocket-Extensions header, or setting the header to the empty string
+  # to explicitly request that no compression be used.
 
   nodeJsCompat @21 :Bool
       $compatEnableFlag("nodejs_compat")
@@ -289,6 +279,9 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
       $experimental;
   # Allows service bindings to call additional event handler methods on the target Worker.
   # Initially only includes support for calling the queue() handler.
+  # WARNING: this flag exposes the V8 deserialiser to users via `Fetcher#queue()` `serializedBody`.
+  # Historically, this has required a trusted environment to be safe. If we decide to make this
+  # flag non-experimental, we must ensure we take appropriate precuations.
 
   noCfBotManagementDefault @29 :Bool
       $compatEnableFlag("no_cf_botmanagement_default")
@@ -304,4 +297,109 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
       $compatEnableDate("2023-07-01");
   # When enabled, the delete() and has() methods of the standard URLSearchParams object
   # (see url-standard.h) will have the recently added second value argument enabled.
+
+  strictCompression @31 :Bool
+      $compatEnableFlag("strict_compression_checks")
+      $compatDisableFlag("no_strict_compression_checks")
+      $compatEnableDate("2023-08-01");
+  # Perform additional error checking in the Web Compression API and throw an error if a
+  # DecompressionStream has trailing data or gets closed before the full compressed data has been
+  # provided.
+
+  brotliContentEncoding @32 :Bool
+      $compatEnableFlag("brotli_content_encoding")
+      $compatDisableFlag("no_brotli_content_encoding")
+      $neededByFl;
+  # Enables compression/decompression support for the brotli compression algorithm.
+  # With the flag enabled workerd will support the "br" content encoding in the Request and
+  # Response APIs and compress or decompress data accordingly as with gzip.
+  # Note that brotli support also requires backend support from the production environment which
+  # may not be available at this time, limiting the functionality of the flag.
+
+  strictCrypto @33 :Bool
+      $compatEnableFlag("strict_crypto_checks")
+      $compatDisableFlag("no_strict_crypto_checks")
+      $compatEnableDate("2023-08-01");
+  # Perform additional error checking in the Web Crypto API to conform with the specification as
+  # well as reject key parameters that may be unsafe based on key length or public exponent.
+
+  rttiApi @34 :Bool
+      $compatEnableFlag("rtti_api")
+      $experimental;
+  # Enables the `workerd:rtti` module for querying runtime-type-information from JavaScript.
+
+  webgpu @35 :Bool
+      $compatEnableFlag("webgpu")
+      $experimental;
+
+  cryptoPreservePublicExponent @36 :Bool
+      $compatEnableFlag("crypto_preserve_public_exponent")
+      $compatDisableFlag("no_crypto_preserve_public_exponent")
+      $compatEnableDate("2023-12-01");
+  # In the WebCrypto API, the `publicExponent` field of the algorithm of RSA keys would previously
+  # be an ArrayBuffer. Using this flag, publicExponent is a Uint8Array as mandated by the
+  # specification.
+
+  vectorizeQueryMetadataOptional @37 :Bool
+      $compatEnableFlag("vectorize_query_metadata_optional")
+      $compatEnableDate("2023-11-08")
+      $compatDisableFlag("vectorize_query_original");
+  # Vectorize query option change to allow returning of metadata to be optional. Accompanying this:
+  # a return format change to move away from a nested object with the VectorizeVector.
+
+  unsafeModule @38 :Bool
+      $compatEnableFlag("unsafe_module")
+      $experimental;
+  # Enables the `workerd:unsafe` module for performing dangerous operations from JavaScript.
+  # Intended for local development and testing use cases. Currently just supports aborting all
+  # Durable Objects running in a `workerd` process.
+
+  jsRpc @39 :Bool
+      $compatEnableFlag("js_rpc")
+      $experimental;
+  # Enables JS RPC on the server side for Durable Object classes that do not explicitly extend
+  # `DurableObjects`.
+  #
+  # This flag is obsolete but supported temporarily to avoid breaking people who used it. All code
+  # should switch to using `extends DurableObject` as the way to enable RPC.
+  #
+  # As of this writing, it is still necessary to enable the general `experimental` flag to use RPC
+  # on both the client and server sides.
+
+  noImportScripts @40 :Bool
+      $compatEnableFlag("no_global_importscripts")
+      $compatDisableFlag("global_importscripts")
+      $compatEnableDate("2024-03-04");
+  # Removes the non-implemented importScripts() function from the global scope.
+
+  nodeJsAls @41 :Bool
+      $compatEnableFlag("nodejs_als")
+      $compatDisableFlag("no_nodejs_als");
+  # Enables the availability of the Node.js AsyncLocalStorage API independently of the full
+  # node.js compatibility option.
+
+  queuesJsonMessages @42 :Bool
+      $compatEnableFlag("queues_json_messages")
+      $compatDisableFlag("no_queues_json_messages")
+      $compatEnableDate("2024-03-18");
+  # Queues bindings serialize messages to JSON format by default (the previous default was v8 format)
+
+  pythonWorkers @43 :Bool
+      $compatEnableFlag("python_workers");
+  # Enables Python Workers. Access to this flag is not restricted, instead bundles containing
+  # Python modules are restricted in EWC.
+  #
+  # WARNING: Python Workers are still an experimental feature and thus subject to change.
+
+  fetcherNoGetPutDelete @44 :Bool
+      $compatEnableFlag("fetcher_no_get_put_delete")
+      $compatDisableFlag("fetcher_has_get_put_delete")
+      $compatEnableDate("2024-03-26");
+  # Historically, the `Fetcher` type -- which is the type of Service Bindings, and also the parent
+  # type of Durable Object stubs -- had special methods `get()`, `put()`, and `delete()`, which
+  # were shortcuts for calling `fetch()` with the corresponding HTTP method. These methods were
+  # never documented.
+  #
+  # To make room for people to define their own RPC methods with these names, this compat flag
+  # makes them no longer defined.
 }

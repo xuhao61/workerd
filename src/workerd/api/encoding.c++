@@ -3,6 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "encoding.h"
+#include <workerd/jsg/jsg.h>
+#include <workerd/jsg/buffersource.h>
 #include <unicode/ucnv.h>
 #include <unicode/utf8.h>
 #include <algorithm>
@@ -289,14 +291,14 @@ kj::Maybe<IcuDecoder> IcuDecoder::create(Encoding encoding, bool fatal, bool ign
   if (fatal) {
     status = U_ZERO_ERROR;
     ucnv_setToUCallBack(inner, UCNV_TO_U_CALLBACK_STOP, nullptr, nullptr, nullptr, &status);
-    if (U_FAILURE(status)) return nullptr;
+    if (U_FAILURE(status)) return kj::none;
   }
 
   return IcuDecoder(encoding, inner, ignoreBom);
 }
 
-kj::Maybe<v8::Local<v8::String>> IcuDecoder::decode(
-    v8::Isolate* isolate,
+kj::Maybe<jsg::JsString> IcuDecoder::decode(
+    jsg::Lock& js,
     kj::ArrayPtr<const kj::byte> buffer,
     bool flush) {
   UErrorCode status = U_ZERO_ERROR;
@@ -333,7 +335,7 @@ kj::Maybe<v8::Local<v8::String>> IcuDecoder::decode(
       // Note also that in this case we'll interpret as Latin1 since UTF-8 bytes
       // within this range are identical to Latin1 and v8 allocates these more
       // efficiently.
-      return jsg::v8StrFromLatin1(isolate, buffer);
+      return js.str(buffer);
     }
 
     if (encoding == Encoding::Utf16le && buffer.size() % sizeof(char16_t) == 0) {
@@ -353,7 +355,7 @@ kj::Maybe<v8::Local<v8::String>> IcuDecoder::decode(
           omitInitialBom = data[0] == 0xfeff;
           bomSeen = true;
         }
-        return jsg::v8Str(isolate, data.slice(omitInitialBom ? 1 : 0, data.size()));
+        return js.str(data.slice(omitInitialBom ? 1 : 0, data.size()));
       }
     }
   }
@@ -379,7 +381,7 @@ kj::Maybe<v8::Local<v8::String>> IcuDecoder::decode(
       flush,
       &status);
 
-  if (U_FAILURE(status)) return nullptr;
+  if (U_FAILURE(status)) return kj::none;
 
   auto omitInitialBom = false;
   auto length = std::distance(result.begin(), dest);
@@ -388,14 +390,13 @@ kj::Maybe<v8::Local<v8::String>> IcuDecoder::decode(
     bomSeen = true;
   }
 
-  return jsg::v8Str(isolate, result.slice(omitInitialBom ? 1 : 0, length));
+  return js.str(result.slice(omitInitialBom ? 1 : 0, length));
 }
 
-kj::Maybe<v8::Local<v8::String>> AsciiDecoder::decode(
-    v8::Isolate* isolate,
-    kj::ArrayPtr<const kj::byte> buffer,
-    bool flush) {
-  return jsg::v8StrFromLatin1(isolate, buffer);
+kj::Maybe<jsg::JsString> AsciiDecoder::decode(jsg::Lock& js,
+                                              kj::ArrayPtr<const kj::byte> buffer,
+                                              bool flush) {
+  return js.str(buffer);
 }
 
 void IcuDecoder::reset() {
@@ -422,13 +423,13 @@ TextDecoder::constructor(jsg::Optional<kj::String> maybeLabel,
     return kj::str("\"", label, "\" is not a valid encoding.");
   };
 
-  KJ_IF_MAYBE(label, maybeLabel) {
-    encoding = getEncodingForLabel(*label);
+  KJ_IF_SOME(label, maybeLabel) {
+    encoding = getEncodingForLabel(label);
     JSG_REQUIRE(encoding != Encoding::Replacement &&
                  encoding != Encoding::X_User_Defined &&
                  encoding != Encoding::INVALID,
                  RangeError,
-                 errorMessage(*label));
+                 errorMessage(label));
   }
 
   if (encoding == Encoding::Windows_1252) {
@@ -446,28 +447,27 @@ kj::StringPtr TextDecoder::getEncoding() {
   return getEncodingId(getImpl().getEncoding());
 }
 
-v8::Local<v8::String> TextDecoder::decode(
+jsg::JsString TextDecoder::decode(
+    jsg::Lock& js,
     jsg::Optional<kj::Array<const kj::byte>> maybeInput,
-    jsg::Optional<DecodeOptions> maybeOptions,
-    v8::Isolate* isolate) {
+    jsg::Optional<DecodeOptions> maybeOptions) {
   auto options = maybeOptions.orDefault(DEFAULT_OPTIONS);
   auto& input = maybeInput.orDefault(EMPTY);
   return JSG_REQUIRE_NONNULL(
-      getImpl().decode(isolate, input, !options.stream),
+      getImpl().decode(js, input, !options.stream),
       TypeError,
       "Failed to decode input.");
 }
 
-kj::Maybe<v8::Local<v8::String>> TextDecoder::decodePtr(
-    v8::Isolate* isolate,
-    kj::ArrayPtr<const kj::byte> buffer,
-    bool flush) {
+kj::Maybe<jsg::JsString> TextDecoder::decodePtr(jsg::Lock& js,
+                                                kj::ArrayPtr<const kj::byte> buffer,
+                                                bool flush) {
   KJ_SWITCH_ONEOF(decoder) {
     KJ_CASE_ONEOF(dec, AsciiDecoder) {
-      return dec.decode(isolate, buffer, flush);
+      return dec.decode(js, buffer, flush);
     }
     KJ_CASE_ONEOF(dec, IcuDecoder) {
-      return dec.decode(isolate, buffer, flush);
+      return dec.decode(js, buffer, flush);
     }
   }
   KJ_UNREACHABLE;
@@ -480,26 +480,36 @@ jsg::Ref<TextEncoder> TextEncoder::constructor() {
   return jsg::alloc<TextEncoder>();
 }
 
-v8::Local<v8::Uint8Array> TextEncoder::encode(jsg::Optional<v8::Local<v8::String>> input,
-    v8::Isolate* isolate) {
-  auto str = input.orDefault(v8::String::Empty(isolate));
-  auto maybeBuffer = v8::ArrayBuffer::MaybeNew(isolate, str->Utf8Length(isolate));
-  JSG_ASSERT(!maybeBuffer.IsEmpty(), RangeError, "Cannot allocate space for TextEncoder.encode");
-  auto buffer = maybeBuffer.ToLocalChecked();
-  auto view = v8::Uint8Array::New(buffer, 0, buffer->ByteLength());
-  [[maybe_unused]] auto result = encodeInto(str, view, isolate);
-  KJ_DASSERT(result.written == buffer->ByteLength());
-  KJ_DASSERT(result.read == str->Length());
-  return view;
+namespace {
+TextEncoder::EncodeIntoResult encodeIntoImpl(jsg::Lock& js,
+                                             jsg::JsString input,
+                                             jsg::BufferSource& buffer) {
+  auto result = input.writeInto(js, buffer.asArrayPtr().asChars(),
+                                static_cast<jsg::JsString::WriteOptions>(
+                                    jsg::JsString::NO_NULL_TERMINATION |
+                                    jsg::JsString::REPLACE_INVALID_UTF8));
+  return TextEncoder::EncodeIntoResult {
+    .read = result.read,
+    .written = result.written,
+  };
+}
+}  // namespace
+
+jsg::BufferSource TextEncoder::encode(jsg::Lock& js, jsg::Optional<jsg::JsString> input) {
+  auto str = input.orDefault(js.str());
+  auto view = JSG_REQUIRE_NONNULL(jsg::BufferSource::tryAlloc(js, str.utf8Length(js)),
+                                  RangeError, "Cannot allocate space for TextEncoder.encode");
+  [[maybe_unused]] auto result = encodeIntoImpl(js, str, view);
+  KJ_DASSERT(result.written == view.size());
+  return kj::mv(view);
 }
 
-TextEncoder::EncodeIntoResult TextEncoder::encodeInto(
-    v8::Local<v8::String> input, v8::Local<v8::Uint8Array> buffer, v8::Isolate* isolate) {
-  EncodeIntoResult result{0,0};
-  auto bytes = jsg::asBytes(buffer.As<v8::ArrayBufferView>()).releaseAsChars();
-  result.written = input->WriteUtf8(isolate, bytes.begin(), bytes.size(), &result.read,
-      v8::String::NO_NULL_TERMINATION | v8::String::REPLACE_INVALID_UTF8);
-  return result;
+TextEncoder::EncodeIntoResult TextEncoder::encodeInto(jsg::Lock& js,
+                                                      jsg::JsString input,
+                                                      jsg::BufferSource buffer) {
+  auto handle = buffer.getHandle(js);
+  JSG_REQUIRE(handle->IsUint8Array(), TypeError, "buffer must be a Uint8Array");
+  return encodeIntoImpl(js, input, buffer);
 }
 
 }  // namespace workerd::api

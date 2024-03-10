@@ -8,9 +8,9 @@
 namespace workerd {
 
 namespace {
-thread_local CrossThreadWaitList::WaiterMap threadLocalWaiters;
 // Optimization: If the same wait list is waited multiple times in the same thread, we want to
 // share the signal rather than send two cross-thread signals.
+thread_local CrossThreadWaitList::WaiterMap threadLocalWaiters;
 
 void END_WAIT_LIST_CANCELER_STACK_START_CANCELEE_STACK() {}
 }  // namespace
@@ -27,8 +27,8 @@ CrossThreadWaitList::Waiter::Waiter(const State& state,
     : state(kj::atomicAddRef(state)), fulfiller(kj::mv(fulfillerArg)) {
   auto lock = state.waiters.lockExclusive();
   if (__atomic_load_n(&state.done, __ATOMIC_ACQUIRE)) {
-    KJ_IF_MAYBE(e, state.exception) {
-      fulfiller->reject(kj::cp(*e));
+    KJ_IF_SOME(e, state.exception) {
+      fulfiller->reject(kj::cp(e));
     } else {
       fulfiller->fulfill();
     }
@@ -56,8 +56,8 @@ CrossThreadWaitList::Waiter::~Waiter() noexcept(false) {
 
 kj::Promise<void> CrossThreadWaitList::addWaiter() const {
   if (__atomic_load_n(&state->done, __ATOMIC_ACQUIRE)) {
-    KJ_IF_MAYBE(e, state->exception) {
-      return kj::cp(*e);
+    KJ_IF_SOME(e, state->exception) {
+      return kj::cp(e);
     } else {
       return kj::READY_NOW;
     }

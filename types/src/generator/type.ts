@@ -1,3 +1,7 @@
+// Copyright (c) 2022-2023 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
 import assert from "assert";
 import {
   ArrayType,
@@ -63,7 +67,8 @@ function isBigNumber(number: NumberType) {
     name === "long" ||
     name === "unsigned long" ||
     name === "long long" ||
-    name === "unsigned long long"
+    name === "unsigned long long" ||
+    name === "jsg::JsBigInt"
   );
 }
 
@@ -291,6 +296,8 @@ export function createTypeNode(
           return f.createTypeReferenceNode("Uint8Array");
         case BuiltinType_Type.V8ARRAY_BUFFER_VIEW:
           return f.createTypeReferenceNode("ArrayBufferView");
+        case BuiltinType_Type.V8ARRAY_BUFFER:
+          return f.createTypeReferenceNode("ArrayBuffer");
         case BuiltinType_Type.JSG_BUFFER_SOURCE:
           return f.createUnionTypeNode([
             f.createTypeReferenceNode("ArrayBuffer"),
@@ -357,6 +364,8 @@ export function createTypeNode(
           return f.createTypeReferenceNode("never");
         case JsgImplType_Type.JSG_VARARGS:
           return f.createArrayTypeNode(f.createTypeReferenceNode("any"));
+        case JsgImplType_Type.JSG_NAME:
+          return f.createTypeReferenceNode("PropertyKey");
         default:
           assert.fail(`Unknown JSG implementation type: ${impl}`);
       }

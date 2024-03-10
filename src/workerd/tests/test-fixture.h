@@ -1,3 +1,7 @@
+// Copyright (c) 2023 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
 #pragma once
 
 #include <kj/function.h>
@@ -8,31 +12,26 @@
 #include <workerd/io/worker.h>
 #include <workerd/jsg/jsg-test.h>
 #include <workerd/server/workerd.capnp.h>
+#include <workerd/api/memory-cache.h>
 
 namespace workerd {
 
+// TestFixture is responsible for creating workerd environment during tests.
+// All the infrastructure is started in the constructor. It is accessed through run() method.
 struct TestFixture {
-  // TestFixture is responsible for creating workerd environment during tests.
-  // All the infrastructure is started in the constructor. It is accessed through run() method.
-
   struct SetupParams {
     // waitScope of outer IO loop. New IO will be set up if missing.
     kj::Maybe<kj::WaitScope&> waitScope;
     kj::Maybe<CompatibilityFlags::Reader> featureFlags;
     kj::Maybe<kj::StringPtr> mainModuleSource;
+    // If set, make a stub of an Actor with the given id.
+    kj::Maybe<Worker::Actor::Id> actorId;
   };
 
-  TestFixture(SetupParams params = { });
+  TestFixture(SetupParams&& params = { });
 
   struct V8Environment {
     v8::Isolate* isolate;
-
-    v8::Local<v8::Value> compileAndRunScript(kj::StringPtr script) const;
-    // Compile and run the script. Returns the result of last statement.
-
-    v8::Local<v8::Object> compileAndInstantiateModule(
-      kj::StringPtr name, kj::ArrayPtr<const char> src) const;
-    // Compile and instantiate esm module. Returns module namespace object.
   };
 
   struct Environment : public V8Environment {
@@ -45,18 +44,17 @@ struct TestFixture {
   template <typename T> struct RunReturnType { using Type = T; };
   template <typename T> struct RunReturnType<kj::Promise<T>> { using Type = T; };
 
+  // Setup the incoming request and run given callback in worker's IO context.
+  // callback should accept const Environment& parameter and return Promise<T>|void.
+  // For void callbacks run waits for their completion, for promises waits for their resolution
+  // and returns the result.
   template<typename CallBack>
   auto runInIoContext(CallBack&& callback)
       -> typename RunReturnType<decltype(callback(kj::instance<const Environment&>()))>::Type {
-    // Setup the incoming request and run given callback in worker's IO context.
-    // callback should accept const Environment& parameter and return Promise<T>|void.
-    // For void callbacks run waits for their completion, for promises waits for their resolution
-    // and returns the result.
-
     auto request = createIncomingRequest();
     kj::WaitScope* waitScope;
-    KJ_IF_MAYBE(ws, params.waitScope) {
-      waitScope = ws;
+    KJ_IF_SOME(ws, this->waitScope) {
+      waitScope = &ws;
     } else {
       waitScope = &KJ_REQUIRE_NONNULL(io).waitScope;
     }
@@ -71,21 +69,21 @@ struct TestFixture {
     }).wait(*waitScope);
   }
 
+  // Special void version of runInIoContext that ignores exceptions with given descriptions.
   void runInIoContext(
       kj::Function<kj::Promise<void>(const Environment&)>&& callback,
       kj::ArrayPtr<kj::StringPtr> errorsToIgnore);
-  // Special void version of runInIoContext that ignores exceptions with given descriptions.
 
   struct Response {
     uint statusCode;
     kj::String body;
   };
 
-  Response runRequest(kj::HttpMethod method, kj::StringPtr url, kj::StringPtr body);
   // Performs HTTP request on the default module handler, and waits for full response.
+  Response runRequest(kj::HttpMethod method, kj::StringPtr url, kj::StringPtr body);
 
 private:
-  SetupParams params;
+  kj::Maybe<kj::WaitScope&> waitScope;
   capnp::MallocMessageBuilder configArena;
   workerd::server::config::Worker::Reader config;
   kj::Maybe<kj::AsyncIoContext> io;
@@ -93,6 +91,7 @@ private:
   kj::Own<kj::Timer> timer;
   kj::Own<TimerChannel> timerChannel;
   kj::Own<kj::EntropySource> entropySource;
+  kj::Maybe<kj::Own<Worker::Actor>> actor;
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
   ThreadContext::HeaderIdBundle threadContextHeaderBundle;
@@ -100,7 +99,8 @@ private:
   ThreadContext threadContext;
   kj::Own<IsolateLimitEnforcer> isolateLimitEnforcer;
   kj::Own<Worker::ValidationErrorReporter> errorReporter;
-  kj::Own<Worker::ApiIsolate> apiIsolate;
+  kj::Own<api::MemoryCacheProvider> memoryCacheProvider;
+  kj::Own<Worker::Api> api;
   kj::Own<Worker::Isolate> workerIsolate;
   kj::Own<Worker::Script> workerScript;
   kj::Own<Worker> worker;

@@ -9,7 +9,7 @@ namespace {
 
 V8System v8System;
 
-struct EvalContext: public Object {
+struct EvalContext: public Object, public ContextGlobal {
   JSG_RESOURCE_TYPE(EvalContext) {}
 };
 JSG_DECLARE_ISOLATE_TYPE(EvalIsolate, EvalContext);
@@ -21,18 +21,17 @@ KJ_TEST("eval() is blocked") {
   e.expectEval("new Function('a', 'b', 'return a + b;')(123, 321)",
       "throws", "EvalError: Code generation from strings disallowed for this context");
 
-  {
-    V8StackScope stackScope;
-    EvalIsolate::Lock(e.getIsolate(), stackScope).setAllowEval(true);
-  }
+  e.getIsolate().runInLockScope([&](EvalIsolate::Lock& lock) {
+    lock.setAllowEval(true);
+  });
 
   e.expectEval("eval('123')", "number", "123");
   e.expectEval("new Function('a', 'b', 'return a + b;')(123, 321)", "number", "444");
 
-  {
-    V8StackScope stackScope;
-    EvalIsolate::Lock(e.getIsolate(), stackScope).setAllowEval(false);
-  }
+  e.getIsolate().runInLockScope([&](EvalIsolate::Lock& lock) {
+    lock.setAllowEval(false);
+  });
+
 
   e.expectEval("eval('123')",
       "throws", "EvalError: Code generation from strings disallowed for this context");
@@ -46,7 +45,7 @@ KJ_TEST("eval() is blocked") {
 
 // ========================================================================================
 
-struct ConfigContext: public Object {
+struct ConfigContext: public Object, public ContextGlobal {
   struct Nested: public Object {
     JSG_RESOURCE_TYPE(Nested, int configuration) {
       KJ_EXPECT(configuration == 123, configuration);
@@ -66,20 +65,23 @@ JSG_DECLARE_ISOLATE_TYPE(ConfigIsolate, ConfigContext, ConfigContext::Nested,
 
 KJ_TEST("configuration values reach nested type declarations") {
   {
-    ConfigIsolate isolate(v8System, 123);
-    V8StackScope stackScope;
-    ConfigIsolate::Lock lock(isolate, stackScope);
-    v8::HandleScope handleScope(lock.v8Isolate);
-    lock.newContext<ConfigContext>().getHandle(lock.v8Isolate);
+    ConfigIsolate isolate(v8System, 123, kj::heap<IsolateObserver>());
+    isolate.runInLockScope([&](ConfigIsolate::Lock& lock) {
+      jsg::Lock& js = lock;
+      js.withinHandleScope([&] {
+        lock.newContext<ConfigContext>().getHandle(lock);
+      });
+    });
   }
   {
     KJ_EXPECT_LOG(ERROR, "failed: expected configuration == 123");
-
-    ConfigIsolate isolate(v8System, 456);
-    V8StackScope stackScope;
-    ConfigIsolate::Lock lock(isolate, stackScope);
-    v8::HandleScope handleScope(lock.v8Isolate);
-    lock.newContext<ConfigContext>().getHandle(lock.v8Isolate);
+    ConfigIsolate isolate(v8System, 456, kj::heap<IsolateObserver>());
+    isolate.runInLockScope([&](ConfigIsolate::Lock& lock) {
+      jsg::Lock& js = lock;
+      js.withinHandleScope([&] {
+        lock.newContext<ConfigContext>().getHandle(lock);
+      });
+    });
   }
 }
 

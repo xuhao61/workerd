@@ -2,10 +2,12 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+#include "workerd/jsg/jsg.h"
 #include <capnp/message.h>
 #include <capnp/serialize-text.h>
 #include <kj/test.h>
 #include <workerd/jsg/rtti.h>
+#include <workerd/jsg/rtti-test.capnp.h>
 
 struct MockConfig {};
 
@@ -28,6 +30,39 @@ kj::String tStructure() {
   auto type = builder.structure<T>();
   capnp::TextCodec codec;
   return codec.encode(type);
+}
+
+KJ_TEST("jsg::Js* types") {
+  KJ_EXPECT(tType<JsValue>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsObject>() == "(object = void)");
+  KJ_EXPECT(tType<JsBoolean>() == "(boolt = void)");
+  KJ_EXPECT(tType<JsArray>() == "(array = (element = (unknown = void), name = \"jsg::JsArray\"))");
+  KJ_EXPECT(tType<JsString>() == "(string = (name = \"jsg::JsString\"))");
+  KJ_EXPECT(tType<JsBigInt>() == "(number = (name = \"jsg::JsBigInt\"))");
+  KJ_EXPECT(tType<JsNumber>() == "(number = (name = \"jsg::JsNumber\"))");
+  KJ_EXPECT(tType<JsInt32>() == "(number = (name = \"jsg::JsInt32\"))");
+  KJ_EXPECT(tType<JsUint32>() == "(number = (name = \"jsg::JsUint32\"))");
+  KJ_EXPECT(tType<JsDate>() == "(builtin = (type = kjDate))");
+  KJ_EXPECT(tType<JsRegExp>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsMap>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsSet>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsSymbol>() == "(unknown = void)");
+
+  KJ_EXPECT(tType<JsRef<JsValue>>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsRef<JsObject>>() == "(object = void)");
+  KJ_EXPECT(tType<JsRef<JsBoolean>>() == "(boolt = void)");
+  KJ_EXPECT(tType<JsRef<JsArray>>() ==
+            "(array = (element = (unknown = void), name = \"jsg::JsArray\"))");
+  KJ_EXPECT(tType<JsRef<JsString>>() == "(string = (name = \"jsg::JsString\"))");
+  KJ_EXPECT(tType<JsRef<JsBigInt>>() == "(number = (name = \"jsg::JsBigInt\"))");
+  KJ_EXPECT(tType<JsRef<JsNumber>>() == "(number = (name = \"jsg::JsNumber\"))");
+  KJ_EXPECT(tType<JsRef<JsInt32>>() == "(number = (name = \"jsg::JsInt32\"))");
+  KJ_EXPECT(tType<JsRef<JsUint32>>() == "(number = (name = \"jsg::JsUint32\"))");
+  KJ_EXPECT(tType<JsRef<JsDate>>() == "(builtin = (type = kjDate))");
+  KJ_EXPECT(tType<JsRef<JsRegExp>>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsRef<JsMap>>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsRef<JsSet>>() == "(unknown = void)");
+  KJ_EXPECT(tType<JsRef<JsSymbol>>() == "(unknown = void)");
 }
 
 KJ_TEST("primitive types") {
@@ -55,8 +90,6 @@ KJ_TEST("string types") {
   KJ_EXPECT(tType<kj::StringPtr>() == "(string = (name = \"kj::StringPtr\"))");
   KJ_EXPECT(tType<v8::String>() == "(string = (name = \"v8::String\"))");
   KJ_EXPECT(tType<ByteString>() == "(string = (name = \"ByteString\"))");
-  KJ_EXPECT(tType<UsvString>() == "(string = (name = \"UsvString\"))");
-  KJ_EXPECT(tType<UsvStringPtr>() == "(string = (name = \"UsvStringPtr\"))");
 }
 
 KJ_TEST("object types") {
@@ -175,7 +208,8 @@ KJ_TEST("resource structure") {
   KJ_EXPECT(tStructure<Base>() == "(name = \"Base\", members = [], "
       "extends = (intrinsic = (name = \"v8::kIteratorPrototype\")), "
       "iterable = false, asyncIterable = false, "
-      "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::Base\", tsRoot = false)");
+      "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::Base\", tsRoot = false, "
+      "disposable = false, asyncDisposable = false)");
 
   KJ_EXPECT(tStructure<TestResource>() == "(name = \"TestResource\", members = ["
       "(method = (name = \"instanceMethod\", returnType = (voidt = void), args = [(number = (name = \"int\")), (number = (name = \"double\"))], static = false)), "
@@ -189,7 +223,8 @@ KJ_TEST("resource structure") {
       "(constructor = (args = [(maybe = (value = (string = (name = \"kj::String\")), name = \"jsg::Optional\"))]))], "
       "extends = (structure = (name = \"Base\", fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::Base\")), "
       "iterable = false, asyncIterable = false, "
-      "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestResource\", tsRoot = false)");
+      "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestResource\", tsRoot = false, "
+      "disposable = false, asyncDisposable = false)");
 }
 
 struct TestNested : jsg::Object {
@@ -204,12 +239,13 @@ KJ_TEST("nested structure") {
     "extends = (intrinsic = (name = \"v8::kIteratorPrototype\")), "
     "iterable = false, asyncIterable = false, "
     "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::Base\", "
-    "tsRoot = false"
+    "tsRoot = false, disposable = false, asyncDisposable = false"
     "), "
     "name = \"Base\"))"
     "], "
     "iterable = false, asyncIterable = false, "
-    "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestNested\", tsRoot = false)");
+    "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestNested\", tsRoot = false, "
+    "disposable = false, asyncDisposable = false)");
 }
 
 struct TestConstant : jsg::Object {
@@ -231,7 +267,25 @@ KJ_TEST("constant members") {
     "(constant = (name = \"CIRCLE\", value = 2))], "
     "iterable = false, asyncIterable = false, "
     "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestConstant\", "
-    "tsRoot = false)");
+    "tsRoot = false, disposable = false, asyncDisposable = false)");
+}
+
+
+struct TestLazyJsProperty : jsg::Object {
+  JSG_RESOURCE_TYPE(TestLazyJsProperty) {
+    JSG_CONTEXT_JS_BUNDLE(TEST_BUNDLE);
+    JSG_LAZY_JS_INSTANCE_PROPERTY(JsProperty, "js-module");
+    JSG_LAZY_JS_INSTANCE_READONLY_PROPERTY(JsReadonlyProperty, "js-readonly-module");
+  };
+};
+
+KJ_TEST("lazyJsProperty") {
+  KJ_EXPECT(tStructure<TestLazyJsProperty>() == "(name = \"TestLazyJsProperty\", members = ["
+  "(property = (name = \"JsProperty\", type = (jsBuiltin = (module = \"js-module\", export = \"JsProperty\")), readonly = false, lazy = true, prototype = false)), "
+  "(property = (name = \"JsReadonlyProperty\", type = (jsBuiltin = (module = \"js-readonly-module\", export = \"JsReadonlyProperty\")), readonly = true, lazy = true, prototype = false))], "
+  "iterable = false, asyncIterable = false, fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestLazyJsProperty\", tsRoot = false, "
+  "builtinModules = [(specifier = \"testBundle:internal\", tsDeclarations = \"foo: string\")], "
+  "disposable = false, asyncDisposable = false)");
 }
 
 struct TestStruct {
@@ -250,7 +304,7 @@ KJ_TEST("struct structure") {
       "(property = (name = \"b\", type = (boolt = void), readonly = false, lazy = false, prototype = false))], "
       "iterable = false, asyncIterable = false, "
       "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestStruct\", "
-      "tsRoot = false)");
+      "tsRoot = false, disposable = false, asyncDisposable = false)");
 }
 
 struct TestSymbolTable: public jsg::Object {
@@ -273,10 +327,10 @@ KJ_TEST("symbol table") {
       "(method = (name = \"recursiveTypeFunction\", returnType = (voidt = void), args = [(structure = (name = \"TestSymbolTable\", fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestSymbolTable\"))], static = false))], "
       "iterable = false, asyncIterable = false, "
       "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestSymbolTable\", "
-      "tsRoot = false)");
+      "tsRoot = false, disposable = false, asyncDisposable = false)");
 
-  KJ_EXPECT(builder.structure("workerd::jsg::rtti::(anonymous namespace)::TestSymbolTable"_kj) != nullptr);
-  KJ_EXPECT(builder.structure("workerd::jsg::rtti::(anonymous namespace)::TestResource"_kj) != nullptr);
+  KJ_EXPECT(builder.structure("workerd::jsg::rtti::(anonymous namespace)::TestSymbolTable"_kj) != kj::none);
+  KJ_EXPECT(builder.structure("workerd::jsg::rtti::(anonymous namespace)::TestResource"_kj) != kj::none);
   KJ_EXPECT(KJ_REQUIRE_NONNULL(builder.structure("workerd::jsg::rtti::(anonymous namespace)::TestResource"_kj)).getMembers().size() > 0);
 }
 
@@ -308,14 +362,16 @@ KJ_TEST("typescript macros") {
       "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestTypeScriptResourceType\", "
       "tsRoot = true, "
       "tsOverride = \"{ readonly thing: 42 }\", "
-      "tsDefine = \"interface Define {}\")");
+      "tsDefine = \"interface Define {}\", "
+      "disposable = false, asyncDisposable = false)");
   KJ_EXPECT(tStructure<TestTypeScriptStruct>() == "(name = \"TestTypeScriptStruct\", members = ["
       "(property = (name = \"structThing\", type = (number = (name = \"int\")), readonly = false, lazy = false, prototype = false))], "
       "iterable = false, asyncIterable = false, "
       "fullyQualifiedName = \"workerd::jsg::rtti::(anonymous namespace)::TestTypeScriptStruct\", "
       "tsRoot = true, "
       "tsOverride = \"RenamedStructThing { structThing: 42 }\", "
-      "tsDefine = \"interface StructDefine {}\")");
+      "tsDefine = \"interface StructDefine {}\", "
+      "disposable = false, asyncDisposable = false)");
 }
 
 } // namespace

@@ -9,6 +9,7 @@
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
     "exactOptionalPropertyTypes": true,
+    "moduleResolution": "node",
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": true,
     "noImplicitReturns": true,
@@ -18,6 +19,7 @@
     "noUnusedParameters": true,
     "strictNullChecks": true,
     "esModuleInterop": true,
+    "declaration": true,
     "types": [
       // todo: consume generated workerd types
       // "@cloudflare/workers-types"

@@ -6,11 +6,11 @@
 #include "util.h"
 #include <kj/vector.h>
 #include <kj/encoding.h>
-#include <algorithm>
-#include <functional>
-#include <regex>
 #include <kj/parse/char.h>
 #include <kj/compat/http.h>
+#include <workerd/util/mimetype.h>
+#include <algorithm>
+#include <regex>
 
 #if !_MSC_VER
 #include <strings.h>
@@ -19,11 +19,9 @@
 namespace workerd::api {
 
 namespace {
-
+// Like split() in kj/compat/url.c++, but splits at a substring rather than a character.
 kj::ArrayPtr<const char> splitAtSubString(
     kj::ArrayPtr<const char>& text, kj::StringPtr subString) {
-  // Like split() in kj/compat/url.c++, but splits at a substring rather than a character.
-
   // TODO(perf): Use a Boyer-Moore search?
   auto iter = std::search(text.begin(), text.end(), subString.begin(), subString.end());
   auto result = kj::arrayPtr(text.begin(), iter - text.begin());
@@ -68,7 +66,7 @@ constexpr auto contentDisposition =
     p::sequence(p::discardWhitespace, httpIdentifier,
                 p::discardWhitespace, p::many(contentDispositionParam));
 
-void parseFormData(kj::Vector<FormData::Entry>& data, kj::ArrayPtr<const char> boundary,
+void parseFormData(kj::Vector<FormData::Entry>& data, kj::StringPtr boundary,
                    kj::ArrayPtr<const char> body, bool convertFilesToStrings) {
   // multipart/form-data messages are delimited by <CRLF>--<boundary>. We want to be able to handle
   // omitted carriage returns, though, so our delimiter only matches against a preceding line feed.
@@ -164,7 +162,7 @@ void parseFormData(kj::Vector<FormData::Entry>& data, kj::ArrayPtr<const char> b
       message = message.slice(0, message.size() - uint(message.back() == '\r'));
     }
 
-    if (filename == nullptr || convertFilesToStrings) {
+    if (filename == kj::none || convertFilesToStrings) {
       data.add(FormData::Entry { kj::mv(name), kj::str(message) });
     } else {
       data.add(FormData::Entry {
@@ -181,8 +179,8 @@ blobToFile(kj::StringPtr name, kj::OneOf<jsg::Ref<File>, jsg::Ref<Blob>, kj::Str
            jsg::Optional<kj::String> filename) {
   auto fromBlob = [&](jsg::Ref<Blob> blob) {
     kj::String fn;
-    KJ_IF_MAYBE(f, filename) {
-      fn = kj::mv(*f);
+    KJ_IF_SOME(f, filename) {
+      fn = kj::mv(f);
     } else {
       fn = kj::str(name);
     }
@@ -192,7 +190,7 @@ blobToFile(kj::StringPtr name, kj::OneOf<jsg::Ref<File>, jsg::Ref<Blob>, kj::Str
 
   KJ_SWITCH_ONEOF(value) {
     KJ_CASE_ONEOF(file, jsg::Ref<File>) {
-      if (filename == nullptr) {
+      if (filename == kj::none) {
         return kj::mv(file);
       } else {
         // Need to substitute filename.
@@ -209,10 +207,9 @@ blobToFile(kj::StringPtr name, kj::OneOf<jsg::Ref<File>, jsg::Ref<Blob>, kj::Str
   KJ_UNREACHABLE;
 }
 
+// Add the chars from `value` into `builder` escaping the characters '"' and '\n' using %
+// encoding, exactly as Chrome does for Content-Disposition values.
 void addEscapingQuotes(kj::Vector<char>& builder, kj::StringPtr value) {
-  // Add the chars from `value` into `builder` escaping the characters '"' and '\n' using %
-  // encoding, exactly as Chrome does for Content-Disposition values.
-
   // Chrome throws "Failed to fetch" if the name ends with a backslash. Otherwise it worries that
   // the backslash may be interpreted as escaping the final quote.
   JSG_REQUIRE(!value.endsWith("\\"), TypeError, "Name or filename can't end with backslash");
@@ -271,9 +268,10 @@ kj::Array<kj::byte> FormData::serialize(kj::ArrayPtr<const char> boundary) {
         builder.addAll("\"\r\nContent-Type: "_kj);
         auto type = file->getType();
         if (type == nullptr) {
-          type = "application/octet-stream"_kj;
+          builder.addAll(MimeType::OCTET_STREAM.toString());
+        } else {
+          builder.addAll(type);
         }
-        builder.addAll(type);
         builder.addAll("\r\n\r\n"_kj);
         builder.addAll(file->getData().asChars());
       }
@@ -287,7 +285,7 @@ kj::Array<kj::byte> FormData::serialize(kj::ArrayPtr<const char> boundary) {
   return builder.releaseAsArray().releaseAsBytes();
 }
 
-FormData::EntryType FormData::clone(v8::Isolate* isolate, FormData::EntryType& value) {
+FormData::EntryType FormData::clone(FormData::EntryType& value) {
   KJ_SWITCH_ONEOF(value) {
     KJ_CASE_ONEOF(file, jsg::Ref<File>) {
       return file.addRef();
@@ -301,33 +299,40 @@ FormData::EntryType FormData::clone(v8::Isolate* isolate, FormData::EntryType& v
 
 void FormData::parse(kj::ArrayPtr<const char> rawText, kj::StringPtr contentType,
                      bool convertFilesToStrings) {
-  if (contentType.startsWith("multipart/form-data")) {
-    auto boundary = JSG_REQUIRE_NONNULL(readContentTypeParameter(contentType, "boundary"),
-        TypeError, "No boundary string in Content-Type header. The multipart/form-data MIME "
-        "type requires a boundary parameter, e.g. 'Content-Type: multipart/form-data; "
-        "boundary=\"abcd\"'. See RFC 7578, section 4.");
-    parseFormData(data, boundary, rawText, convertFilesToStrings);
-  } else if (contentType.startsWith("application/x-www-form-urlencoded")) {
-    // Let's read the charset so we can barf if the body isn't UTF-8.
-    //
-    // TODO(conform): Transcode to UTF-8, like the spec tells us to.
-    KJ_IF_MAYBE(charsetParam, readContentTypeParameter(contentType, "charset")) {
-      auto charset = kj::str(*charsetParam);
-      JSG_REQUIRE(strcasecmp(charset.cStr(), "utf-8") == 0 ||
-                 strcasecmp(charset.cStr(), "utf8") == 0 ||
-                 strcasecmp(charset.cStr(), "unicode-1-1-utf-8") == 0,
-          TypeError, "Non-utf-8 application/x-www-form-urlencoded body.");
+  KJ_IF_SOME(parsed, MimeType::tryParse(contentType)) {
+    auto& params = parsed.params();
+    if (MimeType::FORM_DATA == parsed) {
+      auto& boundary = JSG_REQUIRE_NONNULL(params.find("boundary"_kj), TypeError,
+          "No boundary string in Content-Type header. The multipart/form-data MIME "
+          "type requires a boundary parameter, e.g. 'Content-Type: multipart/form-data; "
+          "boundary=\"abcd\"'. See RFC 7578, section 4.");
+      parseFormData(data, boundary, rawText, convertFilesToStrings);
+      return;
+    } else if (MimeType::FORM_URLENCODED == parsed) {
+      // Let's read the charset so we can barf if the body isn't UTF-8.
+      //
+      // TODO(conform): Transcode to UTF-8, like the spec tells us to.
+      KJ_IF_SOME(charsetParam, params.find("charset"_kj)) {
+        auto charset = kj::str(charsetParam);
+        JSG_REQUIRE(strcasecmp(charset.cStr(), "utf-8") == 0 ||
+                    strcasecmp(charset.cStr(), "utf8") == 0 ||
+                    strcasecmp(charset.cStr(), "unicode-1-1-utf-8") == 0,
+            TypeError, "Non-utf-8 application/x-www-form-urlencoded body.");
+      }
+      kj::Vector<kj::Url::QueryParam> query;
+      parseQueryString(query, kj::mv(rawText));
+      data.reserve(query.size());
+      for (auto& param: query) {
+        data.add(Entry { kj::mv(param.name), kj::mv(param.value) });
+      }
+      return;
     }
-    kj::Vector<kj::Url::QueryParam> query;
-    parseQueryString(query, kj::mv(rawText));
-    data.reserve(query.size());
-    for (auto& param: query) {
-      data.add(Entry { kj::mv(param.name), kj::mv(param.value) });
-    }
-  } else {
-    JSG_FAIL_REQUIRE(TypeError, "Unrecognized Content-Type header value. FormData can only "
-        "parse the following MIME types: multipart/form-data, application/x-www-form-urlencoded.");
   }
+  JSG_FAIL_REQUIRE(TypeError, kj::str(
+      "Unrecognized Content-Type header value. FormData can only "
+      "parse the following MIME types: ",
+      MimeType::FORM_DATA.toString(), ", ",
+      MimeType::FORM_URLENCODED.toString()));
 }
 
 jsg::Ref<FormData> FormData::constructor() {
@@ -347,22 +352,20 @@ void FormData::delete_(kj::String name) {
   data.truncate(pivot - data.begin());
 }
 
-kj::Maybe<kj::OneOf<jsg::Ref<File>, kj::String>> FormData::get(
-    kj::String name, v8::Isolate* isolate) {
+kj::Maybe<kj::OneOf<jsg::Ref<File>, kj::String>> FormData::get(kj::String name) {
   for (auto& [k, v]: data) {
     if (k == name) {
-      return clone(isolate, v);
+      return clone(v);
     }
   }
-  return nullptr;
+  return kj::none;
 }
 
-kj::Array<kj::OneOf<jsg::Ref<File>, kj::String>> FormData::getAll(
-    kj::String name, v8::Isolate* isolate) {
+kj::Array<kj::OneOf<jsg::Ref<File>, kj::String>> FormData::getAll(kj::String name) {
   kj::Vector<kj::OneOf<jsg::Ref<File>, kj::String>> result;
   for (auto& [k, v]: data) {
     if (k == name) {
-      result.add(clone(isolate, v));
+      result.add(clone(v));
     }
   }
   return result.releaseAsArray();
@@ -377,10 +380,10 @@ bool FormData::has(kj::String name) {
   return false;
 }
 
+// Set the first element named `name` to `value`, then remove all the rest matching that name.
 void FormData::set(kj::String name,
     kj::OneOf<jsg::Ref<File>, jsg::Ref<Blob>, kj::String> value,
     jsg::Optional<kj::String> filename) {
-  // Set the first element named `name` to `value`, then remove all the rest matching that name.
   const auto predicate = [name = name.slice(0)](const auto& kv) { return kv.name == name; };
   auto firstFound = std::find_if(data.begin(), data.end(), predicate);
   if (firstFound != data.end()) {
@@ -392,38 +395,32 @@ void FormData::set(kj::String name,
   }
 }
 
-jsg::Ref<FormData::EntryIterator> FormData::entries(
-    jsg::Lock&,
-    CompatibilityFlags::Reader featureFlags) {
+jsg::Ref<FormData::EntryIterator> FormData::entries(jsg::Lock&) {
   return jsg::alloc<EntryIterator>(IteratorState { JSG_THIS });
 }
 
-jsg::Ref<FormData::KeyIterator> FormData::keys(
-    jsg::Lock&,
-    CompatibilityFlags::Reader featureFlags) {
+jsg::Ref<FormData::KeyIterator> FormData::keys(jsg::Lock&) {
   return jsg::alloc<KeyIterator>(IteratorState { JSG_THIS });
 }
 
-jsg::Ref<FormData::ValueIterator> FormData::values(
-    jsg::Lock&,
-    CompatibilityFlags::Reader featureFlags) {
+jsg::Ref<FormData::ValueIterator> FormData::values(jsg::Lock&) {
   return jsg::alloc<ValueIterator>(IteratorState { JSG_THIS });
 }
 
 void FormData::forEach(
     jsg::Lock& js,
-    jsg::V8Ref<v8::Function> callback,
-    jsg::Optional<jsg::Value> thisArg,
-    const jsg::TypeHandler<EntryType>& handler) {
-  auto isolate = js.v8Isolate;
-  auto localCallback = callback.getHandle(isolate);
-  auto localThisArg = thisArg.map([&](jsg::Value& v) { return v.getHandle(isolate); })
-      .orDefault(v8::Undefined(isolate));
-  // JSG_THIS.tryGetHandle() is guaranteed safe because `forEach()` is only called
-  // from JavaScript, which means a Headers JS wrapper object must already exist.
-  auto localParams = KJ_ASSERT_NONNULL(JSG_THIS.tryGetHandle(isolate));
-
-  auto context = js.v8Context();  // Needed later for Call().
+    jsg::Function<void(EntryType, kj::StringPtr, jsg::Ref<FormData>)> callback,
+    jsg::Optional<jsg::Value> thisArg) {
+  // Here, if the thisArg is not passed, or is passed explicitly as a null or
+  // undefined, then undefined is used as the thisArg.
+  auto receiver = js.v8Undefined();
+  KJ_IF_SOME(arg, thisArg) {
+    auto handle = arg.getHandle(js);
+    if (!handle->IsNullOrUndefined()) {
+      receiver = handle;
+    }
+  }
+  callback.setReceiver(js.v8Ref(receiver));
 
   // On each iteration of the for loop, a JavaScript callback is invokved. If a new
   // item is appended to the URLSearchParams within that function, the loop must pick
@@ -432,16 +429,7 @@ void FormData::forEach(
   // are added to the search params unconditionally on each iteration.
   for (size_t i = 0; i < this->data.size(); i++) {
     auto& [key, value] = this->data[i];
-    static constexpr auto ARG_COUNT = 3;
-
-    v8::Local<v8::Value> args[ARG_COUNT] = {
-      handler.wrap(js, clone(isolate, value)),
-      jsg::v8Str(isolate, key),
-      localParams,
-    };
-    // Call jsg::check() to propagate exceptions, but we don't expect any
-    // particular return value.
-    jsg::check(localCallback->Call(context, localThisArg, ARG_COUNT, args));
+    callback(js, clone(value), key, JSG_THIS);
   }
 }
 

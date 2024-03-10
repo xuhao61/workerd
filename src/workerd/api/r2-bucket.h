@@ -7,10 +7,14 @@
 #include "r2-rpc.h"
 
 #include <workerd/jsg/jsg.h>
-#include <workerd/api/http.h>
+#include "streams.h"
 #include <workerd/api/r2-api.capnp.h>
 #include <capnp/compat/json.h>
 #include <workerd/util/http-util.h>
+
+namespace workerd::api {
+  class Headers;
+}
 
 namespace workerd::api::public_beta {
 
@@ -19,9 +23,8 @@ kj::ArrayPtr<kj::StringPtr> fillR2Path(kj::StringPtr pathStorage[1], const kj::M
 
 class R2MultipartUpload;
 
+// A capability to an R2 Bucket.
 class R2Bucket: public jsg::Object {
-  // A capability to an R2 Bucket.
-
 protected:
   struct friend_tag_t {};
 
@@ -32,10 +35,10 @@ protected:
   };
 
 public:
-  explicit R2Bucket(CompatibilityFlags::Reader featureFlags, uint clientIndex)
-      : featureFlags(featureFlags), clientIndex(clientIndex) {}
   // `clientIndex` is what to pass to IoContext::getHttpClient() to get an HttpClient
   // representing this namespace.
+  explicit R2Bucket(CompatibilityFlags::Reader featureFlags, uint clientIndex)
+      : featureFlags(featureFlags), clientIndex(clientIndex) {}
 
   explicit R2Bucket(FeatureFlags featureFlags, uint clientIndex, kj::String bucket, friend_tag_t)
       : featureFlags(featureFlags), clientIndex(clientIndex), adminBucket(kj::mv(bucket)) {}
@@ -124,6 +127,14 @@ public:
     jsg::Optional<kj::Array<kj::byte>> sha256;
     jsg::Optional<kj::Array<kj::byte>> sha384;
     jsg::Optional<kj::Array<kj::byte>> sha512;
+
+    void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+      tracker.trackField("md5", md5);
+      tracker.trackField("sha1", sha1);
+      tracker.trackField("sha256", sha256);
+      tracker.trackField("sha384", sha384);
+      tracker.trackField("sha512", sha512);
+    }
   };
 
   struct HttpMetadata {
@@ -141,6 +152,14 @@ public:
     JSG_STRUCT_TS_OVERRIDE(R2HTTPMetadata);
 
     HttpMetadata clone() const;
+
+    JSG_MEMORY_INFO(HttpMetadata) {
+      tracker.trackField("contentType", contentType);
+      tracker.trackField("contentLanguage", contentLanguage);
+      tracker.trackField("contentDisposition", contentDisposition);
+      tracker.trackField("contentEncoding", contentEncoding);
+      tracker.trackField("cacheControl", cacheControl);
+    }
   };
 
   struct PutOptions {
@@ -218,6 +237,15 @@ public:
       JSG_TS_OVERRIDE(R2Object);
     }
 
+    void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+      tracker.trackField("name", name);
+      tracker.trackField("version", version);
+      tracker.trackField("etag", etag);
+      tracker.trackField("checksums", checksums);
+      tracker.trackField("httpMetadata", httpMetadata);
+      tracker.trackField("customMetadata", customMetadata);
+    }
+
   protected:
     kj::String name;
     kj::String version;
@@ -268,6 +296,10 @@ public:
         json<T>(): Promise<T>;
       });
     }
+
+    void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+      tracker.trackField("body", body);
+    }
   private:
     jsg::Ref<ReadableStream> body;
   };
@@ -306,11 +338,11 @@ public:
 
   jsg::Promise<kj::Maybe<jsg::Ref<HeadResult>>> head(
       jsg::Lock& js, kj::String key,
-      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType
+      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType, CompatibilityFlags::Reader flags
   );
   jsg::Promise<kj::OneOf<kj::Maybe<jsg::Ref<GetResult>>, jsg::Ref<HeadResult>>> get(
       jsg::Lock& js, kj::String key, jsg::Optional<GetOptions> options,
-      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType
+      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType, CompatibilityFlags::Reader flags
   );
   jsg::Promise<kj::Maybe<jsg::Ref<HeadResult>>> put(jsg::Lock& js,
       kj::String key, kj::Maybe<R2PutValue> value, jsg::Optional<PutOptions> options,
@@ -330,7 +362,7 @@ public:
   );
   jsg::Promise<ListResult> list(
       jsg::Lock& js, jsg::Optional<ListOptions> options,
-      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType
+      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType, CompatibilityFlags::Reader flags
   );
 
   JSG_RESOURCE_TYPE(R2Bucket, CompatibilityFlags::Reader flags) {
@@ -344,14 +376,15 @@ public:
 
     JSG_TS_ROOT();
     JSG_TS_OVERRIDE({
+      // The order of these matters, since typescript tries to match function signatures in order
       get(key: string, options: R2GetOptions & { onlyIf: R2BucketConditional | Headers }): Promise<R2ObjectBody | R2Object | null>;
       get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null>;
 
-      put(key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob, options?: R2PutOptions): Promise<R2Object>;
       put(
         key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
         options?: R2PutOptions & { onlyIf: R2BucketConditional | Headers }
       ): Promise<R2Object | null>;
+      put(key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob, options?: R2PutOptions): Promise<R2Object>;
     });
     // Exclude `R2Object` from `get` return type if `onlyIf` not specified, and exclude `null` from `put` return type
 
@@ -398,6 +431,11 @@ public:
     bool secondsGranularity = false;
   };
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("adminBucket", adminBucket);
+    tracker.trackField("jwt", jwt);
+  }
+
 protected:
   kj::Maybe<kj::StringPtr> adminBucketName() const {
     return adminBucket;
@@ -413,10 +451,10 @@ private:
   friend class R2MultipartUpload;
 };
 
-kj::Maybe<jsg::Ref<R2Bucket::HeadResult>> parseHeadResultWrapper(
-  kj::StringPtr action, R2Result& r2Result, const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType);
 // Non-generic wrapper avoid moving the parseObjectMetadata implementation into this header file
 // by making use of dynamic dispatch.
+kj::Maybe<jsg::Ref<R2Bucket::HeadResult>> parseHeadResultWrapper(
+  kj::StringPtr action, R2Result& r2Result, const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType);
 
 }  // namespace workerd::api::public_beta
 

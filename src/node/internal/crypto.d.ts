@@ -1,24 +1,45 @@
 // Copyright (c) 2017-2022 Cloudflare, Inc.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
+
 import {
   Buffer,
 } from 'node-internal:internal_buffer';
 
 // random
 export function checkPrimeSync(candidate: ArrayBufferView, num_checks: number): boolean;
-export function randomPrime(size: number, safe: boolean, add?: ArrayBufferView|undefined, rem?: ArrayBufferView|undefined): ArrayBuffer;
+export function randomPrime(size: number, safe: boolean, add?: ArrayBufferView|undefined,
+                            rem?: ArrayBufferView|undefined): ArrayBuffer;
+
+// Hash and Hmac
+export class HashHandle {
+  public constructor(algorithm: string, xofLen: number);
+  public update(data: Buffer | ArrayBufferView): number;
+  public digest(): ArrayBuffer;
+  public copy(xofLen: number): HashHandle;
+}
+
+export type ArrayLike = ArrayBuffer|string|Buffer|ArrayBufferView;
+
+export class HmacHandle {
+  public constructor(algorithm: string, key: ArrayLike | CryptoKey);
+  public update(data: Buffer | ArrayBufferView): number;
+  public digest(): ArrayBuffer;
+}
+
+// hkdf
+export function getHkdf(hash: string, key: ArrayLike, salt: ArrayLike, info: ArrayLike,
+                        length: number): ArrayBuffer;
 
 // pbkdf2
-export type ArrayLike = ArrayBuffer|string|Buffer|ArrayBufferView;
-export function getPbkdf(password: ArrayLike, salt: ArrayLike, iterations: number, keylen: number, digest: string): ArrayBuffer;
+export function getPbkdf(password: ArrayLike, salt: ArrayLike, iterations: number, keylen: number,
+                         digest: string): ArrayBuffer;
 
 // Keys
 export function exportKey(key: CryptoKey, options?: InnerExportOptions): KeyExportResult;
 export function equals(key: CryptoKey, otherKey: CryptoKey): boolean;
 export function getAsymmetricKeyDetail(key: CryptoKey): AsymmetricKeyDetails;
 export function getAsymmetricKeyType(key: CryptoKey): AsymmetricKeyType;
-export function generateKeyPair(type: AsymmetricKeyType, options: GenerateKeyPairOptions): CryptoKeyPair;
 export function createSecretKey(key: ArrayBuffer | ArrayBufferView): CryptoKey;
 export function createPrivateKey(key: InnerCreateAsymmetricKeyOptions): CryptoKey;
 export function createPublicKey(key: InnerCreateAsymmetricKeyOptions): CryptoKey;
@@ -194,3 +215,22 @@ export interface GenerateKeyPairOptions {
   publicKeyEncoding?: PublicKeyExportOptions;
   privateKeyEncoding?: PrivateKeyExportOptions;
 }
+
+// DiffieHellman
+export class DiffieHellmanHandle {
+  public constructor(sizeOrKey: number | ArrayBuffer | ArrayBufferView,
+                     generator: number | ArrayBuffer | ArrayBufferView);
+  public setPublicKey(data: ArrayBuffer | ArrayBufferView | Buffer): void;
+  public setPrivateKey(data: ArrayBuffer | ArrayBufferView | Buffer): void;
+  public getPublicKey(): ArrayBuffer;
+  public getPrivateKey(): ArrayBuffer;
+  public getGenerator(): ArrayBuffer;
+  public getPrime(): ArrayBuffer;
+
+  public computeSecret(key: ArrayBuffer|ArrayBufferView): ArrayBuffer;
+  public generateKeys(): ArrayBuffer;
+
+  public getVerifyError(): number;
+}
+
+export function DiffieHellmanGroupHandle(name: string): DiffieHellmanHandle;

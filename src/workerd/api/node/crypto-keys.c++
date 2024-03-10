@@ -6,12 +6,12 @@
 namespace workerd::api::node {
 
 namespace {
+// An algorithm-independent secret key. Used as the underlying
+// implementation of Node.js SecretKey objects. Unlike Web Crypto,
+// a Node.js secret key is not algorithm specific. For instance, a
+// single secret key can be used for both AES and HMAC, where as
+// Web Crypto requires a separate key for each algorithm.
 class SecretKey final: public CryptoKey::Impl {
-  // An algorithm-independent secret key. Used as the underlying
-  // implementation of Node.js SecretKey objects. Unlike Web Crypto,
-  // a Node.js secret key is not algorithm specific. For instance, a
-  // single secret key can be used for both AES and HMAC, where as
-  // Web Crypto requires a separate key for each algorithm.
 public:
   explicit SecretKey(kj::Array<kj::byte> keyData)
       : Impl(true, CryptoKeyUsageSet::privateKeyMask() |
@@ -19,7 +19,7 @@ public:
         keyData(kj::mv(keyData)) {}
 
   kj::StringPtr getAlgorithmName() const override { return "secret"_kj; }
-  CryptoKey::AlgorithmVariant getAlgorithm() const override {
+  CryptoKey::AlgorithmVariant getAlgorithm(jsg::Lock& js) const override {
     return CryptoKey::KeyAlgorithm {
       .name = kj::str("secret"_kj)
     };
@@ -50,8 +50,14 @@ public:
     return kj::heapArray(keyData.asPtr());
   }
 
+  kj::StringPtr jsgGetMemoryName() const override { return "SecretKey"; }
+  size_t jsgGetMemorySelfSize() const override { return sizeof(SecretKey); }
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
+    tracker.trackFieldWithSize("keyData", keyData.size());
+  }
+
 private:
-  kj::Array<kj::byte> keyData;
+  ZeroOnFree keyData;
 };
 }  // namespace
 
@@ -113,13 +119,6 @@ kj::StringPtr CryptoImpl::getAsymmetricKeyType(jsg::Lock& js, jsg::Ref<CryptoKey
     return found->second;
   }
   return key->getAlgorithmName();
-}
-
-CryptoKeyPair CryptoImpl::generateKeyPair(
-    jsg::Lock& js,
-    kj::String type,
-    CryptoImpl::GenerateKeyPairOptions options) {
-  KJ_UNIMPLEMENTED("not implemented");
 }
 
 jsg::Ref<CryptoKey> CryptoImpl::createSecretKey(jsg::Lock& js, kj::Array<kj::byte> keyData) {

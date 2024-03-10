@@ -8,6 +8,7 @@
 #include <workerd/jsg/setup.h>
 #include <kj/async-queue.h>
 #include <regex>
+#include <stdlib.h>
 
 namespace workerd::server {
 namespace {
@@ -30,23 +31,22 @@ const bool verboseLog = ([]() {
 kj::Own<config::Config::Reader> parseConfig(kj::StringPtr text, kj::SourceLocation loc) {
   capnp::MallocMessageBuilder builder;
   auto root = builder.initRoot<config::Config>();
-  KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
+  KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
     TEXT_CODEC.decode(text, root);
   })) {
-    KJ_FAIL_REQUIRE_AT(loc, *exception);
+    KJ_FAIL_REQUIRE_AT(loc, exception);
   }
 
   return capnp::clone(root.asReader());
 }
 
+// Accept an indented block of text and remove the indentation. From each line of text, this will
+// remove a number of spaces up to the indentation of the first line.
+//
+// This is intended to allow multi-line raw text to be specified conveniently using C++11
+// `R"(blah)"` literal syntax, without the need to mess up indentation relative to the
+// surrounding code.
 kj::String operator "" _blockquote(const char* str, size_t n) {
-  // Accept an indented block of text and remove the indentation. From each line of text, this will
-  // remove a number of spaces up to the indentation of the first line.
-  //
-  // This is intended to allow multi-line raw text to be specified conveniently using C++11
-  // `R"(blah)"` literal syntax, without the need to mess up indentation relative to the
-  // surrounding code.
-
   kj::StringPtr text(str, n);
 
   // Ignore a leading newline so that `R"(` can be placed on the line before the initial indent.
@@ -107,6 +107,24 @@ public:
     }
   }
 
+  void recvWebSocket(kj::StringPtr expected, kj::SourceLocation loc = {}) {
+    auto actual = readWebSocketMessage();
+    KJ_EXPECT_AT(actual == expected, loc);
+  }
+
+  void recvWebSocketRegex(kj::StringPtr matcher, kj::SourceLocation loc = {}) {
+    auto actual = readWebSocketMessage();
+    std::regex target(matcher.cStr());
+    KJ_EXPECT(std::regex_match(actual.cStr(), target), actual, matcher, loc);
+  }
+
+  void recvWebSocketClose(int expectedCode) {
+    auto actual = readWebSocketMessage();
+    KJ_EXPECT(actual.size() >= 2);
+    int gotCode = (static_cast<uint8_t>(actual[0]) << 8) + static_cast<uint8_t>(actual[1]);
+    KJ_EXPECT(gotCode == expectedCode);
+  }
+
   void sendHttpGet(kj::StringPtr path, kj::SourceLocation loc = {}) {
     send(kj::str(
         "GET ", path, " HTTP/1.1\n"
@@ -128,10 +146,9 @@ public:
     recvHttp200(expectedResponse, loc);
   }
 
+  // Return true if the stream is at EOF.
   bool isEof() {
-    // Return true if the stream is at EOF.
-
-    if (premature != nullptr) {
+    if (premature != kj::none) {
       // We still have unread data so we're definitely not at EOF.
       return false;
     }
@@ -155,17 +172,36 @@ public:
     }
   }
 
+  void upgradeToWebSocket() {
+    send(R"(
+      GET / HTTP/1.1
+      Host: foo
+      Upgrade: websocket
+      Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==
+      Sec-WebSocket-Version: 13
+
+    )"_blockquote, {});
+
+    recv(R"(
+      HTTP/1.1 101 Switching Protocols
+      Connection: Upgrade
+      Upgrade: websocket
+      Sec-WebSocket-Accept: ICX+Yqv66kxgM0FcWaLWlFLwTAI=
+
+    )"_blockquote, {});
+  }
+
 private:
   kj::WaitScope& ws;
   kj::Own<kj::AsyncIoStream> stream;
 
-  kj::Maybe<char> premature;
   // isEof() may prematurely read a character. Keep it off to the side for the next actual read.
+  kj::Maybe<char> premature;
 
   kj::String readAllAvailable() {
     kj::Vector<char> buffer(256);
-    KJ_IF_MAYBE(p, premature) {
-      buffer.add(*p);
+    KJ_IF_SOME(p, premature) {
+      buffer.add(p);
     }
 
     // Continuously try to read until there's nothing to read (or we've gone way past the size
@@ -198,6 +234,69 @@ private:
     buffer.add('\0');
     return kj::String(buffer.releaseAsArray());
   }
+
+  kj::String readWebSocketMessage(size_t maxMessageSize = 1 << 24) {
+    // Reads a single, non-fragmented WebSocket message. Returns just the payload.
+    kj::Vector<uint8_t> header(256);
+    kj::Vector<uint8_t> mask(4);
+
+    KJ_IF_SOME(p, premature) {
+      header.add(p);
+      premature = kj::Maybe<char>();
+    }
+
+    tryRead(header, 2 - header.size(), "reading first two bytes of header");
+    bool masked = header[1] & 0x80;
+    size_t sevenBitPayloadLength = header[1] & 0x7f;
+    size_t realPayloadLength = sevenBitPayloadLength;
+
+    if (sevenBitPayloadLength == 126) {
+      tryRead(header, 2, "reading 16-bit payload length");
+      realPayloadLength = (static_cast<size_t>(header[2]) << 8) + static_cast<size_t>(header[3]);
+    } else if (sevenBitPayloadLength == 127) {
+      tryRead(header, 8, "reading 64-bit payload length");
+      realPayloadLength = (static_cast<size_t>(header[2]) << 56)
+        + (static_cast<size_t>(header[3]) << 48)
+        + (static_cast<size_t>(header[4]) << 40)
+        + (static_cast<size_t>(header[5]) << 32)
+        + (static_cast<size_t>(header[6]) << 24)
+        + (static_cast<size_t>(header[7]) << 16)
+        + (static_cast<size_t>(header[8]) << 8)
+        + (static_cast<size_t>(header[9]));
+
+      KJ_REQUIRE(realPayloadLength <= maxMessageSize,
+        kj::str("Payload size too big (", realPayloadLength, " > ", maxMessageSize, ")"));
+    }
+
+    if (masked) {
+      tryRead(mask, 4, "reading mask key");
+      // Currently we assume the mask is always 0, so its application is a no-op, hence we don't
+      // bother.
+    }
+    kj::Vector<char> payload(realPayloadLength + 1);
+
+    tryRead(payload, realPayloadLength, "reading payload");
+    payload.add('\0');
+    return kj::String(payload.releaseAsArray());
+  }
+
+  template <typename T>
+  void tryRead(kj::Vector<T>& buffer, size_t bytesToRead, kj::StringPtr what) {
+    static_assert(sizeof(T) == 1, "not byte-sized");
+
+    size_t pos = buffer.size();
+    size_t bytesRead = 0;
+    buffer.resize(buffer.size() + bytesToRead);
+    while (bytesRead < bytesToRead) {
+      auto promise = stream->tryRead(buffer.begin() + pos, 1, buffer.size() - pos);
+      KJ_REQUIRE(promise.poll(ws), kj::str("No data available while ", what));
+        // A tryRead() of 1 byte didn't resolve, there must be no data to read.
+
+      size_t n = promise.wait(ws);
+      KJ_REQUIRE(n > 0, kj::str("Not enough data while ", what));
+      bytesRead += n;
+    }
+  }
 };
 
 class TestServer final: private kj::Filesystem, private kj::EntropySource, private kj::Clock {
@@ -209,7 +308,8 @@ public:
         pwd(kj::Path({"current", "dir"})),
         cwd(root->openSubdir(pwd, kj::WriteMode::CREATE | kj::WriteMode::CREATE_PARENT)),
         timer(kj::origin<kj::TimePoint>()),
-        server(*this, timer, mockNetwork, *this, [this](kj::String error) {
+        server(*this, timer, mockNetwork, *this, Worker::ConsoleMode::INSPECTOR_ONLY,
+                [this](kj::String error) {
           if (expectedErrors.startsWith(error) && expectedErrors[error.size()] == '\n') {
             expectedErrors = expectedErrors.slice(error.size() + 1);
           } else {
@@ -226,16 +326,15 @@ public:
 
     if (!unwindDetector.isUnwinding()) {
       // Make sure any errors are reported.
-      KJ_IF_MAYBE(t, runTask) {
-        t->poll(ws);
+      KJ_IF_SOME(t, runTask) {
+        t.poll(ws);
       }
     }
   }
 
+  // Start the server. Call before connect().
   void start(kj::Promise<void> drainWhen = kj::NEVER_DONE) {
-    // Start the server. Call before connect().
-
-    KJ_REQUIRE(runTask == nullptr);
+    KJ_REQUIRE(runTask == kj::none);
     auto task = server.run(v8System, *config, kj::mv(drainWhen))
         .eagerlyEvaluate([](kj::Exception&& e) {
       KJ_FAIL_EXPECT(e);
@@ -244,29 +343,26 @@ public:
     runTask = kj::mv(task);
   }
 
+  // Call instead of `start()` when the config is expected to produce errors. The parameter is
+  // the expected list of errors messages, one per line.
   void expectErrors(kj::StringPtr expected) {
-    // Call instead of `start()` when the config is expected to produce errors. The parameter is
-    // the expected list of errors messages, one per line.
-
     expectedErrors = expected;
     server.run(v8System, *config).poll(ws);
     KJ_EXPECT(expectedErrors == nullptr, "some expected errors weren't seen");
   }
 
+  // Connect to the server on the given address. The string just has to match what is in the
+  // config; the actual connection is in-memory with no network involved.
   TestStream connect(kj::StringPtr addr) {
-    // Connect to the server on the given address. The string just has to match what is in the
-    // config; the actual connection is in-memory with no network involved.
-
     return TestStream(ws, KJ_REQUIRE_NONNULL(sockets.find(addr), addr)->connect().wait(ws));
   }
 
+  // Expect an incoming connection on the given address and from a network with the given
+  // allowed / denied peer list.
   TestStream receiveSubrequest(kj::StringPtr addr,
       kj::ArrayPtr<const kj::StringPtr> allowedPeers = nullptr,
       kj::ArrayPtr<const kj::StringPtr> deniedPeers = nullptr,
       kj::SourceLocation loc = {}) {
-    // Expect an incoming connection on the given address and from a network with the given
-    // allowed / denied peer list.
-
     auto expectedFilter = peerFilterToString(allowedPeers, deniedPeers);
 
     auto promise = getSubrequestQueue(addr).pop();
@@ -284,6 +380,17 @@ public:
   TestStream receiveInternetSubrequest(kj::StringPtr addr,
       kj::SourceLocation loc = {}) {
     return receiveSubrequest(addr, {"public"_kj}, {}, loc);
+  }
+
+  // Advance the timer through `seconds` seconds of virtual time.
+  void wait(size_t seconds) {
+    auto delayPromise = timer.afterDelay(seconds * kj::SECONDS).eagerlyEvaluate(nullptr);
+    while (!delayPromise.poll(ws)) {
+      // Since this test has no external I/O at all other than time, we know no events could
+      // possibly occur until the next timer event. So just advance directly to it and continue.
+      timer.advanceTo(KJ_ASSERT_NONNULL(timer.nextEvent()));
+    }
+    delayPromise.wait(ws);
   }
 
   kj::EventLoop loop;
@@ -320,8 +427,8 @@ private:
   // ---------------------------------------------------------------------------
   // implements Network
 
-  kj::HashMap<kj::String, kj::Own<kj::NetworkAddress>> sockets;
   // Addresses that the server is listening on.
+  kj::HashMap<kj::String, kj::Own<kj::NetworkAddress>> sockets;
 
   class MockNetwork;
 
@@ -330,8 +437,8 @@ private:
     kj::StringPtr peerFilter;
   };
   using SubrequestQueue = kj::ProducerConsumerQueue<SubrequestInfo>;
-  kj::HashMap<kj::String, kj::Own<SubrequestQueue>> subrequests;
   // Expected incoming connections and callbacks that should be used to handle them.
+  kj::HashMap<kj::String, kj::Own<SubrequestQueue>> subrequests;
 
   SubrequestQueue& getSubrequestQueue(kj::StringPtr addr) {
     return *subrequests.findOrCreate(addr, [&]() -> decltype(subrequests)::Entry {
@@ -356,6 +463,11 @@ private:
         : test(test), peerFilter(peerFilter), address(kj::mv(address)) {}
 
     kj::Promise<kj::Own<kj::AsyncIoStream>> connect() override {
+      KJ_IF_SOME(addr, test.sockets.find(address)) {
+        // If someone is listening on this address, connect directly to them.
+        return addr->connect();
+      }
+
       auto [promise, fulfiller] = kj::newPromiseAndFulfiller<kj::Own<kj::AsyncIoStream>>();
 
       test.getSubrequestQueue(address).push({
@@ -368,7 +480,7 @@ private:
       auto pipe = kj::newCapabilityPipe();
       auto receiver = kj::heap<kj::CapabilityStreamConnectionReceiver>(*pipe.ends[0])
           .attach(kj::mv(pipe.ends[0]));
-      auto sender = kj::heap<kj::CapabilityStreamNetworkAddress>(nullptr, *pipe.ends[1])
+      auto sender = kj::heap<kj::CapabilityStreamNetworkAddress>(kj::none, *pipe.ends[1])
           .attach(kj::mv(pipe.ends[1]));
       test.sockets.insert(kj::str(address), kj::mv(sender));
       return receiver;
@@ -524,7 +636,6 @@ KJ_TEST("Server: serve basic modular Worker") {
       )
     ]
   ))"_kj));
-
   test.start();
   auto conn = test.connect("test-addr");
   conn.httpGet200("/", "Hello: http://foo/");
@@ -646,11 +757,17 @@ KJ_TEST("Server: compatibility dates are required") {
   ))"_kj));
 
   test.expectErrors(R"(
-    service hello: Worker must specify compatibiltyDate.
+    service hello: Worker must specify compatibilityDate.
   )"_blockquote);
 }
 
 KJ_TEST("Server: value bindings") {
+#if _WIN32
+  _putenv("TEST_ENVIRONMENT_VAR=Hello from environment variable");
+#else
+  setenv("TEST_ENVIRONMENT_VAR", "Hello from environment variable", true);
+#endif
+
   TestServer test(singleWorker(R"((
     compatibilityDate = "2022-08-17",
     # (Must use Service Worker syntax to allow Wasm bindings.)
@@ -662,6 +779,8 @@ KJ_TEST("Server: value bindings") {
       `  items.push(new TextDecoder().decode(BAR));
       `  items.push("wasm says square(5) = " + SQUARE.exports.square(5));
       `  items.push(QUX.message);
+      `  items.push(CORGE);
+      `  items.push("GRAULT is null? " + (GRAULT === null));
       `  return new Response(items.join("\n"));
       `}
       `addEventListener("fetch", event => {
@@ -681,7 +800,9 @@ KJ_TEST("Server: value bindings") {
       ),
       ( name = "QUX",
         json = `{"message": "Hello from json binding"}
-      )
+      ),
+      ( name = "CORGE", fromEnvironment = "TEST_ENVIRONMENT_VAR" ),
+      ( name = "GRAULT", fromEnvironment = "TEST_NONEXISTENT_ENVIRONMENT_VAR" ),
     ]
   ))"_kj));
 
@@ -691,7 +812,9 @@ KJ_TEST("Server: value bindings") {
       "Hello from text binding\n"
       "Hello from data binding\n"
       "wasm says square(5) = 25\n"
-      "Hello from json binding");
+      "Hello from json binding\n"
+      "Hello from environment variable\n"
+      "GRAULT is null? true");
 }
 
 KJ_TEST("Server: WebCrypto bindings") {
@@ -1006,6 +1129,10 @@ KJ_TEST("Server: capability bindings") {
                 `    items.push(await (await env.r2.get("baz")).text());
                 `    await env.queue.send("hello");
                 `    items.push("Hello from Queue\n");
+                `    const connection = await env.hyperdrive.connect();
+                `    const encoded = new TextEncoder().encode("hyperdrive-test");
+                `    await connection.writable.getWriter().write(new Uint8Array(encoded));
+                `    items.push(`Hello from Hyperdrive(${env.hyperdrive.user})\n`);
                 `    return new Response(items.join(""));
                 `  }
                 `}
@@ -1023,6 +1150,15 @@ KJ_TEST("Server: capability bindings") {
             ),
             ( name = "queue",
               queue = "queue-outbound"
+            ),
+            ( name = "hyperdrive",
+              hyperdrive = (
+                designator = "hyperdrive-outbound",
+                database = "test-db",
+                user = "test-user",
+                password = "test-password",
+                scheme = "postgresql"
+              )
             )
           ]
         )
@@ -1031,6 +1167,10 @@ KJ_TEST("Server: capability bindings") {
       ( name = "kv-outbound", external = "kv-host" ),
       ( name = "r2-outbound", external = "r2-host" ),
       ( name = "queue-outbound", external = "queue-host" ),
+      ( name = "hyperdrive-outbound", external = (
+        address = "hyperdrive-host",
+        tcp = ()
+      ))
     ],
     sockets = [
       ( name = "main",
@@ -1112,11 +1252,16 @@ KJ_TEST("Server: capability bindings") {
     )"_blockquote);
   }
 
+  {
+    auto subreq = test.receiveSubrequest("hyperdrive-host");
+    subreq.recv("hyperdrive-test");
+  }
   conn.recvHttp200(R"(
     Hello from HTTP
     Hello from KV
     Hello from R2
     Hello from Queue
+    Hello from Hyperdrive(test-user)
   )"_blockquote);
 }
 
@@ -1329,7 +1474,7 @@ KJ_TEST("Server: call queue handler on service binding") {
   test.server.allowExperimental();
   test.start();
   auto conn = test.connect("test-addr");
-  conn.httpGet200("/", "queue outcome: 1, ackAll: true");
+  conn.httpGet200("/", "queue outcome: ok, ackAll: true");
 }
 
 KJ_TEST("Server: Durable Objects (in memory)") {
@@ -1585,6 +1730,540 @@ KJ_TEST("Server: Ephemeral Objects") {
       "http://foo/bar: http://foo/bar 2");
 }
 
+KJ_TEST("Server: Durable Objects (ephemeral) eviction") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2023-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request, env) {
+                `    let id = env.ns.idFromName("59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234");
+                `    let obj = env.ns.get(id)
+                `    if (request.url.endsWith("/setup")) {
+                `      return await obj.fetch("http://example.com/setup");
+                `    } else if (request.url.endsWith("/check")) {
+                `      try {
+                `        return await obj.fetch("http://example.com/check");
+                `      } catch(e) {
+                `        throw e;
+                `      }
+                `    } else if (request.url.endsWith("/checkEvicted")) {
+                `      return await obj.fetch("http://example.com/checkEvicted");
+                `    }
+                `    return new Response("Invalid Route!")
+                `  }
+                `}
+                `export class MyActorClass {
+                `  constructor(state, env) {
+                `    this.defaultMessage = false; // Set to true on first "setup" request
+                `  }
+                `  async fetch(request) {
+                `    if (request.url.endsWith("/setup")) {
+                `      // Request 1, set defaultMessage, will remain true as long as actor is live.
+                `      this.defaultMessage = true;
+                `      return new Response("OK");
+                `    } else if (request.url.endsWith("/check")) {
+                `      // Request 2, assert that actor is still in alive (defaultMessage is still true).
+                `      if (this.defaultMessage) {
+                `        // Actor is still alive and we did not re-run the constructor
+                `        return new Response("OK");
+                `      }
+                `      throw new Error("Error: Actor was evicted!");
+                `    } else if (request.url.endsWith("/checkEvicted")) {
+                `      // Final request (3), check if the defaultMessage has been set to false,
+                `      //  indicating the actor was evicted
+                `      if (!this.defaultMessage) {
+                `        // Actor was evicted and we re-ran the constructor!
+                `        return new Response("OK");
+                `      }
+                `      throw new Error("Error: Actor was not evicted! We were still alive.");
+                `    }
+                `  }
+                `}
+            )
+          ],
+          bindings = [(name = "ns", durableObjectNamespace = "MyActorClass")],
+          durableObjectNamespaces = [
+            ( className = "MyActorClass",
+              uniqueKey = "mykey",
+            )
+          ],
+          durableObjectStorage = (inMemory = void)
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj);
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/setup", "OK");
+  conn.httpGet200("/check", "OK");
+
+  // Force hibernation by waiting 10 seconds.
+  test.wait(10);
+  // Need a second connection because of 5 second HTTP timeout.
+  auto connTwo = test.connect("test-addr");
+  connTwo.httpGet200("/checkEvicted", "OK");
+}
+
+KJ_TEST("Server: Durable Objects (ephemeral) prevent eviction") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2023-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request, env) {
+                `    let id = env.ns.idFromName("59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234");
+                `    let obj = env.ns.get(id);
+                `    if (request.url.endsWith("/setup")) {
+                `      return await obj.fetch("http://example.com/setup");
+                `    } else if (request.url.endsWith("/assertNotEvicted")) {
+                `      try {
+                `        return await obj.fetch("http://example.com/assertNotEvicted");
+                `      } catch(e) {
+                `        throw e;
+                `      }
+                `    }
+                `    return new Response("Invalid Route!")
+                `  }
+                `}
+                `export class MyActorClass {
+                `  constructor(state, env) {
+                `    this.defaultMessage = false; // Set to true on first "setup" request
+                `  }
+                `  async fetch(request) {
+                `    if (request.url.endsWith("/setup")) {
+                `      // Request 1, set defaultMessage, will remain true as long as actor is live.
+                `      this.defaultMessage = true;
+                `      return new Response("OK");
+                `    } else if (request.url.endsWith("/assertNotEvicted")) {
+                `      // Request 2, assert that actor is still in alive (defaultMessage is still true).
+                `      if (this.defaultMessage) {
+                `        // Actor is still alive and we did not re-run the constructor
+                `        return new Response("OK");
+                `      }
+                `      throw new Error("Error: Actor was evicted!");
+                `    }
+                `  }
+                `}
+            )
+          ],
+          bindings = [(name = "ns", durableObjectNamespace = "MyActorClass")],
+          durableObjectNamespaces = [
+            ( className = "MyActorClass",
+              uniqueKey = "mykey",
+              preventEviction = true,
+            )
+          ],
+          durableObjectStorage = (inMemory = void)
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj);
+
+  test.start();
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/setup", "OK");
+  conn.httpGet200("/assertNotEvicted", "OK");
+
+  // Attempt to force hibernation by waiting 10 seconds.
+  test.wait(10);
+  // Need a second connection because of 5 second HTTP timeout.
+  auto connTwo = test.connect("test-addr");
+  connTwo.httpGet200("/assertNotEvicted", "OK");
+}
+
+KJ_TEST("Server: Durable Object evictions when callback scheduled") {
+  kj::StringPtr config = R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2023-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request, env) {
+                `    let id = env.ns.idFromName("59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234");
+                `    let obj = env.ns.get(id)
+                `    return await obj.fetch(request.url);
+                `  }
+                `}
+                `export class MyActorClass {
+                `  constructor(state, env) {
+                `    this.defaultMessage = false; // Set to true on first "setup" request
+                `    this.storage = state.storage;
+                `    this.count = 0;
+                `  }
+                `  async fetch(request) {
+                `    if (request.url.endsWith("/15Seconds")) {
+                `      // Schedule a callback to run in 15 seconds.
+                `      // The DO should NOT be evicted by the inactivity timeout before this runs.
+                `      this.defaultMessage = true;
+                `      let id = setInterval(() => { clearInterval(id); }, 15000);
+                `      return new Response("OK");
+                `    } else if (request.url.endsWith("/20Seconds")) {
+                `      // Schedule a callback to run every 20 seconds.
+                `      // The DO should expire after 70 seconds.
+                `      this.defaultMessage = true;
+                `      this.count = 0;
+                `      await this.storage.put("count", this.count);
+                `      let id = setInterval(() => {
+                `        // Increment number of times we ran this.
+                `        this.count += 1;
+                `        this.storage.put("count", this.count);
+                `      }, 20000);
+                `      return new Response("OK");
+                `    } else if (request.url.endsWith("/assertActive")) {
+                `      // Assert that actor is still in alive (defaultMessage is still true).
+                `      if (this.defaultMessage) {
+                `        // Actor is still alive and we did not re-run the constructor
+                `        return new Response("OK");
+                `      }
+                `      throw new Error("Error: Actor was evicted!");
+                `    } else if (request.url.endsWith("/assertEvicted")) {
+                `      // Check if the defaultMessage has been set to false,
+                `      // indicating the actor was evicted
+                `      if (!this.defaultMessage) {
+                `        // Actor was evicted and we re-ran the constructor!
+                `        return new Response("OK");
+                `      }
+                `      throw new Error("Error: Actor was not evicted! We were still alive.");
+                `    } else if (request.url.endsWith("/assertEvictedAndCount")) {
+                `      // Check if the defaultMessage has been set to false,
+                `      // indicating the actor was evicted
+                `      if (!this.defaultMessage) {
+                `        var count = await this.storage.get("count");
+                `        if (!(4 < count && count < 8)) {
+                `          // Something must have gone wrong. We have a 70 sec expiration,
+                `          // and worst case is it takes ~140 seconds to evict. The callback runs
+                `          // every 20 seconds, so it has to be evicted before the 8th callback.
+                `          throw new Error(`Callback ran ${count} times, expected between 4 to 8!`);
+                `        }
+                `        // Actor was evicted and we had the right count!
+                `        return new Response("OK");
+                `      }
+                `      throw new Error("Error: Actor was not evicted! We were still alive.");
+                `    }
+                `  }
+                `}
+            )
+          ],
+          bindings = [(name = "ns", durableObjectNamespace = "MyActorClass")],
+          durableObjectNamespaces = [
+            ( className = "MyActorClass",
+              uniqueKey = "mykey",
+            )
+          ],
+          durableObjectStorage = (localDisk = "my-disk")
+        )
+      ),
+      ( name = "my-disk",
+        disk = (
+          path = "../../var/do-storage",
+          writable = true,
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj;
+
+  // Create a directory outside of the test scope which we can use across multiple TestServers.
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  {
+      TestServer test(config);
+      // Link our directory into the test filesystem.
+      test.root->transfer(
+          kj::Path({"var"_kj, "do-storage"_kj}), kj::WriteMode::CREATE | kj::WriteMode::CREATE_PARENT,
+          *dir, nullptr, kj::TransferMode::LINK);
+
+      test.start();
+      auto conn = test.connect("test-addr");
+      // Setup a callback that will run in 15 seconds.
+      // This callback should prevent the DO from being evicted.
+      conn.httpGet200("/15Seconds", "OK");
+
+      // If we weren't waiting on anything, the DO would be evicted after 10 seconds,
+      // however, it will actually be evicted in 25 seconds (15 seconds until setInterval is cleared +
+      // 10 seconds for inactivity timer).
+
+      test.wait(15);
+      // The `setInterval()` will be cleared around now. Let's verify that we didn't get evicted.
+
+      // Need a new connection because of 5 second HTTP timeout.
+      auto connTwo = test.connect("test-addr");
+      connTwo.httpGet200("/assertActive", "OK");
+
+      // Force hibernation by waiting at least 10 seconds since we haven't scheduled any new work.
+      test.wait(10);
+
+      // Need a new connection because of 5 second HTTP timeout.
+      auto connThree = test.connect("test-addr");
+      connThree.httpGet200("/assertEvicted", "OK");
+
+      // Now we know we aren't evicting DOs early if they have future work scheduled. Next, let's
+      // ensure we ARE evicting DOs if there are no connected clients for 70 seconds.
+      // Note that the `/20seconds` path calls setInterval to run every 20 seconds, and never clears.
+      auto connFour = test.connect("test-addr");
+      connFour.httpGet200("/20Seconds", "OK");
+      // It's unlikely, but the worst case is the cleanupLoop checks just before the 70 sec expiration,
+      // and has to wait another 70 seconds before trying to remove again. We'll wait for 142 seconds
+      // to account for this.
+      test.wait(142);
+
+      auto connFive = test.connect("test-addr");
+      connFive.httpGet200("/assertEvictedAndCount", "OK");
+  }
+}
+
+KJ_TEST("Server: Durable Objects websocket") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2023-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request, env) {
+                `    let id = env.ns.idFromName("59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234");
+                `    let obj = env.ns.get(id)
+                `    return await obj.fetch(request);
+                `  }
+                `}
+                `
+                `export class MyActorClass {
+                `  constructor(state) {}
+                `
+                `  async fetch(request) {
+                `    let pair = new WebSocketPair();
+                `    let ws = pair[1]
+                `    ws.accept();
+                `
+                `    ws.addEventListener("message", (m) => {
+                `      ws.send(m.data);
+                `    });
+                `    ws.addEventListener("close", (c) => {
+                `      ws.close(c.code, c.reason);
+                `    });
+                `
+                `    return new Response(null, {status: 101, statusText: "Switching Protocols", webSocket: pair[0]});
+                `  }
+                `}
+            )
+          ],
+          bindings = [(name = "ns", durableObjectNamespace = "MyActorClass")],
+          durableObjectNamespaces = [
+            ( className = "MyActorClass",
+              uniqueKey = "mykey",
+            )
+          ],
+          durableObjectStorage = (inMemory = void)
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj);
+
+  test.start();
+  auto wsConn = test.connect("test-addr");
+  wsConn.upgradeToWebSocket();
+  constexpr kj::StringPtr expectedOne = "Hello"_kj;
+  constexpr kj::StringPtr expectedTwo = "There"_kj;
+  // \x81\x05 are part of the websocket frame.
+  // \x81 is 10000001 -- leftmost bit implies this is the final frame, rightmost implies text data.
+  // \x05 says the payload length is 5.
+  wsConn.send(kj::str("\x81\x05", expectedOne));
+  wsConn.send(kj::str("\x81\x05", expectedTwo));
+  wsConn.recvWebSocket(expectedOne);
+  wsConn.recvWebSocket(expectedTwo);
+
+  // Force hibernation by waiting 10 seconds.
+  test.wait(10);
+  wsConn.send(kj::str("\x81\x05", expectedOne));
+  wsConn.send(kj::str("\x81\x05", expectedTwo));
+  wsConn.recvWebSocket(expectedOne);
+  wsConn.recvWebSocket(expectedTwo);
+}
+
+KJ_TEST("Server: Durable Objects websocket hibernation") {
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2023-08-17",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `export default {
+                `  async fetch(request, env) {
+                `    let id = env.ns.idFromName("59002eb8cf872e541722977a258a12d6a93bbe8192b502e1c0cb250aa91af234");
+                `    let obj = env.ns.get(id)
+                `
+                `    // 1. Create a websocket (request 1)
+                `    // 2. Use websocket once
+                `    // 3. Let actor hibernate
+                `    // 4. Wake actor by sending new request (request 2)
+                `    //  - This confirms we get back hibernation manager.
+                `    //    5. Use websocket once
+                `    // 6. Let actor hibernate
+                `    // 7. Wake actor by using websocket
+                `    //  - This confirms we get back hibernation manager.
+                `    //    8. Use websocket once
+                `    return await obj.fetch(request);
+                `  }
+                `}
+                `
+                `export class MyActorClass {
+                `  constructor(state) {
+                `    this.state = state;
+                `    // If reqCount is 0, then the actor's constructor has run.
+                `    // This implies we're starting up, so either this is the first request or we were evicted.
+                `    this.reqCount = 0;
+                `  }
+                `
+                `  async fetch(request) {
+                `    if (request.url.endsWith("/")) {
+                `      // Request 1, accept a websocket.
+                `      let pair = new WebSocketPair(true);
+                `      let ws = pair[1];
+                `      this.state.acceptWebSocket(ws);
+                `
+                `      this.reqCount += 1;
+                `      if (this.reqCount != 1) {
+                `        throw new Error(`Expected request count of 1 but got ${this.reqCount}`);
+                `      }
+                `      return new Response(null, {status: 101, statusText: "Switching Protocols", webSocket: pair[0]});
+                `    } else if (request.url.endsWith("/wakeUpAndCheckWS")) {
+                `      // Request 2, wake actor and check if WS available.
+                `      let allWebsockets = this.state.getWebSockets();
+                `      for (const ws of allWebsockets) {
+                `        ws.send("Hello! Just woke up from a nap.");
+                `      }
+                `
+                `      this.reqCount += 1;
+                `      if (this.reqCount != 1) {
+                `        throw new Error(`Expected request count of 1 but got ${this.reqCount}`);
+                `      }
+                `
+                `      return new Response("OK");
+                `    }
+                `    return new Error("Unknown path!");
+                `  }
+                `
+                `  async webSocketMessage(ws, msg) {
+                `    if (msg == "Regular message.") {
+                `      ws.send("Regular response.");
+                `    } else if (msg == "Confirm actor was evicted.") {
+                `      // Called when waking from hibernation due to inbound websocket message.
+                `      if (this.reqCount == 0) {
+                `        ws.send("OK")
+                `      } else {
+                `        ws.send(`[ FAILURE ] - reqCount was ${this.reqCount} so actor wasn't evicted`);
+                `      }
+                `    }
+                `  }
+                `
+                `  async webSocketClose(ws, code, reason, wasClean) {
+                `    if (code == 1006) {
+                `      if (reason != "WebSocket disconnected without sending Close frame.") {
+                `        throw new Error(`Got abnormal closure with unexpected reason: ${reason}`);
+                `      }
+                `      if (wasClean) {
+                `        throw new Error("Got abnormal closure but wasClean was true!");
+                `      }
+                `    } else if (code != 1234) {
+                `      throw new Error(`Expected close code 1234, got ${code}`);
+                `    } else if (reason != "OK") {
+                `      throw new Error(`Expected close reason "OK", got ${reason}`);
+                `    } else {
+                `      ws.close(4321, "KO");
+                `    }
+                `  }
+                `
+                `  async webSocketError(ws, error) {
+                `    console.log(`Encountered error: ${error}`);
+                `    throw new Error(error);
+                `  }
+                `}
+
+            )
+          ],
+          bindings = [(name = "ns", durableObjectNamespace = "MyActorClass")],
+          durableObjectNamespaces = [
+            ( className = "MyActorClass",
+              uniqueKey = "mykey",
+            )
+          ],
+          durableObjectStorage = (inMemory = void)
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj);
+
+  test.start();
+  auto wsConn = test.connect("test-addr");
+  wsConn.upgradeToWebSocket();
+  // 1. Make hibernatable ws and use it.
+  constexpr kj::StringPtr message = "Regular message."_kj;
+  constexpr kj::StringPtr response = "Regular response."_kj;
+  wsConn.send(kj::str("\x81\x10", message));
+  wsConn.recvWebSocket(response);
+
+  // 2. Hibernate
+  test.wait(10);
+  // 3. Use normal connection and read from ws.
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/wakeUpAndCheckWS", "OK"_kj);
+  constexpr kj::StringPtr unpromptedResponse = "Hello! Just woke up from a nap."_kj;
+  wsConn.recvWebSocket(unpromptedResponse);
+
+  // 4. Hibernate again
+  test.wait(10);
+
+  // 5. Wake up by sending a message.
+  constexpr kj::StringPtr confirmEviction = "Confirm actor was evicted."_kj;
+  constexpr kj::StringPtr evicted = "OK"_kj;
+  wsConn.send(kj::str("\x81\x1a", confirmEviction));
+  wsConn.recvWebSocket(evicted);
+}
 // =======================================================================================
 // Test HttpOptions on receive
 
@@ -2126,6 +2805,7 @@ KJ_TEST("Server: disk service") {
   test.fakeDate = kj::UNIX_EPOCH + 2 * kj::DAYS + 5 * kj::HOURS +
                   18 * kj::MINUTES + 23 * kj::SECONDS;
   dir->openFile(kj::Path({"foo.txt"}), mode)->writeAll("hello from foo.txt\n");
+  dir->openFile(kj::Path({"numbers.txt"}), mode)->writeAll("0123456789\n");
   test.fakeDate = kj::UNIX_EPOCH + 400 * kj::DAYS + 2 * kj::HOURS +
                   52 * kj::MINUTES + 9 * kj::SECONDS + 163 * kj::MILLISECONDS;
   dir->openFile(kj::Path({"bar.txt"}), mode)->writeAll("hello from bar.txt\n");
@@ -2173,6 +2853,82 @@ KJ_TEST("Server: disk service") {
   //
   // conn.sendHttpGet("/");
 
+  // HEAD returns no content.
+  conn.send(R"(
+    HEAD /numbers.txt HTTP/1.1
+    Host: foo
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 11
+    Content-Type: application/octet-stream
+    Last-Modified: Sat, 03 Jan 1970 05:18:23 GMT
+
+  )"_blockquote);
+
+  // GET with single range returns partial content.
+  conn.send(R"(
+    GET /numbers.txt HTTP/1.1
+    Host: foo
+    Range: bytes=3-5
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 206 Partial Content
+    Content-Length: 3
+    Content-Type: application/octet-stream
+    Content-Range: bytes 3-5/11
+    Last-Modified: Sat, 03 Jan 1970 05:18:23 GMT
+
+    345)"_blockquote);
+
+  // GET with single covering range returns full content.
+  conn.send(R"(
+    GET /numbers.txt HTTP/1.1
+    Host: foo
+    Range: bytes=-50
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 11
+    Content-Type: application/octet-stream
+    Last-Modified: Sat, 03 Jan 1970 05:18:23 GMT
+
+    0123456789
+  )"_blockquote);
+
+  // GET with many ranges returns full content.
+  conn.send(R"(
+    GET /numbers.txt HTTP/1.1
+    Host: foo
+    Range: bytes=1-3, 6-8
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 200 OK
+    Content-Length: 11
+    Content-Type: application/octet-stream
+    Last-Modified: Sat, 03 Jan 1970 05:18:23 GMT
+
+    0123456789
+  )"_blockquote);
+
+  // GET with unsatisfiable range.
+  conn.send(R"(
+    GET /numbers.txt HTTP/1.1
+    Host: foo
+    Range: bytes=20-30
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 416 Range Not Satisfiable
+    Content-Length: 21
+    Content-Range: bytes */11
+
+    Range Not Satisfiable)"_blockquote);
+
   // File not found...
   conn.sendHttpGet("/no-such-file.txt");
   conn.recv(R"(
@@ -2196,6 +2952,18 @@ KJ_TEST("Server: disk service") {
     Content-Length: 6
 
     corge
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 405 Method Not Allowed
+    Content-Length: 18
+
+    Method Not Allowed)"_blockquote);
+
+  // DELETE is denied because not writable.
+  conn.send(R"(
+    DELETE /corge.txt HTTP/1.1
+    Host: foo
+
   )"_blockquote);
   conn.recv(R"(
     HTTP/1.1 405 Method Not Allowed
@@ -2268,6 +3036,30 @@ KJ_TEST("Server: disk service writable") {
   // Read it back.
   KJ_EXPECT(dir->openFile(kj::Path({"newfile.txt"}))->readAllText() == "corge\n");
 
+  // Delete it.
+  conn.send(R"(
+    DELETE /newfile.txt HTTP/1.1
+    Host: foo
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 204 No Content
+
+    )"_blockquote);
+  KJ_EXPECT(!dir->exists(kj::Path({"newfile.txt"})));
+
+  // Delete a non-existent file.
+  conn.send(R"(
+    DELETE /notfound.txt HTTP/1.1
+    Host: foo
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 404 Not Found
+    Content-Length: 9
+
+    Not Found)"_blockquote);
+
   // Replace a file.
   conn.send(R"(
     PUT /existing.txt HTTP/1.1
@@ -2284,7 +3076,7 @@ KJ_TEST("Server: disk service writable") {
   // Read it back.
   KJ_EXPECT(dir->openFile(kj::Path({"existing.txt"}))->readAllText() == "grault\n");
 
-  // Write a file to a new direcotry.
+  // Write a file to a new directory.
   conn.send(R"(
     PUT /newdir/newfile.txt HTTP/1.1
     Host: foo
@@ -2299,6 +3091,18 @@ KJ_TEST("Server: disk service writable") {
 
   // Read it back.
   KJ_EXPECT(dir->openFile(kj::Path({"newdir", "newfile.txt"}))->readAllText() == "garply\n");
+
+  // Delete the new directory.
+  conn.send(R"(
+    DELETE /newdir/ HTTP/1.1
+    Host: foo
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 204 No Content
+
+    )"_blockquote);
+  KJ_EXPECT(!dir->exists(kj::Path({"newdir"})));
 
   // POST is denied because invalid method.
   conn.send(R"(
@@ -2335,6 +3139,44 @@ KJ_TEST("Server: disk service writable") {
     Content-Length: 6
 
     waldo
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 403 Unauthorized
+    Content-Length: 12
+
+    Unauthorized)"_blockquote);
+
+  // Dotfile delete access is denied.
+  conn.send(R"(
+    DELETE /.dot HTTP/1.1
+    Host: foo
+
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 403 Unauthorized
+    Content-Length: 12
+
+    Unauthorized)"_blockquote);
+
+  // Root write is denied.
+  conn.send(R"(
+    PUT / HTTP/1.1
+    Host: foo
+    Content-Length: 6
+
+    corge
+  )"_blockquote);
+  conn.recv(R"(
+    HTTP/1.1 403 Unauthorized
+    Content-Length: 12
+
+    Unauthorized)"_blockquote);
+
+  // Root delete is denied.
+  conn.send(R"(
+    DELETE / HTTP/1.1
+    Host: foo
+
   )"_blockquote);
   conn.recv(R"(
     HTTP/1.1 403 Unauthorized
@@ -2683,6 +3525,52 @@ KJ_TEST("Server: cache name is passed through to service") {
     KJ_EXPECT_LOG(INFO, "[ PASS ] another");
     KJ_EXPECT(!test.server.test(v8System, *test.config, "*", "*").wait(test.ws));
   }
+}
+
+// =======================================================================================
+
+KJ_TEST("Server: JS RPC over HTTP connections") {
+  // Test that we can send RPC over an ExternalServer pointing back to our own loopback socket,
+  // as long as both are configured with a `capnpConnectHost`.
+
+  TestServer test(R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2024-02-23",
+          compatibilityFlags = ["experimental"],
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `import {WorkerEntrypoint} from "cloudflare:workers";
+                `export default {
+                `  async fetch(request, env) {
+                `    return new Response("got: " + await env.OUT.frob(3, 11));
+                `  }
+                `}
+                `export class MyRpc extends WorkerEntrypoint {
+                `  async frob(a, b) { return a * b + 2; }
+                `}
+            )
+          ],
+          bindings = [( name = "OUT", service = "outbound")]
+        )
+      ),
+      (name = "outbound", external = (address = "loopback", http = (capnpConnectHost = "cappy")))
+    ],
+    sockets = [
+      ( name = "main", address = "test-addr", service = "hello" ),
+      ( name = "alt1", address = "loopback",
+        service = (name = "hello", entrypoint = "MyRpc"),
+        http = (capnpConnectHost = "cappy")),
+    ]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "got: 35");
 }
 
 // =======================================================================================

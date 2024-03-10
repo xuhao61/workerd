@@ -4,11 +4,17 @@
 
 #include "server.h"
 #include <kj/debug.h>
+#include <kj/glob-filter.h>
 #include <kj/compat/http.h>
 #include <kj/compat/tls.h>
 #include <kj/compat/url.h>
 #include <kj/encoding.h>
 #include <kj/map.h>
+#include <capnp/message.h>
+#include <capnp/rpc-twoparty.h>
+#include <capnp/compat/json.h>
+#include <workerd/api/analytics-engine.capnp.h>
+#include <workerd/io/actor-id.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/io/worker-entrypoint.h>
 #include <workerd/io/compatibility-date.h>
@@ -19,8 +25,16 @@
 #include <openssl/pem.h>
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/actor-sqlite.h>
+#include <workerd/io/request-tracker.h>
+#include <workerd/util/http-util.h>
 #include <workerd/api/actor-state.h>
+#include <workerd/util/mimetype.h>
+#include <workerd/util/uuid.h>
+#include <workerd/util/use-perfetto-categories.h>
+#include <workerd/api/worker-rpc.h>
 #include "workerd-api.h"
+#include "workerd/io/hibernation-manager.h"
+#include <stdlib.h>
 
 namespace workerd::server {
 
@@ -31,9 +45,8 @@ struct PemData {
   kj::Array<byte> data;
 };
 
+// Decode PEM format using OpenSSL helpers.
 static kj::Maybe<PemData> decodePem(kj::ArrayPtr<const char> text) {
-  // Decode PEM format using OpenSSL helpers.
-  //
   // TODO(cleanup): Should this be part of the KJ TLS library? We don't technically use it for TLS.
   //   Maybe KJ should have a general crypto library that wraps OpenSSL?
 
@@ -54,7 +67,7 @@ static kj::Maybe<PemData> decodePem(kj::ArrayPtr<const char> text) {
   byte* dataPtr = nullptr;
   long dataLen = 0;
   if (!PEM_read_bio(bio, &namePtr, &headerPtr, &dataPtr, &dataLen)) {
-    return nullptr;
+    return kj::none;
   }
   kj::Array<char> nameArr(namePtr, strlen(namePtr) + 1, disposer);
   KJ_DEFER(OPENSSL_free(headerPtr));
@@ -63,9 +76,8 @@ static kj::Maybe<PemData> decodePem(kj::ArrayPtr<const char> text) {
   return PemData { kj::String(kj::mv(nameArr)), kj::mv(data) };
 }
 
+// Returns a time string in the format HTTP likes to use.
 static kj::String httpTime(kj::Date date) {
-  // Returns a time string in the format HTTP likes to use.
-
   time_t time = (date - kj::UNIX_EPOCH) / kj::SECONDS;
 #if _WIN32
   // `gmtime` is thread-safe on Windows: https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/gmtime-gmtime32-gmtime64?view=msvc-170#return-value
@@ -109,61 +121,16 @@ static kj::Vector<char> escapeJsonString(kj::StringPtr text) {
   return escaped;
 }
 
-class EmptyReadOnlyActorStorageImpl final: public rpc::ActorStorage::Stage::Server {
-  // An ActorStorage implementation which will always respond to reads as if the state is empty,
-  // and will fail any writes.
-public:
-  kj::Promise<void> get(GetContext context) override {
-    return kj::READY_NOW;
-  }
-  kj::Promise<void> getMultiple(GetMultipleContext context) override {
-    return context.getParams().getStream().endRequest(capnp::MessageSize {2, 0})
-        .send().ignoreResult();
-  }
-  kj::Promise<void> list(ListContext context) override {
-    return context.getParams().getStream().endRequest(capnp::MessageSize {2, 0})
-        .send().ignoreResult();
-  }
-  kj::Promise<void> getAlarm(GetAlarmContext context) override {
-    return kj::READY_NOW;
-  }
-  kj::Promise<void> txn(TxnContext context) override {
-    auto results = context.getResults(capnp::MessageSize {2, 1});
-    results.setTransaction(kj::heap<TransactionImpl>());
-    return kj::READY_NOW;
-  }
-
-private:
-  class TransactionImpl final: public rpc::ActorStorage::Stage::Transaction::Server {
-  protected:
-    kj::Promise<void> get(GetContext context) override {
-      return kj::READY_NOW;
-    }
-    kj::Promise<void> getMultiple(GetMultipleContext context) override {
-      return context.getParams().getStream().endRequest(capnp::MessageSize {2, 0})
-          .send().ignoreResult();
-    }
-    kj::Promise<void> list(ListContext context) override {
-      return context.getParams().getStream().endRequest(capnp::MessageSize {2, 0})
-          .send().ignoreResult();
-    }
-    kj::Promise<void> getAlarm(GetAlarmContext context) override {
-      return kj::READY_NOW;
-    }
-    kj::Promise<void> commit(CommitContext context) override {
-      return kj::READY_NOW;
-    }
-  };
-};
-
 }  // namespace
 
 // =======================================================================================
 
 Server::Server(kj::Filesystem& fs, kj::Timer& timer, kj::Network& network,
-               kj::EntropySource& entropySource, kj::Function<void(kj::String)> reportConfigError)
+               kj::EntropySource& entropySource, Worker::ConsoleMode consoleMode,
+               kj::Function<void(kj::String)> reportConfigError)
     : fs(fs), timer(timer), network(network), entropySource(entropySource),
-      reportConfigError(kj::mv(reportConfigError)), tasks(*this) {}
+      reportConfigError(kj::mv(reportConfigError)), consoleMode(consoleMode),
+      memoryCacheProvider(kj::heap<api::MemoryCacheProvider>()), tasks(*this) {}
 
 Server::~Server() noexcept(false) {}
 
@@ -177,7 +144,8 @@ struct Server::GlobalContext {
   GlobalContext(Server& server, jsg::V8System& v8System,
                 kj::HttpHeaderTable::Builder& headerTableBuilder)
       : v8System(v8System),
-        httpOverCapnpFactory(byteStreamFactory, headerTableBuilder),
+        httpOverCapnpFactory(byteStreamFactory, headerTableBuilder,
+                             capnp::HttpOverCapnpFactory::LEVEL_2),
         threadContext(server.timer, server.entropySource,
             headerTableBuilder, httpOverCapnpFactory,
             byteStreamFactory,
@@ -187,16 +155,16 @@ struct Server::GlobalContext {
 
 class Server::Service {
 public:
-  virtual void link() {}
   // Cross-links this service with other services. Must be called once before `startRequest()`.
+  virtual void link() {}
 
-  virtual kj::Own<WorkerInterface> startRequest(
-      IoChannelFactory::SubrequestMetadata metadata) = 0;
   // Begin an incoming request. Returns a `WorkerInterface` object that will be used for one
   // request then discarded.
+  virtual kj::Own<WorkerInterface> startRequest(
+      IoChannelFactory::SubrequestMetadata metadata) = 0;
 
-  virtual bool hasHandler(kj::StringPtr handlerName) = 0;
   // Returns true if the service exports the given handler, e.g. `fetch`, `scheduled`, etc.
+  virtual bool hasHandler(kj::StringPtr handlerName) = 0;
 };
 
 // =======================================================================================
@@ -265,28 +233,22 @@ kj::Promise<kj::Own<kj::NetworkAddress>> Server::makeTlsNetworkAddress(
     kj::Maybe<kj::StringPtr> certificateHost, uint defaultPort) {
   auto context = makeTlsContext(conf);
 
-  KJ_IF_MAYBE(h, certificateHost) {
-    return network.parseAddress(addrStr, defaultPort)
-        .then([certificateHost = *h, context = kj::mv(context)]
-              (kj::Own<kj::NetworkAddress> addr) mutable {
-      return context->wrapAddress(kj::mv(addr), certificateHost).attach(kj::mv(context));
-    });
-  } else {
-    // Wrap the `Network` itself so we can use the TLS implementation's `parseAddress()` to extract
-    // the authority from the address.
-    auto tlsNetwork = context->wrapNetwork(network);
-    return tlsNetwork->parseAddress(addrStr, defaultPort).attach(kj::mv(tlsNetwork))
-        .then([context = kj::mv(context)](kj::Own<kj::NetworkAddress> addr) mutable {
-      return addr.attach(kj::mv(context));
-    });
+  KJ_IF_SOME(h, certificateHost) {
+    auto parsed = co_await network.parseAddress(addrStr, defaultPort);
+    co_return context->wrapAddress(kj::mv(parsed), h).attach(kj::mv(context));
   }
+
+  // Wrap the `Network` itself so we can use the TLS implementation's `parseAddress()` to extract
+  // the authority from the address.
+  auto tlsNetwork = context->wrapNetwork(network);
+  auto parsed = co_await network.parseAddress(addrStr, defaultPort);
+  co_return parsed.attach(kj::mv(context));
 }
 
 // =======================================================================================
 
+// Helper to apply config::HttpOptions.
 class Server::HttpRewriter {
-  // Helper to apply config::HttpOptions.
-  //
   // TODO(beta): Do we want to automatically add `Date`, `Server` (to outgoing responses),
   //   `User-Agent` (to outgoing requests), etc.?
 
@@ -302,21 +264,23 @@ public:
     if (httpOptions.hasCfBlobHeader()) {
       cfBlobHeader = headerTableBuilder.add(httpOptions.getCfBlobHeader());
     }
+    if (httpOptions.hasCapnpConnectHost()) {
+      capnpConnectHost = httpOptions.getCapnpConnectHost();
+    }
   }
 
   bool hasCfBlobHeader() {
-    return cfBlobHeader != nullptr;
+    return cfBlobHeader != kj::none;
   }
 
   bool needsRewriteRequest() {
     return style == config::HttpOptions::Style::HOST
-        || cfBlobHeader != nullptr
+        || hasCfBlobHeader()
         || !requestInjector.empty();
   }
 
+  // Attach this to the promise returned by request().
   struct Rewritten {
-    // Attach this to the promise returned by request().
-
     kj::Own<kj::HttpHeaders> headers;
     kj::String ownUrl;
   };
@@ -329,17 +293,17 @@ public:
       auto parsed = kj::Url::parse(url, kj::Url::HTTP_PROXY_REQUEST,
           kj::Url::Options {.percentDecode = false, .allowEmpty = true});
       result.headers->set(kj::HttpHeaderId::HOST, kj::mv(parsed.host));
-      KJ_IF_MAYBE(h, forwardedProtoHeader) {
-        result.headers->set(*h, kj::mv(parsed.scheme));
+      KJ_IF_SOME(h, forwardedProtoHeader) {
+        result.headers->set(h, kj::mv(parsed.scheme));
       }
       url = result.ownUrl = parsed.toString(kj::Url::HTTP_REQUEST);
     }
 
-    KJ_IF_MAYBE(h, cfBlobHeader) {
-      KJ_IF_MAYBE(b, cfBlobJson) {
-        result.headers->set(*h, *b);
+    KJ_IF_SOME(h, cfBlobHeader) {
+      KJ_IF_SOME(b, cfBlobJson) {
+        result.headers->set(h, b);
       } else {
-        result.headers->unset(*h);
+        result.headers->unset(h);
       }
     }
 
@@ -357,12 +321,12 @@ public:
     if (style == config::HttpOptions::Style::HOST) {
       auto parsed = kj::Url::parse(url, kj::Url::HTTP_REQUEST,
           kj::Url::Options {.percentDecode = false, .allowEmpty = true});
-      parsed.host = kj::str(KJ_UNWRAP_OR_RETURN(headers.get(kj::HttpHeaderId::HOST), nullptr));
+      parsed.host = kj::str(KJ_UNWRAP_OR_RETURN(headers.get(kj::HttpHeaderId::HOST), kj::none));
 
-      KJ_IF_MAYBE(h, forwardedProtoHeader) {
-        KJ_IF_MAYBE(s, headers.get(*h)) {
-          parsed.scheme = kj::str(*s);
-          result.headers->unset(*h);
+      KJ_IF_SOME(h, forwardedProtoHeader) {
+        KJ_IF_SOME(s, headers.get(h)) {
+          parsed.scheme = kj::str(s);
+          result.headers->unset(h);
         }
       }
 
@@ -371,10 +335,10 @@ public:
       url = result.ownUrl = parsed.toString(kj::Url::HTTP_PROXY_REQUEST);
     }
 
-    KJ_IF_MAYBE(h, cfBlobHeader) {
-      KJ_IF_MAYBE(b, headers.get(*h)) {
-        cfBlobJson = kj::str(*b);
-        result.headers->unset(*h);
+    KJ_IF_SOME(h, cfBlobHeader) {
+      KJ_IF_SOME(b, headers.get(h)) {
+        cfBlobJson = kj::str(b);
+        result.headers->unset(h);
       }
     }
 
@@ -391,10 +355,15 @@ public:
     responseInjector.apply(headers);
   }
 
+  kj::Maybe<kj::StringPtr> getCapnpConnectHost() {
+    return capnpConnectHost;
+  }
+
 private:
   config::HttpOptions::Style style;
   kj::Maybe<kj::HttpHeaderId> forwardedProtoHeader;
   kj::Maybe<kj::HttpHeaderId> cfBlobHeader;
+  kj::Maybe<kj::StringPtr> capnpConnectHost;
 
   class HeaderInjector {
   public:
@@ -413,8 +382,8 @@ private:
 
     void apply(kj::HttpHeaders& headers) {
       for (auto& header: injectedHeaders) {
-        KJ_IF_MAYBE(v, header.value) {
-          headers.set(header.id, *v);
+        KJ_IF_SOME(v, header.value) {
+          headers.set(header.id, v);
         } else {
           headers.unset(header.id);
         }
@@ -435,9 +404,8 @@ private:
 
 // =======================================================================================
 
+// Service used when the service's config is invalid.
 class Server::InvalidConfigService final: public Service {
-  // Service used when the service's config is invalid.
-
 public:
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
     JSG_FAIL_REQUIRE(Error, "Service cannot handle requests because its config is invalid.");
@@ -448,16 +416,15 @@ public:
   }
 };
 
+// Return a fake Own pointing to the singleton.
 kj::Own<Server::Service> Server::makeInvalidConfigService() {
-  // Return a fake Own pointing to the singleton.
   return { invalidConfigServiceSingleton.get(), kj::NullDisposer::instance };
 }
 
+// A NetworkAddress whose connect() method waits for a Promise<NetworkAddress> and then forwards
+// to it. Used by ExternalHttpService so that we don't have to wait for DNS lookup before the
+// server can start.
 class PromisedNetworkAddress final: public kj::NetworkAddress {
-  // A NetworkAddress whose connect() method waits for a Promise<NetworkAddress> and then forwards
-  // to it. Used by ExternalHttpService so that we don't have to wait for DNS lookup before the
-  // server can start.
-  //
   // TODO(cleanup): kj::Network should be extended with a new version of parseAddress() which does
   //   not do DNS lookup immediately, and therefore can return a NetworkAddress synchronously.
   //   In fact, this version should be designed to redo the DNS lookup periodically to see if it
@@ -469,22 +436,20 @@ public:
         }).fork()) {}
 
   kj::Promise<kj::Own<kj::AsyncIoStream>> connect() override {
-    KJ_IF_MAYBE(a, addr) {
-      return a->get()->connect();
+    KJ_IF_SOME(a, addr) {
+      co_return co_await a.get()->connect();
     } else {
-      return promise.addBranch().then([this]() {
-        return KJ_ASSERT_NONNULL(addr)->connect();
-      });
+      co_await promise;
+      co_return co_await KJ_ASSERT_NONNULL(addr)->connect();
     }
   }
 
   kj::Promise<kj::AuthenticatedStream> connectAuthenticated() override {
-    KJ_IF_MAYBE(a, addr) {
-      return a->get()->connectAuthenticated();
+    KJ_IF_SOME(a, addr) {
+      co_return co_await a.get()->connectAuthenticated();
     } else {
-      return promise.addBranch().then([this]() {
-        return KJ_ASSERT_NONNULL(addr)->connectAuthenticated();
-      });
+      co_await promise;
+      co_return co_await KJ_ASSERT_NONNULL(addr)->connectAuthenticated();
     }
   }
 
@@ -504,20 +469,85 @@ private:
   kj::Maybe<kj::Own<kj::NetworkAddress>> addr;
 };
 
-class Server::ExternalHttpService final: public Service {
-  // Service used when the service is configured as external HTTP service.
+class Server::ExternalTcpService final: public Service, private WorkerInterface {
+public:
+  ExternalTcpService(kj::Own<kj::NetworkAddress> addrParam)
+    : addr(kj::mv(addrParam)) {}
 
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    return { this, kj::NullDisposer::instance };
+  }
+
+  bool hasHandler(kj::StringPtr handlerName) override {
+    return handlerName == "fetch"_kj || handlerName == "connect"_kj;
+  }
+
+private:
+  kj::Own<kj::NetworkAddress> addr;
+
+  kj::Promise<void> request(
+      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
+    throwUnsupported();
+  }
+
+  kj::Promise<void> connect(
+      kj::StringPtr host, const kj::HttpHeaders& headers, kj::AsyncIoStream& connection,
+      ConnectResponse& tunnel, kj::HttpConnectSettings settings) override {
+      TRACE_EVENT("workerd", "ExternalTcpService::connect()", "host", host.cStr());
+      auto io_stream = co_await addr->connect();
+
+      auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+
+      promises.add(connection.pumpTo(*io_stream).then([&io_stream=*io_stream](uint64_t size) {
+        io_stream.shutdownWrite();
+      }));
+
+      promises.add(io_stream->pumpTo(connection).then([&connection](uint64_t size) {
+        connection.shutdownWrite();
+      }));
+
+      tunnel.accept(200, "OK", kj::HttpHeaders(kj::HttpHeaderTable{}));
+
+      co_await kj::joinPromisesFailFast(promises.finish()).attach(kj::mv(io_stream));
+  }
+
+  void prewarm(kj::StringPtr url) override {}
+  kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+    throwUnsupported();
+  }
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+    throwUnsupported();
+  }
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    throwUnsupported();
+  }
+
+  [[noreturn]] void throwUnsupported() {
+    JSG_FAIL_REQUIRE(Error, "External TCP servers don't support this event type.");
+  }
+
+};
+
+// Service used when the service is configured as external HTTP service.
+class Server::ExternalHttpService final: public Service, private kj::TaskSet::ErrorHandler {
 public:
   ExternalHttpService(kj::Own<kj::NetworkAddress> addrParam,
                       kj::Own<HttpRewriter> rewriter, kj::HttpHeaderTable& headerTable,
-                      kj::Timer& timer, kj::EntropySource& entropySource)
+                      kj::Timer& timer, kj::EntropySource& entropySource,
+                      capnp::ByteStreamFactory& byteStreamFactory,
+                      capnp::HttpOverCapnpFactory& httpOverCapnpFactory)
       : addr(kj::mv(addrParam)),
         inner(kj::newHttpClient(timer, headerTable, *addr, {
           .entropySource = entropySource,
           .webSocketCompressionMode = kj::HttpClientSettings::MANUAL_COMPRESSION
         })),
         serviceAdapter(kj::newHttpService(*inner)),
-        rewriter(kj::mv(rewriter)) {}
+        rewriter(kj::mv(rewriter)),
+        headerTable(headerTable),
+        byteStreamFactory(byteStreamFactory),
+        httpOverCapnpFactory(httpOverCapnpFactory),
+        waitUntilTasks(*this) {}
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
     return kj::heap<WorkerInterfaceImpl>(*this, kj::mv(metadata));
@@ -535,6 +565,55 @@ private:
 
   kj::Own<HttpRewriter> rewriter;
 
+  kj::HttpHeaderTable& headerTable;
+  capnp::ByteStreamFactory& byteStreamFactory;
+  capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
+  kj::TaskSet waitUntilTasks;
+
+  void taskFailed(kj::Exception&& exception) override {
+    LOG_EXCEPTION("externalServiceWaitUntilTasks", exception);
+  }
+
+  struct CapnpClient {
+    kj::Own<kj::AsyncIoStream> connection;
+    capnp::TwoPartyClient rpcSystem;
+
+    CapnpClient(kj::Own<kj::AsyncIoStream> connectionParam)
+        : connection(kj::mv(connectionParam)), rpcSystem(*connection) {}
+  };
+
+  // capnpClient is created on-demand when RPC is needed.
+  kj::Maybe<CapnpClient> capnpClient;
+
+  // This task nulls out `capnpClient` when the connection is lost.
+  kj::Promise<void> clearCapnpClientTask = nullptr;
+
+  // Get an WorkerdBootstrap representing the service on the other end of an HTTP connection. May
+  // reuse an existing connection, or form a new one over `client`.
+  rpc::WorkerdBootstrap::Client getOutgoingCapnp(kj::HttpClient& client) {
+    KJ_IF_SOME(c, capnpClient) {
+      return c.rpcSystem.bootstrap().castAs<rpc::WorkerdBootstrap>();
+    }
+
+    // No existing client, need to create a new one.
+    kj::StringPtr host = KJ_UNWRAP_OR(rewriter->getCapnpConnectHost(), {
+      return JSG_KJ_EXCEPTION(FAILED, Error, "This ExternalServer not configured for RPC.");
+    });
+
+    auto req = client.connect(host, kj::HttpHeaders(headerTable), {});
+    auto& c = capnpClient.emplace(kj::mv(req.connection));
+
+    // Arrange that when the connection is lost, we'll null out `capnpClient`. This ensures that
+    // on the next event, we'll attempt to reconnect.
+    //
+    // TODO(perf): Time out idle connections?
+    clearCapnpClientTask = c.rpcSystem.onDisconnect()
+        .attach(kj::defer([this]() { capnpClient = kj::none; }))
+        .eagerlyEvaluate(nullptr);
+
+    return c.rpcSystem.bootstrap().castAs<rpc::WorkerdBootstrap>();
+  }
+
   class WorkerInterfaceImpl final: public WorkerInterface, private kj::HttpService::Response {
   public:
     WorkerInterfaceImpl(ExternalHttpService& parent, IoChannelFactory::SubrequestMetadata metadata)
@@ -543,7 +622,8 @@ private:
     kj::Promise<void> request(
         kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
         kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
-      KJ_REQUIRE(wrappedResponse == nullptr, "object should only receive one request");
+      TRACE_EVENT("workerd", "ExternalHttpServer::request()");
+      KJ_REQUIRE(wrappedResponse == kj::none, "object should only receive one request");
       wrappedResponse = response;
       if (parent.rewriter->needsRewriteRequest()) {
         auto rewrite = parent.rewriter->rewriteOutgoingRequest(url, headers, metadata.cfBlobJson);
@@ -557,6 +637,7 @@ private:
     kj::Promise<void> connect(
         kj::StringPtr host, const kj::HttpHeaders& headers, kj::AsyncIoStream& connection,
         ConnectResponse& tunnel, kj::HttpConnectSettings settings) override {
+      TRACE_EVENT("workerd", "ExternalHttpServer::connect()");
       return parent.serviceAdapter->connect(host, headers, connection, tunnel, kj::mv(settings));
     }
 
@@ -564,11 +645,18 @@ private:
     kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
       throwUnsupported();
     }
-    kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime) override {
+    kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
       throwUnsupported();
     }
+
     kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
-      throwUnsupported();
+      // We'll use capnp RPC for custom events.
+      auto bootstrap = parent.getOutgoingCapnp(*parent.inner);
+      auto dispatcher =
+          bootstrap.startEventRequest(capnp::MessageSize {4, 0}).send().getDispatcher();
+      return event->sendRpc(parent.httpOverCapnpFactory, parent.byteStreamFactory,
+                            parent.waitUntilTasks, kj::mv(dispatcher))
+          .attach(kj::mv(event));
     }
 
   private:
@@ -583,6 +671,7 @@ private:
     kj::Own<kj::AsyncOutputStream> send(
         uint statusCode, kj::StringPtr statusText, const kj::HttpHeaders& headers,
         kj::Maybe<uint64_t> expectedBodySize) override {
+      TRACE_EVENT("workerd", "ExternalHttpService::send()", "status", statusCode);
       auto& response = KJ_ASSERT_NONNULL(wrappedResponse);
       if (parent.rewriter->needsRewriteResponse()) {
         auto rewrite = headers.cloneShallow();
@@ -594,6 +683,7 @@ private:
     }
 
     kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+      TRACE_EVENT("workerd", "ExternalHttpService::acceptWebSocket()");
       auto& response = KJ_ASSERT_NONNULL(wrappedResponse);
       if (parent.rewriter->needsRewriteResponse()) {
         auto rewrite = headers.cloneShallow();
@@ -609,12 +699,13 @@ private:
 kj::Own<Server::Service> Server::makeExternalService(
     kj::StringPtr name, config::ExternalServer::Reader conf,
     kj::HttpHeaderTable::Builder& headerTableBuilder) {
+  TRACE_EVENT("workerd", "Server::makeExternalService()", "name", name.cStr());
   kj::StringPtr addrStr = nullptr;
   kj::String ownAddrStr = nullptr;
 
-  KJ_IF_MAYBE(override, externalOverrides.findEntry(name)) {
-    addrStr = ownAddrStr = kj::mv(override->value);
-    externalOverrides.erase(*override);
+  KJ_IF_SOME(override, externalOverrides.findEntry(name)) {
+    addrStr = ownAddrStr = kj::mv(override.value);
+    externalOverrides.erase(override);
   } else if (conf.hasAddress()) {
     addrStr = conf.getAddress();
   } else {
@@ -631,7 +722,9 @@ kj::Own<Server::Service> Server::makeExternalService(
       auto rewriter = kj::heap<HttpRewriter>(conf.getHttp(), headerTableBuilder);
       auto addr = kj::heap<PromisedNetworkAddress>(network.parseAddress(addrStr, 80));
       return kj::heap<ExternalHttpService>(
-          kj::mv(addr), kj::mv(rewriter), globalContext->headerTable, timer, entropySource);
+          kj::mv(addr), kj::mv(rewriter), headerTableBuilder.getFutureTable(),
+          timer, entropySource, globalContext->byteStreamFactory,
+          globalContext->httpOverCapnpFactory);
     }
     case config::ExternalServer::HTTPS: {
       auto httpsConf = conf.getHttps();
@@ -643,7 +736,22 @@ kj::Own<Server::Service> Server::makeExternalService(
       auto addr = kj::heap<PromisedNetworkAddress>(
           makeTlsNetworkAddress(httpsConf.getTlsOptions(), addrStr, certificateHost, 443));
       return kj::heap<ExternalHttpService>(
-          kj::mv(addr), kj::mv(rewriter), globalContext->headerTable, timer, entropySource);
+          kj::mv(addr), kj::mv(rewriter), headerTableBuilder.getFutureTable(),
+          timer, entropySource, globalContext->byteStreamFactory,
+          globalContext->httpOverCapnpFactory);
+    }
+    case config::ExternalServer::TCP: {
+      auto tcpConf = conf.getTcp();
+      auto addr = kj::heap<PromisedNetworkAddress>(network.parseAddress(addrStr, 80));
+      if (tcpConf.hasTlsOptions()) {
+        kj::Maybe<kj::StringPtr> certificateHost;
+        if (tcpConf.hasCertificateHost()) {
+          certificateHost = tcpConf.getCertificateHost();
+        }
+        addr = kj::heap<PromisedNetworkAddress>(
+            makeTlsNetworkAddress(tcpConf.getTlsOptions(), addrStr, certificateHost, 0));
+      }
+      return kj::heap<ExternalTcpService>(kj::mv(addr));
     }
   }
   reportConfigError(kj::str(
@@ -652,9 +760,8 @@ kj::Own<Server::Service> Server::makeExternalService(
   return makeInvalidConfigService();
 }
 
+// Service used when the service is configured as network service.
 class Server::NetworkService final: public Service, private WorkerInterface {
-  // Service used when the service is configured as network service.
-
 public:
   NetworkService(kj::HttpHeaderTable& headerTable,
                  kj::Timer& timer, kj::EntropySource& entropySource,
@@ -686,12 +793,14 @@ private:
   kj::Promise<void> request(
       kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
+    TRACE_EVENT("workerd", "NetworkService::request()");
     return serviceAdapter->request(method, url, headers, requestBody, response);
   }
 
   kj::Promise<void> connect(
       kj::StringPtr host, const kj::HttpHeaders& headers, kj::AsyncIoStream& connection,
       ConnectResponse& tunnel, kj::HttpConnectSettings settings) override {
+    TRACE_EVENT("workerd", "NetworkService::connect()");
     // This code is hit when the global `connect` function is called in a JS worker script.
     // It represents a proxy-less TCP connection, which means we can simply defer the handling of
     // the connection to the service adapter (likely NetworkHttpClient). Its behaviour will be to
@@ -703,7 +812,7 @@ private:
   kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
     throwUnsupported();
   }
-  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime) override {
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
     throwUnsupported();
   }
   kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
@@ -716,6 +825,7 @@ private:
 };
 
 kj::Own<Server::Service> Server::makeNetworkService(config::Network::Reader conf) {
+  TRACE_EVENT("workerd", "Server::makeNetworkService()");
   auto restrictedNetwork = network.restrictPeers(
       KJ_MAP(a, conf.getAllow()) -> kj::StringPtr { return a; },
       KJ_MAP(a, conf.getDeny() ) -> kj::StringPtr { return a; });
@@ -732,9 +842,8 @@ kj::Own<Server::Service> Server::makeNetworkService(config::Network::Reader conf
                                   kj::mv(restrictedNetwork), kj::mv(tlsNetwork), tlsContext);
 }
 
+// Service used when the service is configured as disk directory service.
 class Server::DiskDirectoryService final: public Service, private WorkerInterface {
-  // Service used when the service is configured as disk directory service.
-
 public:
   DiskDirectoryService(config::DiskDirectory::Reader conf,
                        kj::Own<const kj::Directory> dir,
@@ -767,15 +876,17 @@ private:
   bool allowDotfiles;
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr urlStr, const kj::HttpHeaders& headers,
+      kj::HttpMethod method, kj::StringPtr urlStr, const kj::HttpHeaders& requestHeaders,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
+    TRACE_EVENT("workerd", "DiskDirectoryService::request()", "url", urlStr.cStr());
     auto url = kj::Url::parse(urlStr);
 
     bool blockedPath = false;
     kj::Path path = nullptr;
-    KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
+    KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
       path = kj::Path(url.path.releaseAsArray());
     })) {
+      (void)exception; // squash compiler warning about unused var
       // If the Path constructor throws, this path is not valid (e.g. it contains "..").
       blockedPath = true;
     }
@@ -791,19 +902,40 @@ private:
 
     if (method == kj::HttpMethod::GET || method == kj::HttpMethod::HEAD) {
       if (blockedPath) {
-        return response.sendError(404, "Not Found", headerTable);
+        co_return co_await response.sendError(404, "Not Found", headerTable);
       }
 
       auto file = KJ_UNWRAP_OR(readable->tryOpenFile(path), {
-        return response.sendError(404, "Not Found", headerTable);
+        co_return co_await response.sendError(404, "Not Found", headerTable);
       });
 
       auto meta = file->stat();
 
       switch (meta.type) {
         case kj::FsNode::Type::FILE: {
+          // If this is a GET request with a Range header, return partial content if a single
+          // satisfiable range is specified.
+          // TODO(someday): consider supporting multiple ranges with multipart/byteranges
+          kj::Maybe<kj::HttpByteRange> range;
+          if (method == kj::HttpMethod::GET) {
+            KJ_IF_SOME(header, requestHeaders.get(kj::HttpHeaderId::RANGE)) {
+              KJ_SWITCH_ONEOF(kj::tryParseHttpRangeHeader(header.asArray(), meta.size)) {
+                KJ_CASE_ONEOF(ranges, kj::Array<kj::HttpByteRange>) {
+                  KJ_ASSERT(ranges.size() > 0);
+                  if (ranges.size() == 1) range = ranges[0];
+                }
+                KJ_CASE_ONEOF(_, kj::HttpEverythingRange) {}
+                KJ_CASE_ONEOF(_, kj::HttpUnsatisfiableRange) {
+                  kj::HttpHeaders headers(headerTable);
+                  headers.set(kj::HttpHeaderId::CONTENT_RANGE, kj::str("bytes */", meta.size));
+                  co_return co_await response.sendError(416, "Range Not Satisfiable", headers);
+                }
+              }
+            }
+          }
+
           kj::HttpHeaders headers(headerTable);
-          headers.set(kj::HttpHeaderId::CONTENT_TYPE, "application/octet-stream");
+          headers.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::OCTET_STREAM.toString());
           headers.set(hLastModified, httpTime(meta.lastModified));
 
           // We explicitly set the Content-Length header because if we don't, and we were called
@@ -814,18 +946,27 @@ private:
           //   if no `Content-Length` header is returned, but the body size is known via the KJ
           //   HTTP API, then the header shoud be filled in automatically. Unclear if this is safe
           //   to change without a compat flag.
-          headers.set(kj::HttpHeaderId::CONTENT_LENGTH, kj::str(meta.size));
-
-          auto out = response.send(200, "OK", headers, meta.size);
 
           if (method == kj::HttpMethod::HEAD) {
-            return kj::READY_NOW;
-          } else {
-            auto in = kj::heap<kj::FileInputStream>(*file);
+            headers.set(kj::HttpHeaderId::CONTENT_LENGTH, kj::str(meta.size));
+            response.send(200, "OK", headers, meta.size);
+            co_return;
+          } else KJ_IF_SOME(r, range) {
+            KJ_ASSERT(r.start <= r.end);
+            auto rangeSize = r.end - r.start + 1;
+            headers.set(kj::HttpHeaderId::CONTENT_LENGTH, kj::str(rangeSize));
+            headers.set(kj::HttpHeaderId::CONTENT_RANGE,
+              kj::str("bytes ", r.start, "-", r.end, "/", meta.size));
+            auto out = response.send(206, "Partial Content", headers, rangeSize);
 
-            return in->pumpTo(*out, meta.size)
-                .ignoreResult()
-                .attach(kj::mv(in), kj::mv(out), kj::mv(file));
+            auto in = kj::heap<kj::FileInputStream>(*file, r.start);
+            co_return co_await in->pumpTo(*out, rangeSize).ignoreResult();
+          } else {
+            headers.set(kj::HttpHeaderId::CONTENT_LENGTH, kj::str(meta.size));
+            auto out = response.send(200, "OK", headers, meta.size);
+
+            auto in = kj::heap<kj::FileInputStream>(*file);
+            co_return co_await in->pumpTo(*out, meta.size).ignoreResult();
           }
         }
         case kj::FsNode::Type::DIRECTORY: {
@@ -834,7 +975,7 @@ private:
           auto dir = readable->openSubdir(path);
 
           kj::HttpHeaders headers(headerTable);
-          headers.set(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
+          headers.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::JSON.toString());
           headers.set(hLastModified, httpTime(meta.lastModified));
 
           // We intentionally don't provide the expected size here in order to reserve the right
@@ -842,7 +983,7 @@ private:
           auto out = response.send(200, "OK", headers);
 
           if (method == kj::HttpMethod::HEAD) {
-            return kj::READY_NOW;
+            co_return;
           } else {
             auto entries = dir->listEntries();
             kj::Vector<kj::String> jsonEntries(entries.size());
@@ -870,34 +1011,51 @@ private:
 
             auto content = kj::str('[', kj::strArray(jsonEntries, ","), ']');
 
-            return out->write(content.begin(), content.size())
-                .attach(kj::mv(content), kj::mv(out));
+            co_return co_await out->write(content.begin(), content.size());
           }
         }
         default:
-          return response.sendError(406, "Not Acceptable", headerTable);
+          co_return co_await response.sendError(406, "Not Acceptable", headerTable);
       }
     } else if (method == kj::HttpMethod::PUT) {
       auto& w = KJ_UNWRAP_OR(writable, {
-        return response.sendError(405, "Method Not Allowed", headerTable);
+        co_return co_await response.sendError(405, "Method Not Allowed", headerTable);
       });
 
-      if (blockedPath) {
-        return response.sendError(403, "Unauthorized", headerTable);
+      if (blockedPath || path.size() == 0) {
+        co_return co_await response.sendError(403, "Unauthorized", headerTable);
       }
 
       auto replacer = w.replaceFile(path,
           kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
       auto stream = kj::heap<kj::FileOutputStream>(replacer->get());
 
-      return requestBody.pumpTo(*stream).attach(kj::mv(stream))
-          .then([this, replacer = kj::mv(replacer), &response](uint64_t) mutable {
-        replacer->commit();
-        kj::HttpHeaders headers(headerTable);
-        response.send(204, "No Content", headers);
+      co_await requestBody.pumpTo(*stream);
+
+      replacer->commit();
+      kj::HttpHeaders headers(headerTable);
+      response.send(204, "No Content", headers);
+      co_return;
+    } else if (method == kj::HttpMethod::DELETE) {
+      auto& w = KJ_UNWRAP_OR(writable, {
+        co_return co_await response.sendError(405, "Method Not Allowed", headerTable);
       });
+
+      if (blockedPath || path.size() == 0) {
+        co_return co_await response.sendError(403, "Unauthorized", headerTable);
+      }
+
+      auto found = w.tryRemove(path);
+
+      kj::HttpHeaders headers(headerTable);
+      if (found) {
+        response.send(204, "No Content", headers);
+        co_return;
+      } else {
+        co_return co_await response.sendError(404, "Not Found", headers);
+      }
     } else {
-      return response.sendError(501, "Not Implemented", headerTable);
+      co_return co_await response.sendError(501, "Not Implemented", headerTable);
     }
   }
 
@@ -910,7 +1068,7 @@ private:
   kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
     throwUnsupported();
   }
-  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime) override {
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
     throwUnsupported();
   }
   kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
@@ -925,12 +1083,13 @@ private:
 kj::Own<Server::Service> Server::makeDiskDirectoryService(
     kj::StringPtr name, config::DiskDirectory::Reader conf,
     kj::HttpHeaderTable::Builder& headerTableBuilder) {
+  TRACE_EVENT("workerd", "Server::makeDiskDirectoryService()");
   kj::StringPtr pathStr = nullptr;
   kj::String ownPathStr;
 
-  KJ_IF_MAYBE(override, directoryOverrides.findEntry(name)) {
-    pathStr = ownPathStr = kj::mv(override->value);
-    directoryOverrides.erase(*override);
+  KJ_IF_SOME(override, directoryOverrides.findEntry(name)) {
+    pathStr = ownPathStr = kj::mv(override.value);
+    directoryOverrides.erase(override);
   } else if (conf.hasPath()) {
     pathStr = conf.getPath();
   } else {
@@ -963,28 +1122,71 @@ kj::Own<Server::Service> Server::makeDiskDirectoryService(
 
 // =======================================================================================
 
+// This class exists to update the InspectorService's table of isolates when a config
+// has multiple services. The InspectorService exists on the stack of it's own thread and
+// initializes state that is bound to the thread, e.g. a http server and an event loop.
+// This class provides a small thread-safe interface to the InspectorService so <name>:<isolate>
+// mappings can be added after the InspectorService has started.
+//
+// The CloudFlare devtools only show the first service in workerd configuration. This service
+// is always contains a users code. However, in packaging user code wrangler may add
+// additional services that also have code. If using Chrome devtools to inspect a workerd,
+// instance all services are visible and can be debugged.
+class Server::InspectorServiceIsolateRegistrar final {
+public:
+  InspectorServiceIsolateRegistrar() {}
+  ~InspectorServiceIsolateRegistrar() noexcept(true);
+
+  void registerIsolate(kj::StringPtr name, Worker::Isolate* isolate);
+
+  KJ_DISALLOW_COPY_AND_MOVE(InspectorServiceIsolateRegistrar);
+private:
+  void attach(const Server::InspectorService* anInspectorService) {
+    *inspectorService.lockExclusive() = anInspectorService;
+  }
+
+  void detach() {
+    *inspectorService.lockExclusive() = nullptr;
+  }
+
+  kj::MutexGuarded<const InspectorService*> inspectorService;
+  friend class Server::InspectorService;
+};
+
+// Implements the interface for the devtools inspector protocol.
+//
+// The InspectorService is created when workerd serve is called using the -i option
+// to define the inspector socket.
 class Server::InspectorService final: public kj::HttpService, public kj::HttpServerErrorHandler {
-  // Implements the interface for the devtools inspector protocol.
-  //
-  // The InspectorService is created when workerd serve is called using the -i option
-  // to define the inspector socket.
 public:
   InspectorService(
       kj::Timer& timer,
-      kj::HttpHeaderTable::Builder& headerTableBuilder)
+      kj::HttpHeaderTable::Builder& headerTableBuilder,
+      InspectorServiceIsolateRegistrar& registrar)
       : timer(timer),
         headerTable(headerTableBuilder.getFutureTable()),
         server(timer, headerTable, *this, kj::HttpServerSettings {
           .errorHandler = *this
-        }) {}
+        }),
+        registrar(registrar) {
+    registrar.attach(this);
+  }
+
+  ~InspectorService() {
+    KJ_IF_SOME(r, registrar) {
+      r.detach();
+    }
+  }
+
+  void invalidateRegistrar() {
+    registrar = kj::none;
+  }
 
   kj::Promise<void> handleApplicationError(
       kj::Exception exception, kj::Maybe<kj::HttpService::Response&> response) override {
     KJ_LOG(ERROR, kj::str("Uncaught exception: ", exception));
-    KJ_IF_MAYBE(r, response) {
-      return r->sendError(500, "Internal Server Error", headerTable);
-    } else {
-      return kj::READY_NOW;
+    KJ_IF_SOME(r, response) {
+      co_return co_await r.sendError(500, "Internal Server Error", headerTable);
     }
   }
 
@@ -1002,35 +1204,36 @@ public:
     // actually connect the debug session.
     kj::HttpHeaders responseHeaders(headerTable);
     if (headers.isWebSocket()) {
-      KJ_IF_MAYBE(pos, url.findLast('/')) {
-        auto id = url.slice(*pos + 1);
+      KJ_IF_SOME(pos, url.findLast('/')) {
+        auto id = url.slice(pos + 1);
 
-        KJ_IF_MAYBE(isolate, isolates.find(id)) {
+        KJ_IF_SOME(isolate, isolates.find(id)) {
           // If getting the strong ref doesn't work it means that the Worker::Isolate
           // has already been cleaned up. We use a weak ref here in order to keep from
           // having the Worker::Isolate itself having to know anything at all about the
           // IsolateService and the registration process. So instead of having Isolate
           // explicitly clean up after itself we lazily evaluate the weak ref and clean
           // up when necessary.
-          KJ_IF_MAYBE(ref, (*isolate)->tryAddStrongRef()) {
+          KJ_IF_SOME(ref, isolate->tryAddStrongRef()) {
             // When using --verbose, we'll output some logging to indicate when the
             // inspector client is attached/detached.
             KJ_LOG(INFO, kj::str("Inspector client attaching [", id, "]"));
             auto webSocket = response.acceptWebSocket(responseHeaders);
             kj::Duration timerOffset = 0 * kj::MILLISECONDS;
-            return (*ref)->attachInspector(timer, timerOffset, *webSocket)
-                .attach(kj::mv(webSocket), kj::mv(*ref)).catch_([id=kj::str(id)](kj::Exception&& ex)
-                    -> kj::Promise<void> {
-              if (ex.getType() == kj::Exception::Type::DISCONNECTED) {
+            try {
+              co_return co_await ref->attachInspector(timer, timerOffset, *webSocket);
+            } catch (...) {
+              auto exception = kj::getCaughtExceptionAsKj();
+              if (exception.getType() == kj::Exception::Type::DISCONNECTED) {
                 // This likely just means that the inspector client was closed.
                 // Nothing to do here but move along.
                 KJ_LOG(INFO, kj::str("Inspector client detached [", id, "]"));
-                return kj::READY_NOW;
+                co_return;
               } else {
                 // If it's any other kind of error, propagate it!
-                kj::throwFatalException(kj::mv(ex));
+                kj::throwFatalException(kj::mv(exception));
               }
-            });
+            }
           } else {
             // If we can't get a strong ref to the isolate here, it's been cleaned
             // up. The only thing we're going to do is clean up here and act like
@@ -1039,29 +1242,32 @@ public:
           }
         }
 
-        return response.sendError(404, "Unknown worker session", responseHeaders);
+        KJ_LOG(INFO, kj::str("Unknown worker session [", id, "]"));
+        co_return co_await response.sendError(404, "Unknown worker session", responseHeaders);
       }
 
       // No / in url!? That's weird
-      return response.sendError(400, "Invalid request", responseHeaders);
+      co_return co_await response.sendError(400, "Invalid request", responseHeaders);
     }
 
     // If the request is not a WebSocket request, it must be a GET to fetch details
     // about the implementation.
     if (method != kj::HttpMethod::GET) {
-      return response.sendError(501, "Unsupported Operation", responseHeaders);
+      co_return co_await response.sendError(501, "Unsupported Operation", responseHeaders);
     }
 
     if (url.endsWith("/json/version")) {
-      responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, "application/json"_kj);
+      responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::JSON.toString());
       auto content = kj::str("{\"Browser\": \"workerd\", \"Protocol-Version\": \"1.3\" }");
       auto out = response.send(200, "OK", responseHeaders, content.size());
-      return out->write(content.begin(), content.size()).attach(kj::mv(content), kj::mv(out));
-    } else if (url.endsWith("/json") || url.endsWith("/json/list")) {
-      responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, "application/json"_kj);
+      co_return co_await out->write(content.begin(), content.size());
+    } else if (url.endsWith("/json") ||
+               url.endsWith("/json/list") ||
+               url.endsWith("/json/list?for_tab")) {
+      responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::JSON.toString());
 
       auto baseWsUrl = KJ_UNWRAP_OR(headers.get(kj::HttpHeaderId::HOST), {
-        return response.sendError(400, "Bad Request", responseHeaders);
+        co_return co_await response.sendError(400, "Bad Request", responseHeaders);
       });
 
       kj::Vector<kj::String> entries(isolates.size());
@@ -1074,10 +1280,11 @@ public:
         // We'll lazily clean up whenever we detect that the ref has been invalidated.
         //
         // TODO(cleanup): If we ever enable reloading of isolates for live services, we may
-        // want to refactor this such thatthe WorkerService holds a handle to the registration
+        // want to refactor this such that the WorkerService holds a handle to the registration
         // as opposed to using this lazy cleanup mechanism. For now, however, this is
         // sufficient.
-        KJ_IF_MAYBE(ref, entry.value->tryAddStrongRef()) {
+        KJ_IF_SOME(ref, entry.value->tryAddStrongRef()) {
+          (void)ref; // squash compiler warning about unused ref
           kj::Vector<kj::String> fields(9);
           fields.add(kj::str("\"id\":\"", entry.key ,"\""));
           fields.add(kj::str("\"title\":\"workerd: worker ", entry.key ,"\""));
@@ -1105,10 +1312,11 @@ public:
       auto content = kj::str('[', kj::strArray(entries, ","), ']');
 
       auto out = response.send(200, "OK", responseHeaders, content.size());
-      return out->write(content.begin(), content.size()).attach(kj::mv(content), kj::mv(out));
+      co_return co_await out->write(content.begin(), content.size()).attach(kj::mv(content),
+                                    kj::mv(out));
     }
 
-    return response.sendError(500, "Not yet implemented", responseHeaders);
+    co_return co_await response.sendError(500, "Not yet implemented", responseHeaders);
   }
 
   kj::Promise<void> listen(kj::Own<kj::ConnectionReceiver> listener) {
@@ -1124,7 +1332,7 @@ public:
     //   drain() requests. (However, our caller does cancel listening on the server port as soon
     //   as we begin draining, since we may want new connections to go to a new instance of the
     //   server.)
-    return server.listenHttp(*listener).attach(kj::mv(listener));
+    co_return co_await server.listenHttp(*listener);
   }
 
   void registerIsolate(kj::StringPtr name, Worker::Isolate* isolate) {
@@ -1136,13 +1344,24 @@ private:
   kj::HttpHeaderTable& headerTable;
   kj::HashMap<kj::String, kj::Own<const Worker::Isolate::WeakIsolateRef>> isolates;
   kj::HttpServer server;
-
-  friend class Registration;
+  kj::Maybe<InspectorServiceIsolateRegistrar&> registrar;
 };
 
-kj::Own<Server::InspectorService> Server::makeInspectorService(
-    kj::HttpHeaderTable::Builder& headerTableBuilder) {
-  return kj::heap<InspectorService>(timer, headerTableBuilder);
+Server::InspectorServiceIsolateRegistrar::~InspectorServiceIsolateRegistrar() noexcept(true) {
+  auto lockedInspectorService = this->inspectorService.lockExclusive();
+  if (lockedInspectorService != nullptr) {
+    auto is = const_cast<InspectorService*>(*lockedInspectorService);
+    is->invalidateRegistrar();
+  }
+}
+
+void Server::InspectorServiceIsolateRegistrar::registerIsolate(kj::StringPtr name,
+                                                               Worker::Isolate* isolate) {
+  auto lockedInspectorService = this->inspectorService.lockExclusive();
+  if (lockedInspectorService != nullptr) {
+    auto is = const_cast<InspectorService*>(*lockedInspectorService);
+    is->registerIsolate(name, isolate);
+  }
 }
 
 // =======================================================================================
@@ -1153,8 +1372,8 @@ class Server::WorkerService final: public Service, private kj::TaskSet::ErrorHan
 public:
   class ActorNamespace;
 
+  // I/O channels, delivered when link() is called.
   struct LinkedIoChannels {
-    // I/O channels, delivered when link() is called.
     kj::Array<Service*> subrequest;
     kj::Array<kj::Maybe<ActorNamespace&>> actor;  // null = configuration error
     kj::Maybe<Service&> cache;
@@ -1162,17 +1381,19 @@ public:
     AlarmScheduler& alarmScheduler;
   };
   using LinkCallback = kj::Function<LinkedIoChannels(WorkerService&)>;
+  using AbortActorsCallback = kj::Function<void()>;
 
   WorkerService(ThreadContext& threadContext, kj::Own<const Worker> worker,
                 kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers,
                 kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypointsParam,
                 const kj::HashMap<kj::String, ActorConfig>& actorClasses,
-                LinkCallback linkCallback)
+                LinkCallback linkCallback, AbortActorsCallback abortActorsCallback)
       : threadContext(threadContext),
         ioChannels(kj::mv(linkCallback)),
         worker(kj::mv(worker)),
         defaultEntrypointHandlers(kj::mv(defaultEntrypointHandlers)),
-        waitUntilTasks(*this) {
+        waitUntilTasks(*this), abortActorsCallback(kj::mv(abortActorsCallback)) {
+
     namedEntrypoints.reserve(namedEntrypointsParam.size());
     for (auto& ep: namedEntrypointsParam) {
       kj::StringPtr epPtr = ep.key;
@@ -1181,7 +1402,7 @@ public:
 
     actorNamespaces.reserve(actorClasses.size());
     for (auto& entry: actorClasses) {
-      auto ns = kj::heap<ActorNamespace>(*this, entry.key, entry.value);
+      auto ns = kj::heap<ActorNamespace>(*this, entry.key, entry.value, threadContext.getUnsafeTimer());
       actorNamespaces.insert(entry.key, kj::mv(ns));
     }
   }
@@ -1201,10 +1422,10 @@ public:
   }
 
   kj::Maybe<ActorNamespace&> getActorNamespace(kj::StringPtr name) {
-    KJ_IF_MAYBE(a, actorNamespaces.find(name)) {
-      return **a;
+    KJ_IF_SOME(a, actorNamespaces.find(name)) {
+      return *a;
     } else {
-      return nullptr;
+      return kj::none;
     }
   }
 
@@ -1214,12 +1435,12 @@ public:
 
   kj::Own<WorkerInterface> startRequest(
       IoChannelFactory::SubrequestMetadata metadata) override {
-    return startRequest(kj::mv(metadata), nullptr);
+    return startRequest(kj::mv(metadata), kj::none);
   }
 
   bool hasHandler(kj::StringPtr handlerName) override {
-    KJ_IF_MAYBE(h, defaultEntrypointHandlers) {
-      return h->contains(handlerName);
+    KJ_IF_SOME(h, defaultEntrypointHandlers) {
+      return h.contains(handlerName);
     } else {
       return false;
     }
@@ -1227,8 +1448,9 @@ public:
 
   kj::Own<WorkerInterface> startRequest(
       IoChannelFactory::SubrequestMetadata metadata, kj::Maybe<kj::StringPtr> entrypointName,
-      kj::Maybe<kj::Own<Worker::Actor>> actor = nullptr) {
-    return WorkerEntrypoint::construct(
+      kj::Maybe<kj::Own<Worker::Actor>> actor = kj::none) {
+    TRACE_EVENT("workerd", "Server::WorkerService::startRequest()");
+    return newWorkerEntrypoint(
         threadContext,
         kj::atomicAddRef(*worker),
         entrypointName,
@@ -1239,14 +1461,18 @@ public:
         kj::refcounted<RequestObserver>(),  // default observer makes no observations
         waitUntilTasks,
         true,                      // tunnelExceptions
-        nullptr,                   // workerTracer
+        kj::none,                  // workerTracer
         kj::mv(metadata.cfBlobJson));
   }
 
-  class ActorNamespace final: private kj::TaskSet::ErrorHandler {
+  class ActorNamespace final {
   public:
-    ActorNamespace(WorkerService& service, kj::StringPtr className, const ActorConfig& config)
-        : service(service), className(className), config(config), onBrokenTasks(*this) {}
+    ActorNamespace(WorkerService& service,kj::StringPtr className, const ActorConfig& config,
+        kj::Timer& timer)
+        : service(service),
+          className(className),
+          config(config),
+          timer(timer) {}
 
     const ActorConfig& getConfig() { return config; }
 
@@ -1269,33 +1495,264 @@ public:
 
     kj::Own<WorkerInterface> getActor(kj::String id,
         IoChannelFactory::SubrequestMetadata metadata) {
-      auto promise = getActorImpl(kj::mv(id))
-          .then([this, metadata = kj::mv(metadata)](kj::Own<Worker::Actor> actor) mutable {
-        return service.startRequest(kj::mv(metadata), className, kj::mv(actor));
-      });
-
-      return newPromisedWorkerInterface(service.waitUntilTasks, kj::mv(promise));
+      return newPromisedWorkerInterface(service.waitUntilTasks,
+          getActorThenStartRequest(kj::mv(id), kj::mv(metadata)));
     }
 
     kj::Own<IoChannelFactory::ActorChannel> getActorChannel(Worker::Actor::Id id) {
       return kj::heap<ActorChannelImpl>(*this, kj::mv(id));
     }
 
+    // Forward declaration.
+    class ActorContainerRef;
+
+    // ActorContainer mostly serves as a wrapper around Worker::Actor.
+    // We use it to associate a HibernationManager with the Worker::Actor, since the
+    // Worker::Actor can be destroyed during periods of prolonged inactivity.
+    //
+    // We use a RequestTracker to track strong references to this ActorContainer's Worker::Actor.
+    // Once there are no Worker::Actor's left (excluding our own), `inactive()` is triggered and we
+    // initiate the eviction of the Durable Object. If no requests arrive in the next 10 seconds,
+    // the DO is evicted, otherwise we cancel the eviction task.
+    class ActorContainer final: public RequestTracker::Hooks {
+    public:
+      ActorContainer(kj::StringPtr key, ActorNamespace& parent, kj::Timer& timer)
+          : key(key),
+            tracker(kj::refcounted<RequestTracker>(*this)),
+            parent(parent),
+            timer(timer),
+            lastAccess(timer.now()) {}
+
+      ~ActorContainer() noexcept(false) {
+        // Shutdown the tracker so we don't use active/inactive hooks anymore.
+        tracker->shutdown();
+
+        KJ_IF_SOME(a, actor) {
+          // Unknown broken reason.
+          auto reason = 0;
+          a->shutdown(reason);
+        }
+
+        KJ_IF_SOME(ref, containerRef) {
+          // We're being destroyed before the ActorContainerRef, probably because the actor broke.
+          // Let's drop the ActorContainerRef's reference to us to prevent another eviction attempt.
+          ref.container = kj::none;
+        }
+
+        // Don't erase the onBrokenTask if it is the reason we are being destroyed.
+        if (!onBrokenTriggered) {
+          parent.onBrokenTasks.erase(key);
+        }
+        // We need to make sure we're removed from the actors map.
+        parent.actors.erase(key);
+      }
+
+      void active() override {
+        // We're handling a new request, cancel the eviction promise.
+        shutdownTask = kj::none;
+      }
+
+      void inactive() override {
+        // Durable objects are evictable by default.
+        bool isEvictable = true;
+        KJ_SWITCH_ONEOF(parent.config) {
+          KJ_CASE_ONEOF(c, Durable) {
+            isEvictable = c.isEvictable;
+          }
+          KJ_CASE_ONEOF(c, Ephemeral) {
+            isEvictable = c.isEvictable;
+          }
+        }
+        if (isEvictable) {
+          KJ_IF_SOME(a, actor) {
+            KJ_IF_SOME(m, a->getHibernationManager()) {
+              // The hibernation manager needs to survive actor eviction and be passed to the actor
+              // constructor next time we create it.
+              manager = m.addRef();
+            }
+          }
+          shutdownTask = handleShutdown().eagerlyEvaluate([](kj::Exception&& e) { KJ_LOG(ERROR, e); });
+        }
+      }
+
+      // Processes the eviction of the Durable Object and hibernates active websockets.
+      kj::Promise<void> handleShutdown() {
+        // After 10 seconds of inactivity, we destroy the Worker::Actor and hibernate any active
+        // JS WebSockets.
+        // TODO(someday): We could make this timeout configurable to make testing less burdensome.
+        co_await timer.afterDelay(10 * kj::SECONDS);
+        KJ_IF_SOME(onBroken, parent.onBrokenTasks.findEntry(getKey())) {
+          // Cancel the onBroken promise, since we're about to destroy the actor anyways and don't
+          // want to trigger it.
+          parent.onBrokenTasks.erase(onBroken);
+        }
+        KJ_IF_SOME(a, actor) {
+          if (a->isShared()) {
+            // Our ActiveRequest refcounting has broken somewhere. This is likely because we're
+            // `addRef`-ing an actor that has had an ActiveRequest attached to its kj::Own (in other
+            // words, the ActiveRequest count is less than it should be).
+            //
+            // Rather than dropping our actor and possibly ending up with split-brain,
+            // we should opt out of the deferred proxy optimization and log the error to Sentry.
+            KJ_LOG(ERROR,
+                "Detected internal bug in hibernation: Durable Object has strong references "\
+                "when hibernation timeout expired.");
+
+            co_return;
+          }
+          KJ_IF_SOME(m, manager) {
+            auto& worker = a->getWorker();
+            auto workerStrongRef = kj::atomicAddRef(worker);
+            // Take an async lock, we can't use `takeAsyncLock(RequestObserver&)` since we don't
+            // have an `IncomingRequest` at this point.
+            //
+            // Note that we do not have a race here because this is part of the `shutdownTask`
+            // promise. If a new request comes in while we're waiting to get the lock then we will
+            // cancel this promise.
+            Worker::AsyncLock asyncLock = co_await worker.takeAsyncLockWithoutRequest(nullptr);
+            workerStrongRef->runInLockScope(asyncLock, [&](Worker::Lock& lock) {
+              m->hibernateWebSockets(lock);
+            });
+          }
+          a->shutdown(0, KJ_EXCEPTION(DISCONNECTED,
+              "broken.dropped; Actor freed due to inactivity"));
+        }
+        // Destory the last strong Worker::Actor reference.
+        actor = kj::none;
+      }
+
+      kj::StringPtr getKey() { return key; }
+      RequestTracker& getTracker() { return *tracker; }
+      kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> tryGetManagerRef() {
+        return manager.map([&](kj::Own<Worker::Actor::HibernationManager>& m) {
+          return kj::addRef(*m);
+        });
+      }
+      void updateAccessTime() { lastAccess = timer.now(); }
+      kj::TimePoint getLastAccess() { return lastAccess; }
+
+      bool hasClients() { return containerRef != kj::none; }
+      kj::Maybe<ActorContainerRef&> getContainerRef() { return containerRef; }
+
+      // `onBrokenTriggered` indicates the actor has been broken.
+      void setOnBroken() { onBrokenTriggered = true; }
+
+      // The actor is constructed after the ActorContainer so it starts off empty.
+      kj::Maybe<kj::Own<Worker::Actor>> actor;
+    private:
+      kj::StringPtr key;
+      kj::Own<RequestTracker> tracker;
+      ActorNamespace& parent;
+      kj::Timer& timer;
+      kj::TimePoint lastAccess;
+      kj::Maybe<kj::Own<Worker::Actor::HibernationManager>> manager;
+      kj::Maybe<kj::Promise<void>> shutdownTask;
+      bool onBrokenTriggered = false;
+
+      // Non-empty if at least one client has a reference to this actor.
+      // If no clients are connected, we may be evicted by `cleanupLoop`.
+      kj::Maybe<ActorContainerRef&> containerRef;
+      friend class ActorContainerRef;
+    };
+
+    // This class tracks clients that a have reference to the given actor.
+    // Upon destruction, we update the lastAccess time for the actor and
+    // `ActorContainer::hasClients()` starts returning false. After 70 seconds, the cleanupLoop
+    // will remove the `ActorContainer` from `actors`.
+    class ActorContainerRef: public kj::Refcounted {
+    public:
+      ActorContainerRef(ActorContainer& container): container(container) {
+        // Link this ref to the actual ActorContainer.
+        container.containerRef = *this;
+      }
+      ~ActorContainerRef() noexcept(false) {
+        KJ_IF_SOME(ref, container) {
+          ref.updateAccessTime();
+          ref.containerRef = kj::none;
+        }
+      }
+
+      kj::Own<ActorContainerRef> addRef() {
+        return kj::addRef(*this);
+      }
+
+    private:
+      // This is a maybe because the ActorContainer could be destroyed before ActorContainerRef
+      // if the actor is broken.
+      kj::Maybe<ActorContainer&> container;
+      friend class ActorContainer;
+    };
+
+    void abortAll() {
+      actors.clear();
+    }
+
   private:
     WorkerService& service;
     kj::StringPtr className;
     const ActorConfig& config;
-    kj::HashMap<kj::String, kj::Own<Worker::Actor>> actors;
-    kj::TaskSet onBrokenTasks;
+    // If the actor is broken, we remove it from the map. However, if it's just evicted due to
+    // inactivity, we keep the ActorContainer in the map but drop the Own<Worker::Actor>. When a new
+    // request comes in, we recreate the Own<Worker::Actor>.
+    kj::HashMap<kj::String, kj::Own<ActorContainer>> actors;
+    kj::HashMap<kj::String, kj::Maybe<kj::Promise<void>>> onBrokenTasks;
+    kj::Maybe<kj::Promise<void>> cleanupTask;
+    kj::Timer& timer;
 
-    void taskFailed(kj::Exception&& exception) override {
-      // Error from `actors.erase()`?
-      KJ_LOG(ERROR, exception);
+    // An owned actor and an ActorContainerRef
+    // used to track the client that requested it.
+    struct GetActorResult {
+      kj::Own<Worker::Actor> actor;
+      kj::Own<ActorContainerRef> ref;
+    };
+
+    kj::Promise<kj::Own<WorkerInterface>> getActorThenStartRequest(
+        kj::String id,
+        IoChannelFactory::SubrequestMetadata metadata) {
+      auto [actor, refTracker] = co_await getActorImpl(kj::mv(id));
+
+      if (cleanupTask == kj::none) {
+        // Need to start the cleanup loop.
+        cleanupTask = cleanupLoop();
+      }
+
+      co_return service.startRequest(kj::mv(metadata), className, kj::mv(actor))
+          .attach(kj::mv(refTracker));
     }
 
+    // Removes actors from `actors` after 70 seconds of last access.
+    kj::Promise<void> cleanupLoop() {
+      constexpr auto EXPIRATION = 70 * kj::SECONDS;
+
+      while (true) {
+        auto now = timer.now();
+        actors.eraseAll([&](auto&, kj::Own<ActorContainer>& entry) {
+
+          // Durable Objects are evictable by default.
+          bool isEvictable = true;
+          KJ_SWITCH_ONEOF(config) {
+            KJ_CASE_ONEOF(c, Durable) {
+              isEvictable = c.isEvictable;
+            }
+            KJ_CASE_ONEOF(c, Ephemeral) {
+              isEvictable = c.isEvictable;
+            }
+          }
+          if (entry->hasClients() || !isEvictable) {
+            // We are still using the actor so we cannot remove it, or this actor cannot be evicted.
+            return false;
+          }
+
+          return (now - entry->getLastAccess()) > EXPIRATION;
+        });
+
+        co_await timer.afterDelay(EXPIRATION).eagerlyEvaluate(nullptr);
+      }
+    }
+
+    // Implements actor loopback, which is used by websocket hibernation to deliver events to the
+    // actor from the websocket's read loop.
     class Loopback : public Worker::Actor::Loopback, public kj::Refcounted {
-      // Implements actor loopback, which is used by websocket hibernation to deliver events to the
-      // actor from the websocket's read loop.
     public:
       Loopback(ActorNamespace& ns, kj::String id) : ns(ns), id(kj::mv(id)) {}
 
@@ -1322,19 +1779,18 @@ public:
       }
 
       kj::Promise<void> setAlarm(kj::Maybe<kj::Date> newAlarmTime) override {
-        KJ_IF_MAYBE(scheduledTime, newAlarmTime) {
-          alarmScheduler.setAlarm(actor, *scheduledTime);
+        KJ_IF_SOME(scheduledTime, newAlarmTime) {
+          alarmScheduler.setAlarm(actor, scheduledTime);
         } else {
           alarmScheduler.deleteAlarm(actor);
         }
         return kj::READY_NOW;
       }
 
+      // No-op -- armAlarmHandler() is normally used to schedule a delete after the alarm runs.
+      // But since alarm read/write operations happen on the same thread as the scheduler in
+      // workerd, we can just handle the delete in the scheduler instead.
       kj::Maybe<kj::Own<void>> armAlarmHandler(kj::Date, bool) override {
-        // No-op -- armAlarmHandler() is normally used to schedule a delete after the alarm runs.
-        // But since alarm read/write operations happen on the same thread as the scheduler in
-        // workerd, we can just handle the delete in the scheduler instead.
-        //
         // We return this weird kj::Own<void> to `this` since just doing kj::Own<void>() creates an
         // empty maybe.
         return kj::Own<void>(this, kj::NullDisposer::instance);
@@ -1347,15 +1803,37 @@ public:
       ActorKey actor;
     };
 
-    kj::Promise<kj::Own<Worker::Actor>> getActorImpl(kj::String id) {
+    kj::Promise<GetActorResult> getActorImpl(kj::String id) {
       // `getActor()` is often called with the calling isolate's lock held. We need to drop that
       // lock and take a lock on the target isolate before constructing the actor. Even if these
       // are the same isolate (as is commonly the case), we really don't want to do this stuff
       // synchronously, so this has the effect of pushing off to a later turn of the event loop.
       return service.worker->takeAsyncLockWithoutRequest(nullptr).then(
-          [this, id = kj::mv(id)]
-          (Worker::AsyncLock asyncLock) mutable -> kj::Own<Worker::Actor> {
-        auto actor = kj::addRef(*actors.findOrCreate(id, [&]() mutable {
+          [this, id = kj::mv(id)] (Worker::AsyncLock asyncLock) mutable -> GetActorResult {
+        kj::StringPtr idPtr = id;
+        auto& actorContainer = actors.findOrCreate(id, [&]() mutable {
+          auto container = kj::heap<ActorContainer>(idPtr, *this, timer);
+
+          return kj::HashMap<kj::String, kj::Own<ActorContainer>>::Entry {
+            kj::mv(id), kj::mv(container)
+          };
+        });
+
+        // If we don't have an ActorContainerRef, we'll create one to track the client.
+        auto actor = [&]() mutable {
+          KJ_IF_SOME(a, actorContainer->actor) {
+            // This actor was used recently and hasn't been evicted, let's reuse it.
+            KJ_IF_SOME(ref, actorContainer->getContainerRef()) {
+              return GetActorResult { .actor = a->addRef(), .ref = ref.addRef() };
+            }
+            // We have an actor, but all the clients dropped their reference to the DO so we need
+            // make a new `ActorContainerRef`. Note that `hasClients()` will return true now,
+            // preventing cleanupLoop from evicting us.
+            return GetActorResult {
+                .actor = a->addRef(),
+                .ref = kj::refcounted<ActorContainerRef>(*actorContainer) };
+          }
+          // We don't have an actor so we need to create it.
           auto& channels = KJ_ASSERT_NONNULL(service.ioChannels.tryGet<LinkedIoChannels>());
 
           auto makeActorCache =
@@ -1363,13 +1841,18 @@ public:
                   ActorCache::Hooks& hooks) {
             return config.tryGet<Durable>()
                 .map([&](const Durable& d) -> kj::Own<ActorCacheInterface> {
-              KJ_IF_MAYBE(as, channels.actorStorage) {
+              KJ_IF_SOME(as, channels.actorStorage) {
+                // The idPtr can end up being freed if the Actor gets hibernated so we need
+                // to create a copy that is ensured to live as long as the ActorSqliteHooks
+                // instance we're creating here.
+                // TODO(cleanup): Is there a better way to handle the ActorKey in general here?
+                auto idStr = kj::str(idPtr);
                 auto sqliteHooks = kj::heap<ActorSqliteHooks>(channels.alarmScheduler, ActorKey{
-                  .uniqueKey = d.uniqueKey, .actorId = id
-                });
+                  .uniqueKey = d.uniqueKey, .actorId = idStr
+                }).attach(kj::mv(idStr));
 
-                auto db = kj::heap<SqliteDatabase>(**as,
-                    kj::Path({d.uniqueKey, kj::str(id, ".sqlite")}),
+                auto db = kj::heap<SqliteDatabase>(*as,
+                    kj::Path({d.uniqueKey, kj::str(idPtr, ".sqlite")}),
                     kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
                 return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
                     []() -> kj::Promise<void> { return kj::READY_NOW; },
@@ -1383,7 +1866,7 @@ public:
             });
           };
 
-          auto makeStorage = [](jsg::Lock& js, const Worker::ApiIsolate& apiIsolate,
+          auto makeStorage = [](jsg::Lock& js, const Worker::Api& api,
                                 ActorCacheInterface& actorCache)
                             -> jsg::Ref<api::DurableObjectStorage> {
             return jsg::alloc<api::DurableObjectStorage>(
@@ -1392,30 +1875,57 @@ public:
 
           TimerChannel& timerChannel = service;
 
-          auto loopback = kj::refcounted<Loopback>(*this, kj::str(id));
-          Worker::Lock lock(*service.worker, asyncLock);
-          auto newActor = kj::refcounted<Worker::Actor>(
-              *service.worker, nullptr, kj::str(id), true, kj::mv(makeActorCache),
-              className, kj::mv(makeStorage), lock, kj::mv(loopback),
-              timerChannel, kj::refcounted<ActorObserver>(), nullptr, nullptr);
+          auto loopback = kj::refcounted<Loopback>(*this, kj::str(idPtr));
 
-          // If the actor becomes broken, remove it from the map, so a new one will be created
-          // next time.
-          onBrokenTasks.add(newActor->onBroken()
-              .catch_([](kj::Exception&&) {})
-              .then([this, id = id.asPtr(), &actor = *newActor]() {
-            actors.erase(id);
-          }));
+          return service.worker->runInLockScope(asyncLock, [&](Worker::Lock& lock) {
+            // We define this event ID in the internal codebase, but to have WebSocket Hibernation
+            // work for local development we need to pass an event type.
+            static constexpr uint16_t hibernationEventTypeId = 8;
 
-          // TODO(sqlite): Now that actors are backed by real disk, we should shut them down after
-          //   a minute of inactivity...
-          return kj::HashMap<kj::String, kj::Own<Worker::Actor>>::Entry {
-            kj::mv(id), kj::mv(newActor)
-          };
-        }));
+            actorContainer->actor.emplace(
+                kj::refcounted<Worker::Actor>(
+                    *service.worker, actorContainer->getTracker(), kj::str(idPtr), true,
+                    kj::mv(makeActorCache), className, kj::mv(makeStorage), lock, kj::mv(loopback),
+                    timerChannel, kj::refcounted<ActorObserver>(),
+                    actorContainer->tryGetManagerRef(),
+                    hibernationEventTypeId));
+
+            // If the actor becomes broken, remove it from the map, so a new one will be created
+            // next time.
+            auto& actorRef = KJ_REQUIRE_NONNULL(actorContainer->actor);
+            auto& entry = onBrokenTasks.findOrCreateEntry(actorContainer->getKey(), [&](){
+              return decltype(onBrokenTasks)::Entry {
+                kj::str(actorContainer->getKey()), kj::none
+              };
+            });
+            entry.value = onActorBroken(actorRef->onBroken(), *actorContainer)
+                .eagerlyEvaluate([](kj::Exception&& e) { KJ_LOG(ERROR, e); });
+
+            // `hasClients()` will return true now, preventing cleanupLoop from evicting us.
+            return GetActorResult {
+                .actor = actorRef->addRef(),
+                .ref = kj::refcounted<ActorContainerRef>(*actorContainer) };
+          });
+        }();
 
         return kj::mv(actor);
       });
+    }
+
+    kj::Promise<void> onActorBroken(kj::Promise<void> broken, ActorContainer& entryRef) {
+      try {
+        // It's possible for this to never resolve if the actor never breaks,
+        // in which case the returned promise will just be canceled.
+        co_await broken;
+      } catch (...) {
+        // We are intentionally ignoring any errors here. We just want to ensure
+        // that the actor is removed if the onBroken promise is resolved or errors.
+      }
+      // Note that we remove the entire ActorContainer from the map -- this drops the
+      // HibernationManager so any connected hibernatable websockets will be disconnected.
+      entryRef.setOnBroken();
+      auto key = kj::str(entryRef.getKey());
+      actors.erase(key.asPtr());
     }
   };
 
@@ -1443,14 +1953,15 @@ private:
 
   ThreadContext& threadContext;
 
-  kj::OneOf<LinkCallback, LinkedIoChannels> ioChannels;
   // LinkedIoChannels owns the SqliteDatabase::Vfs, so make sure it is destroyed last.
+  kj::OneOf<LinkCallback, LinkedIoChannels> ioChannels;
 
   kj::Own<const Worker> worker;
   kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers;
   kj::HashMap<kj::String, EntrypointService> namedEntrypoints;
   kj::HashMap<kj::StringPtr, kj::Own<ActorNamespace>> actorNamespaces;
   kj::TaskSet waitUntilTasks;
+  AbortActorsCallback abortActorsCallback;
 
   class ActorChannelImpl final: public IoChannelFactory::ActorChannel {
   public:
@@ -1497,7 +2008,7 @@ private:
                                        SpanParent parentSpan) override {
 
       return kj::heap<CacheHttpClientImpl>(
-          cacheService, cacheNamespaceHeader, nullptr, kj::mv(cfBlobJson), kj::mv(parentSpan));
+          cacheService, cacheNamespaceHeader, kj::none, kj::mv(cfBlobJson), kj::mv(parentSpan));
     }
 
     kj::Own<kj::HttpClient> getNamespace(kj::StringPtr cacheName,
@@ -1526,7 +2037,7 @@ private:
 
     Request request(kj::HttpMethod method, kj::StringPtr url,
                     const kj::HttpHeaders &headers,
-                    kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
+                    kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
 
       return client->request(method, url, addCacheNameHeader(headers, cacheName),
                              expectedBodySize);
@@ -1540,8 +2051,8 @@ private:
     kj::HttpHeaders addCacheNameHeader(const kj::HttpHeaders& headers,
                                        kj::Maybe<kj::StringPtr> cacheName) {
       auto headersCopy = headers.cloneShallow();
-      KJ_IF_MAYBE (name, cacheName) {
-        headersCopy.set(cacheNamespaceHeader, *name);
+      KJ_IF_SOME (name, cacheName) {
+        headersCopy.set(cacheNamespaceHeader, name);
       }
 
       return headersCopy;
@@ -1561,11 +2072,42 @@ private:
 
   kj::Promise<void> writeLogfwdr(uint channel,
       kj::FunctionParam<void(capnp::AnyPointer::Builder)> buildMessage) override {
-    KJ_FAIL_REQUIRE("no logging channels");
+    auto& context = IoContext::current();
+
+    auto headers = kj::HttpHeaders(context.getHeaderTable());
+    auto client = context.getHttpClient(channel, true, kj::none, "writeLogfwdr"_kjc);
+
+    auto urlStr = kj::str("https://fake-host");
+
+    capnp::MallocMessageBuilder requestMessage;
+    auto requestBuilder = requestMessage.initRoot<capnp::AnyPointer>();
+
+    buildMessage(requestBuilder);
+    capnp::JsonCodec json;
+    auto requestJson = json.encode(requestBuilder.getAs<api::AnalyticsEngineEvent>());
+
+    co_await context.waitForOutputLocks();
+
+    auto innerReq = client->request(kj::HttpMethod::POST, urlStr, headers, requestJson.size());
+
+    struct RefcountedWrapper: public kj::Refcounted {
+      explicit RefcountedWrapper(kj::Own<kj::HttpClient> client): client(kj::mv(client)) {}
+      kj::Own<kj::HttpClient> client;
+    };
+    auto rcClient = kj::refcounted<RefcountedWrapper>(kj::mv(client));
+    auto request = attachToRequest(kj::mv(innerReq), kj::mv(rcClient));
+
+    co_await request.body->write(requestJson.begin(), requestJson.size())
+          .attach(kj::mv(requestJson), kj::mv(request.body));
+    auto response = co_await request.response;
+
+    KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300, "writeLogfwdr request returned an error");
+    co_await response.body->readAllBytes().attach(kj::mv(response.body)).ignoreResult();
+    co_return;
   }
 
   kj::Own<ActorChannel> getGlobalActor(uint channel, const ActorIdFactory::ActorId& id,
-      kj::Maybe<kj::String> locationHint, ActorGetMode mode) override {
+      kj::Maybe<kj::String> locationHint, ActorGetMode mode, SpanParent parentSpan) override {
     JSG_REQUIRE(mode == ActorGetMode::GET_OR_CREATE, Error,
         "workerd only supports GET_OR_CREATE mode for getting actor stubs");
     auto& channels = KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>(),
@@ -1578,7 +2120,8 @@ private:
     return ns.getActorChannel(id.clone());
   }
 
-  kj::Own<ActorChannel> getColoLocalActor(uint channel, kj::StringPtr id) override {
+  kj::Own<ActorChannel> getColoLocalActor(uint channel, kj::StringPtr id,
+      SpanParent parentSpan) override {
     auto& channels = KJ_REQUIRE_NONNULL(ioChannels.tryGet<LinkedIoChannels>(),
         "link() has not been called");
 
@@ -1587,6 +2130,10 @@ private:
         "Actor namespace configuration was invalid.");
     KJ_REQUIRE(ns.getConfig().is<Ephemeral>());  // should have been verified earlier
     return ns.getActorChannel(kj::str(id));
+  }
+
+  void abortAllActors() override {
+    abortActorsCallback();
   }
 
   // ---------------------------------------------------------------------------
@@ -1620,8 +2167,9 @@ private:
   void newAnalyticsEngineRequest() override {}
   kj::Promise<void> limitDrain() override { return kj::NEVER_DONE; }
   kj::Promise<void> limitScheduled() override { return kj::NEVER_DONE; }
+  kj::Duration getAlarmLimit() override { return 0 * kj::MILLISECONDS; }
   size_t getBufferingLimit() override { return kj::maxValue; }
-  kj::Maybe<EventOutcome> getLimitsExceeded() override { return nullptr; }
+  kj::Maybe<EventOutcome> getLimitsExceeded() override { return kj::none; }
   kj::Promise<void> onLimitsExceeded() override { return kj::NEVER_DONE; }
   void requireLimitsNotExceeded() override {}
   void reportMetrics(RequestObserver& requestMetrics) override {}
@@ -1637,17 +2185,21 @@ struct FutureActorChannel {
   kj::String errorContext;
 };
 
-static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
+static kj::Maybe<WorkerdApi::Global> createBinding(
     kj::StringPtr workerName,
     config::Worker::Reader conf,
     config::Worker::Binding::Reader binding,
     Worker::ValidationErrorReporter& errorReporter,
     kj::Vector<FutureSubrequestChannel>& subrequestChannels,
     kj::Vector<FutureActorChannel>& actorChannels,
-    kj::HashMap<kj::String, kj::HashMap<kj::String, Server::ActorConfig>>& actorConfigs) {
+    kj::HashMap<kj::String, kj::HashMap<kj::String, Server::ActorConfig>>& actorConfigs,
+    bool experimental) {
   // creates binding object or returns null and reports an error
-  using Global = WorkerdApiIsolate::Global;
+  using Global = WorkerdApi::Global;
   kj::StringPtr bindingName = binding.getName();
+  TRACE_EVENT("workerd", "Server::WorkerService::createBinding()",
+              "name", workerName.cStr(),
+              "binding", bindingName.cStr());
   auto makeGlobal = [&](auto&& value) {
     return Global{.name = kj::str(bindingName), .value = kj::mv(value)};
   };
@@ -1657,7 +2209,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
   switch (binding.which()) {
     case config::Worker::Binding::UNSPECIFIED:
       errorReporter.addError(kj::str(errorContext, " does not specify any binding value."));
-      return nullptr;
+      return kj::none;
 
     case config::Worker::Binding::PARAMETER:
       KJ_UNIMPLEMENTED("TODO(beta): parameters");
@@ -1677,7 +2229,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
             errorContext, " is a Wasm binding, but Wasm bindings are not allowed in "
             "modules-based scripts. Use Wasm modules instead."));
       }
-      return nullptr;
+      return kj::none;
 
     case config::Worker::Binding::CRYPTO_KEY: {
       auto keyConf = binding.getCryptoKey();
@@ -1713,13 +2265,13 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
           auto pem = KJ_UNWRAP_OR(decodePem(keyConf.getPkcs8()), {
             errorReporter.addError(kj::str(
                 "CryptoKey binding \"", binding.getName(), "\" contained invalid PEM format."));
-            return nullptr;
+            return kj::none;
           });
           if (pem.type != "PRIVATE KEY") {
             errorReporter.addError(kj::str(
                 "CryptoKey binding \"", binding.getName(), "\" contained wrong PEM type, "
                 "expected \"PRIVATE KEY\" but got \"", pem.type, "\"."));
-            return nullptr;
+            return kj::none;
           }
           keyGlobal.keyData = kj::mv(pem.data);
           goto validFormat;
@@ -1729,13 +2281,13 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
           auto pem = KJ_UNWRAP_OR(decodePem(keyConf.getSpki()), {
             errorReporter.addError(kj::str(
                 "CryptoKey binding \"", binding.getName(), "\" contained invalid PEM format."));
-            return nullptr;
+            return kj::none;
           });
           if (pem.type != "PUBLIC KEY") {
             errorReporter.addError(kj::str(
                 "CryptoKey binding \"", binding.getName(), "\" contained wrong PEM type, "
                 "expected \"PUBLIC KEY\" but got \"", pem.type, "\"."));
-            return nullptr;
+            return kj::none;
           }
           keyGlobal.keyData = kj::mv(pem.data);
           goto validFormat;
@@ -1748,7 +2300,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
       errorReporter.addError(kj::str(
           "Encountered unknown CryptoKey type for binding \"", binding.getName(),
           "\". Was the config compiled with a newer version of the schema?"));
-      return nullptr;
+      return kj::none;
     validFormat:
 
       auto algorithmConf = keyConf.getAlgorithm();
@@ -1765,14 +2317,14 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
       errorReporter.addError(kj::str(
           "Encountered unknown CryptoKey algorithm type for binding \"", binding.getName(),
           "\". Was the config compiled with a newer version of the schema?"));
-      return nullptr;
+      return kj::none;
     validAlgorithm:
 
       keyGlobal.extractable = keyConf.getExtractable();
       keyGlobal.usages = KJ_MAP(usage, keyConf.getUsages()) { return kj::str(usage); };
 
       return makeGlobal(kj::mv(keyGlobal));
-      return nullptr;
+      return kj::none;
     }
 
     case config::Worker::Binding::SERVICE: {
@@ -1796,7 +2348,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
           errorReporter.addError(kj::str(
               errorContext, " refers to a service \"", actorBinding.getServiceName(),
               "\", but no such service is defined."));
-          return nullptr;
+          return kj::none;
         });
 
         actorConfig = &KJ_UNWRAP_OR(svcMap.find(actorBinding.getClassName()), {
@@ -1804,7 +2356,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
               errorContext, " refers to a Durable Object namespace named \"",
               actorBinding.getClassName(), "\" in service \"", actorBinding.getServiceName(),
               "\", but no such Durable Object namespace is defined by that service."));
-          return nullptr;
+          return kj::none;
         });
       } else {
           auto& localActorConfigs = KJ_ASSERT_NONNULL(actorConfigs.find(workerName));
@@ -1813,7 +2365,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
               errorContext, " refers to a Durable Object namespace named \"",
               actorBinding.getClassName(), "\", but no such Durable Object namespace is defined "
               "by this Worker."));
-          return nullptr;
+          return kj::none;
         });
       }
 
@@ -1832,7 +2384,7 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
         }
       }
 
-      return nullptr;
+      return kj::none;
     }
 
     case config::Worker::Binding::KV_NAMESPACE: {
@@ -1877,12 +2429,12 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
       auto wrapped = binding.getWrapped();
       kj::Vector<Global> innerGlobals;
       for (const auto& innerBinding: wrapped.getInnerBindings()) {
-        KJ_IF_MAYBE(global, createBinding(workerName, conf, innerBinding,
-            errorReporter, subrequestChannels, actorChannels, actorConfigs)) {
-          innerGlobals.add(kj::mv(*global));
+        KJ_IF_SOME(global, createBinding(workerName, conf, innerBinding,
+            errorReporter, subrequestChannels, actorChannels, actorConfigs, experimental)) {
+          innerGlobals.add(kj::mv(global));
         } else {
           // we've already communicated the error
-          return nullptr;
+          return kj::none;
         }
       }
       return makeGlobal(Global::Wrapped {
@@ -1892,15 +2444,115 @@ static kj::Maybe<WorkerdApiIsolate::Global> createBinding(
       });
     }
 
+    case config::Worker::Binding::FROM_ENVIRONMENT: {
+      const char* value = getenv(binding.getFromEnvironment().cStr());
+      if (value == nullptr) {
+        // TODO(cleanup): Maybe make a Global::Null? (Can't use nullptr_t in OneOf.) For now,
+        // using JSON gets the job done hackily.
+        return makeGlobal(Global::Json { kj::str("null") });
+      } else {
+        return makeGlobal(kj::str(value));
+      }
+    }
+
+    case config::Worker::Binding::ANALYTICS_ENGINE: {
+      if (!experimental) {
+        errorReporter.addError(kj::str(
+          "AnalyticsEngine bindings are an experimental feature which may change or go away in the future."
+          "You must run workerd with `--experimental` to use this feature."));
+      }
+
+      uint channel = (uint)subrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT;
+      subrequestChannels.add(FutureSubrequestChannel {
+        binding.getAnalyticsEngine(),
+        kj::mv(errorContext)
+      });
+
+      return makeGlobal(Global::AnalyticsEngine{
+        .subrequestChannel = channel,
+        .dataset = kj::str(binding.getAnalyticsEngine().getName()),
+        .version = 0,
+      });
+    }
+    case config::Worker::Binding::HYPERDRIVE: {
+      uint channel = (uint)subrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT;
+      subrequestChannels.add(FutureSubrequestChannel {
+        binding.getHyperdrive().getDesignator(),
+        kj::mv(errorContext)
+      });
+      return makeGlobal(Global::Hyperdrive{
+          .subrequestChannel = channel,
+          .database = kj::str(binding.getHyperdrive().getDatabase()),
+          .user = kj::str(binding.getHyperdrive().getUser()),
+          .password = kj::str(binding.getHyperdrive().getPassword()),
+          .scheme = kj::str(binding.getHyperdrive().getScheme()),
+      });
+    }
+    case config::Worker::Binding::UNSAFE_EVAL: {
+      if (!experimental) {
+        errorReporter.addError(kj::str("Unsafe eval is an experimental feature. ",
+            "You must run workerd with `--experimental` to use this feature."));
+        return kj::none;
+      }
+      return makeGlobal(Global::UnsafeEval {});
+    }
+    case config::Worker::Binding::MEMORY_CACHE: {
+      if (!experimental) {
+        errorReporter.addError(kj::str(
+          "MemoryCache bindings are an experimental feature which may change or go away "
+          "in the future. You must run workerd with `--experimental` to use this feature."));
+        return kj::none;
+      }
+      auto cache = binding.getMemoryCache();
+      // TODO(cleanup): Should we have some reasonable default for these so they can
+      // be optional?
+      if (!cache.hasLimits()) {
+        errorReporter.addError(kj::str("MemoryCache bindings must specify limits. Please "
+            "update the binding in the worker configuration and try again."));
+        return kj::none;
+      }
+      Global::MemoryCache cacheCopy;
+      // The id is optional. If provided, then multiple bindings with the same id will
+      // share the same cache. Otherwise, a unique id is generated for the cache.
+      if (cache.hasId()) {
+        cacheCopy.cacheId = kj::str(cache.getId());
+      }
+      auto limits = cache.getLimits();
+      cacheCopy.maxKeys = limits.getMaxKeys();
+      cacheCopy.maxValueSize = limits.getMaxValueSize();
+      cacheCopy.maxTotalValueSize = limits.getMaxTotalValueSize();
+      return makeGlobal(kj::mv(cacheCopy));
+    }
   }
   errorReporter.addError(kj::str(
       errorContext, "has unrecognized type. Was the config compiled with a newer version of "
       "the schema?"));
 }
 
+uint startInspector(kj::StringPtr inspectorAddress, Server::InspectorServiceIsolateRegistrar& registrar);
+
+void Server::abortAllActors() {
+  for (auto& service: services) {
+    if (WorkerService* worker = dynamic_cast<WorkerService*>(&*service.value)) {
+      for (auto& [className, ns] : worker->getActorNamespaces()) {
+        bool isEvictable = true;
+        KJ_SWITCH_ONEOF(ns->getConfig()) {
+          KJ_CASE_ONEOF(c, Durable) {
+            isEvictable = c.isEvictable;
+          }
+          KJ_CASE_ONEOF(c, Ephemeral) {
+            isEvictable = c.isEvictable;
+          }
+        }
+        if (isEvictable) ns->abortAll();
+      }
+    }
+  }
+}
 
 kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::Reader conf,
     capnp::List<config::Extension>::Reader extensions) {
+  TRACE_EVENT("workerd", "Server::makeWorker()", "name", name.cStr());
   auto& localActorConfigs = KJ_ASSERT_NONNULL(actorConfigs.find(name));
 
   struct ErrorReporter: public Worker::ValidationErrorReporter {
@@ -1910,8 +2562,9 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
     kj::StringPtr name;
 
     kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypoints;
-    kj::Maybe<kj::HashSet<kj::String>> defaultEntrypoint;
+
     // The `HashSet`s are the set of exported handlers, like `fetch`, `test`, etc.
+    kj::Maybe<kj::HashSet<kj::String>> defaultEntrypoint;
 
     void addError(kj::String error) override {
       server.reportConfigError(kj::str("service ", name, ": ", error));
@@ -1919,9 +2572,9 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
 
     void addHandler(kj::Maybe<kj::StringPtr> exportName, kj::StringPtr type) override {
       kj::HashSet<kj::String>* set;
-      KJ_IF_MAYBE(e, exportName) {
-        set = &namedEntrypoints.findOrCreate(*e,
-            [&]() -> decltype(namedEntrypoints)::Entry { return { kj::str(*e), {} }; });
+      KJ_IF_SOME(e, exportName) {
+        set = &namedEntrypoints.findOrCreate(e,
+            [&]() -> decltype(namedEntrypoints)::Entry { return { kj::str(e), {} }; });
       } else {
         set = &defaultEntrypoint.emplace();
       }
@@ -1940,11 +2593,11 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
                               featureFlags, errorReporter, experimental,
                               CompatibilityDateValidation::CODE_VERSION);
   } else {
-    errorReporter.addError(kj::str("Worker must specify compatibiltyDate."));
+    errorReporter.addError(kj::str("Worker must specify compatibilityDate."));
   }
 
+  // IsolateLimitEnforcer that enforces no limits.
   class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-    // IsolateLimitEnforcer that enforces no limits.
   public:
     v8::Isolate::CreateParams getCreateParams() override { return {}; }
     void customizeIsolate(v8::Isolate* isolate) override {}
@@ -1981,59 +2634,246 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
     void completedRequest(kj::StringPtr id) const override {}
     bool exitJs(jsg::Lock& lock) const override { return false; }
     void reportMetrics(IsolateObserver& isolateMetrics) const override {}
+    kj::Maybe<size_t> checkPbkdfIterations(jsg::Lock& lock, size_t iterations) const override {
+      // No limit on the number of iterations in workerd
+      return kj::none;
+    }
   };
 
+  auto observer = kj::atomicRefcounted<IsolateObserver>();
   auto limitEnforcer = kj::heap<NullIsolateLimitEnforcer>();
-  auto api = kj::heap<WorkerdApiIsolate>(globalContext->v8System,
-      featureFlags.asReader(), *limitEnforcer);
+  auto api = kj::heap<WorkerdApi>(globalContext->v8System,
+                                  featureFlags.asReader(),
+                                  *limitEnforcer,
+                                  kj::atomicAddRef(*observer),
+                                  *memoryCacheProvider);
+  auto inspectorPolicy = Worker::Isolate::InspectorPolicy::DISALLOW;
+  if (inspectorOverride != kj::none) {
+    // For workerd, if the inspector is enabled, it is always fully trusted.
+    inspectorPolicy = Worker::Isolate::InspectorPolicy::ALLOW_FULLY_TRUSTED;
+  }
   auto isolate = kj::atomicRefcounted<Worker::Isolate>(
       kj::mv(api),
-      kj::atomicRefcounted<IsolateObserver>(),
+      kj::mv(observer),
       name,
       kj::mv(limitEnforcer),
-      // For workerd, if the inspector is enabled, it is always fully trusted.
-      maybeInspectorService != nullptr ?
-          Worker::Isolate::InspectorPolicy::ALLOW_FULLY_TRUSTED :
-          Worker::Isolate::InspectorPolicy::DISALLOW);
+      inspectorPolicy,
+      conf.isServiceWorkerScript() ? Worker::ConsoleMode::INSPECTOR_ONLY : consoleMode);
 
   // If we are using the inspector, we need to register the Worker::Isolate
   // with the inspector service.
-  KJ_IF_MAYBE(inspector, maybeInspectorService) {
-    (*inspector)->registerIsolate(name, isolate.get());
+  KJ_IF_SOME(isolateRegistrar, inspectorIsolateRegistrar) {
+    isolateRegistrar->registerIsolate(name, isolate.get());
+  }
+
+  if (conf.hasModuleFallback()) {
+    KJ_REQUIRE(experimental,
+               "The module fallback service is an experimental feature. "
+               "You must run workerd with `--experimental` to use this feature.");
+    // If the config has the moduleFallback option, then we are going to set up the ability
+    // to load certain modules from a fallback service. This is generally intended for local
+    // dev/testing purposes only.
+    auto& apiIsolate = isolate->getApi();
+    apiIsolate.setModuleFallbackCallback(
+        [address=kj::str(conf.getModuleFallback()), featureFlags=apiIsolate.getFeatureFlags()]
+        (jsg::Lock& js,
+         kj::StringPtr specifier,
+         kj::Maybe<kj::String> referrer,
+         jsg::CompilationObserver& observer,
+         jsg::ModuleRegistry::ResolveMethod method) mutable
+            -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
+      kj::Maybe<kj::String> jsonPayload;
+      bool redirect = false;
+      bool prefixed = false;
+      kj::Url url;
+      kj::StringPtr actualSpecifier = nullptr;
+      // TODO(cleanup): This is a bit of a hack based on the current
+      // design of the module registry loader algorithms handling of
+      // prefixed modules. This will be simplified with the upcoming
+      // module registry refactor.
+      KJ_IF_SOME(pos, specifier.findLast('/')) {
+        auto segment = specifier.slice(pos + 1);
+        if (segment.startsWith("node:") ||
+            segment.startsWith("cloudflare:") ||
+            segment.startsWith("workerd:")) {
+          actualSpecifier = segment;
+          url.query.add(kj::Url::QueryParam {
+            .name = kj::str("specifier"),
+            .value = kj::str(segment)
+          });
+          prefixed = true;
+        }
+      }
+      if (!prefixed) {
+        actualSpecifier = specifier;
+        if (actualSpecifier.startsWith("/")) {
+          actualSpecifier = specifier.slice(1);
+        }
+        url.query.add(
+          kj::Url::QueryParam { kj::str("specifier"), kj::str(specifier) }
+        );
+      }
+      KJ_IF_SOME(ref, referrer) {
+        url.query.add(
+          kj::Url::QueryParam { kj::str("referrer"), kj::mv(ref) }
+        );
+      }
+
+      auto spec = url.toString(kj::Url::HTTP_REQUEST);
+
+      {
+        // Module loading in workerd is expected to be synchronous but we need to perform
+        // an async HTTP request to the fallback service. To accomplish that we wrap the
+        // actual request in a kj::Thread, perform the GET, and drop the thread immediately
+        // so that the destructor joins the current thread (blocking it). The thread will
+        // either set the jsonPayload variable or not.
+        kj::Thread loaderThread(
+          [&spec,
+           referrer=kj::mv(referrer),
+           address=address.asPtr(),
+           &jsonPayload,
+           &redirect,
+           method]() mutable {
+          try {
+            const auto toStr = [](jsg::ModuleRegistry::ResolveMethod method) {
+              switch (method) {
+                case jsg::ModuleRegistry::ResolveMethod::IMPORT: return "import"_kjc;
+                case jsg::ModuleRegistry::ResolveMethod::REQUIRE: return "require"_kjc;
+              }
+              KJ_UNREACHABLE;
+            };
+
+            kj::AsyncIoContext io = kj::setupAsyncIo();
+
+            kj::HttpHeaderTable::Builder builder;
+            kj::HttpHeaderId kMethod = builder.add("x-resolve-method");
+            auto headerTable = builder.build();
+
+            auto addr = io.provider->getNetwork().parseAddress(address, 80).wait(io.waitScope);
+
+            auto client = kj::newHttpClient(
+                io.provider->getTimer(),
+                *headerTable,
+                *addr, { });
+
+            kj::HttpHeaders headers(*headerTable);
+            headers.set(kMethod, toStr(method));
+            headers.set(kj::HttpHeaderId::HOST, "localhost"_kj);
+
+            auto request = client->request(kj::HttpMethod::GET, spec, headers, kj::none);
+
+            kj::HttpClient::Response resp = request.response.wait(io.waitScope);
+
+            if (resp.statusCode == 301) {
+              // The fallback service responded with a redirect.
+              KJ_IF_SOME(loc, resp.headers->get(kj::HttpHeaderId::LOCATION)) {
+                redirect = true;
+                jsonPayload = kj::str(loc);
+              } else {
+                KJ_LOG(ERROR, "Fallback service returned a redirect with no location", spec);
+              }
+            } else if (resp.statusCode != 200) {
+              // Failed! Log the body of the respnose, if any, and fall through without
+              // setting jsonPayload to signal that the fallback service failed to return
+              // a module for this specifier.
+              auto payload = resp.body->readAllText().wait(io.waitScope);
+              KJ_LOG(ERROR, "Fallback service failed to fetch module", payload, spec);
+            } else {
+              jsonPayload = resp.body->readAllText().wait(io.waitScope);
+            }
+          } catch (...) {
+            auto exception = kj::getCaughtExceptionAsKj();
+            KJ_LOG(ERROR, "Fallback service failed to fetch module", exception, spec);
+          }
+        });
+      }
+
+      KJ_IF_SOME(payload, jsonPayload) {
+        // If the payload is empty then the fallback service failed to fetch the module.
+        if (payload.size() == 0) return kj::none;
+
+        // If redirect is true then the fallback service returned a 301 redirect. The
+        // payload is the specifier of the new target module.
+        if (redirect) {
+          return kj::Maybe(kj::mv(payload));
+        }
+
+        // The response from the fallback service must be a valid JSON serialization
+        // of the workerd module configuration. If it is not, or if there is any other
+        // error when processing here, we'll log the exception and return nothing.
+        try {
+          capnp::MallocMessageBuilder moduleMessage;
+          capnp::JsonCodec json;
+          json.handleByAnnotation<config::Worker::Module>();
+          auto moduleBuilder = moduleMessage.initRoot<config::Worker::Module>();
+          json.decode(payload, moduleBuilder);
+
+          // If the module fallback service returns a name in the module then it has to
+          // match the specifier we passed in. This is an optional sanity check.
+          if (moduleBuilder.hasName()) {
+            if (moduleBuilder.getName() != actualSpecifier) {
+              KJ_LOG(ERROR,
+                    "Fallback service failed to fetch module: returned module "
+                    "name does not match specifier",
+                    moduleBuilder.getName(), actualSpecifier);
+              return kj::none;
+            }
+          } else {
+            moduleBuilder.setName(kj::str(actualSpecifier));
+          }
+
+          auto module = WorkerdApi::tryCompileModule(js, moduleBuilder, observer, featureFlags);
+          if (module == kj::none) {
+            KJ_LOG(ERROR, "Fallback service does not support this module type",
+                moduleBuilder.which());
+          }
+          return module;
+        } catch (...) {
+          auto exception = kj::getCaughtExceptionAsKj();
+          KJ_LOG(ERROR, "Fallback service failed to fetch module", exception, spec);
+          return kj::none;
+        }
+      }
+
+      // If we got here, no jsonPayload was received and we return nothing.
+      return kj::none;
+    });
   }
 
   auto script = isolate->newScript(
-      name, WorkerdApiIsolate::extractSource(name, conf, errorReporter, extensions),
+      name, WorkerdApi::extractSource(name, conf, errorReporter, extensions),
       IsolateObserver::StartType::COLD, false, errorReporter);
 
   kj::Vector<FutureSubrequestChannel> subrequestChannels;
   kj::Vector<FutureActorChannel> actorChannels;
 
   auto confBindings = conf.getBindings();
-  using Global = WorkerdApiIsolate::Global;
+  using Global = WorkerdApi::Global;
   kj::Vector<Global> globals(confBindings.size());
   for (auto binding: confBindings) {
-    KJ_IF_MAYBE(global, createBinding(name, conf, binding, errorReporter,
-                                     subrequestChannels, actorChannels, actorConfigs)) {
-      globals.add(kj::mv(*global));
+    KJ_IF_SOME(global, createBinding(name, conf, binding, errorReporter,
+                                     subrequestChannels, actorChannels, actorConfigs,
+                                     experimental)) {
+      globals.add(kj::mv(global));
     }
   }
 
   auto worker = kj::atomicRefcounted<Worker>(
       kj::mv(script),
       kj::atomicRefcounted<WorkerObserver>(),
-      [&](jsg::Lock& lock, const Worker::ApiIsolate& apiIsolate, v8::Local<v8::Object> target) {
-        return kj::downcast<const WorkerdApiIsolate>(apiIsolate).compileGlobals(
+      [&](jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target) {
+        return WorkerdApi::from(api).compileGlobals(
             lock, globals, target, 1);
       },
       IsolateObserver::StartType::COLD,
       nullptr,          // systemTracer -- TODO(beta): factor out
-      Worker::Lock::TakeSynchronously(nullptr),
+      Worker::Lock::TakeSynchronously(kj::none),
       errorReporter);
 
   {
-    Worker::Lock lock(*worker, Worker::Lock::TakeSynchronously(nullptr));
-    lock.validateHandlers(errorReporter);
+    worker->runInLockScope(Worker::Lock::TakeSynchronously(kj::none), [&](Worker::Lock& lock) {
+      lock.validateHandlers(errorReporter);
+    });
   }
 
   auto linkCallback =
@@ -2064,12 +2904,12 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
       if (channel.designator.hasServiceName()) {
         auto& svc = KJ_UNWRAP_OR(this->services.find(channel.designator.getServiceName()), {
           // error was reported earlier
-          return nullptr;
+          return kj::none;
         });
         targetService = dynamic_cast<WorkerService*>(svc.get());
         if (targetService == nullptr) {
           // error was reported earlier
-          return nullptr;
+          return kj::none;
         }
       }
 
@@ -2085,13 +2925,13 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
     auto actorStorageConf = conf.getDurableObjectStorage();
     if (actorStorageConf.isLocalDisk()) {
       kj::StringPtr diskName = actorStorageConf.getLocalDisk();
-      KJ_IF_MAYBE(svc, this->services.find(actorStorageConf.getLocalDisk())) {
-        auto diskSvc = dynamic_cast<DiskDirectoryService*>(svc->get());
+      KJ_IF_SOME(svc, this->services.find(actorStorageConf.getLocalDisk())) {
+        auto diskSvc = dynamic_cast<DiskDirectoryService*>(svc.get());
         if (diskSvc == nullptr) {
           reportConfigError(kj::str("service ", name, ": durableObjectStorage config refers "
               "to the service \"", diskName, "\", but that service is not a local disk service."));
-        } else KJ_IF_MAYBE(dir, diskSvc->getWritable()) {
-          result.actorStorage = kj::heap<SqliteDatabase::Vfs>(*dir);
+        } else KJ_IF_SOME(dir, diskSvc->getWritable()) {
+          result.actorStorage = kj::heap<SqliteDatabase::Vfs>(dir);
         } else {
           reportConfigError(kj::str("service ", name, ": durableObjectStorage config refers "
               "to the disk service \"", diskName, "\", but that service is defined read-only."));
@@ -2104,10 +2944,10 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
 
     kj::HashMap<kj::StringPtr, WorkerService::ActorNamespace&> durableNamespacesByUniqueKey;
     for(auto& [className, ns] : workerService.getActorNamespaces()) {
-      KJ_IF_MAYBE(config, ns->getConfig().tryGet<Server::Durable>()) {
+      KJ_IF_SOME(config, ns->getConfig().tryGet<Server::Durable>()) {
         auto& actorNs = ns; // clangd gets confused trying to use ns directly in the capture below??
 
-        alarmScheduler->registerNamespace(config->uniqueKey,
+        alarmScheduler->registerNamespace(config.uniqueKey,
             [&actorNs](kj::String id) -> kj::Own<WorkerInterface> {
           return actorNs->getActor(kj::mv(id), IoChannelFactory::SubrequestMetadata{});
         });
@@ -2120,7 +2960,7 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name, config::Worker::
   return kj::heap<WorkerService>(globalContext->threadContext, kj::mv(worker),
                                  kj::mv(errorReporter.defaultEntrypoint),
                                  kj::mv(errorReporter.namedEntrypoints), localActorConfigs,
-                                 kj::mv(linkCallback));
+                                 kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors));
 }
 
 // =======================================================================================
@@ -2173,8 +3013,8 @@ Server::Service& Server::lookupService(
   if (designator.hasEntrypoint()) {
     kj::StringPtr entrypointName = designator.getEntrypoint();
     if (WorkerService* worker = dynamic_cast<WorkerService*>(service)) {
-      KJ_IF_MAYBE(ep, worker->getEntrypoint(entrypointName)) {
-        return *ep;
+      KJ_IF_SOME(ep, worker->getEntrypoint(entrypointName)) {
+        return ep;
       } else {
         reportConfigError(kj::str(
             errorContext, " refers to service \"", targetName, "\" with a named entrypoint \"",
@@ -2199,24 +3039,29 @@ class Server::HttpListener final: public kj::Refcounted {
 public:
   HttpListener(Server& owner, kj::Own<kj::ConnectionReceiver> listener, Service& service,
                kj::StringPtr physicalProtocol, kj::Own<HttpRewriter> rewriter,
-               kj::HttpHeaderTable& headerTable, kj::Timer& timer)
+               kj::HttpHeaderTable& headerTable, kj::Timer& timer,
+               capnp::HttpOverCapnpFactory& httpOverCapnpFactory)
       : owner(owner), listener(kj::mv(listener)), service(service),
         headerTable(headerTable), timer(timer),
+        httpOverCapnpFactory(httpOverCapnpFactory),
         physicalProtocol(physicalProtocol),
         rewriter(kj::mv(rewriter)) {}
 
   kj::Promise<void> run() {
-    return listener->acceptAuthenticated()
-        .then([this](kj::AuthenticatedStream stream) {
+    TRACE_EVENT("workerd", "HttpListener::run");
+    for (;;) {
+      kj::AuthenticatedStream stream = co_await listener->acceptAuthenticated();
+      TRACE_EVENT("workerd", "HTTPListener handle connection");
+
       kj::Maybe<kj::String> cfBlobJson;
       if (!rewriter->hasCfBlobHeader()) {
         // Construct a cf blob describing the client identity.
 
         kj::PeerIdentity* peerId;
 
-        KJ_IF_MAYBE(tlsId,
+        KJ_IF_SOME(tlsId,
             kj::dynamicDowncastIfAvailable<kj::TlsPeerIdentity>(*stream.peerIdentity)) {
-          peerId = &tlsId->getNetworkIdentity();
+          peerId = &tlsId.getNetworkIdentity();
 
           // TODO(someday): Add client certificate info to the cf blob? At present, KJ only
           //   supplies the common name, but that doesn't even seem to be one of the fields that
@@ -2225,19 +3070,19 @@ public:
           peerId = stream.peerIdentity;
         }
 
-        KJ_IF_MAYBE(remote,
+        KJ_IF_SOME(remote,
             kj::dynamicDowncastIfAvailable<kj::NetworkPeerIdentity>(*peerId)) {
-          cfBlobJson = kj::str("{\"clientIp\": \"", escapeJsonString(remote->toString()), "\"}");
-        } else KJ_IF_MAYBE(local,
+          cfBlobJson = kj::str("{\"clientIp\": \"", escapeJsonString(remote.toString()), "\"}");
+        } else KJ_IF_SOME(local,
             kj::dynamicDowncastIfAvailable<kj::LocalPeerIdentity>(*peerId)) {
-          auto creds = local->getCredentials();
+          auto creds = local.getCredentials();
 
           kj::Vector<kj::String> parts;
-          KJ_IF_MAYBE(p, creds.pid) {
-            parts.add(kj::str("\"clientPid\":", *p));
+          KJ_IF_SOME(p, creds.pid) {
+            parts.add(kj::str("\"clientPid\":", p));
           }
-          KJ_IF_MAYBE(u, creds.uid) {
-            parts.add(kj::str("\"clientUid\":", *u));
+          KJ_IF_SOME(u, creds.uid) {
+            parts.add(kj::str("\"clientUid\":", u));
           }
 
           cfBlobJson = kj::str("{", kj::strArray(parts, ","), "}");
@@ -2246,21 +3091,21 @@ public:
 
       auto conn = kj::heap<Connection>(*this, kj::mv(cfBlobJson));
 
-      auto promise = kj::evalNow([&]() {
-        return conn->listedHttp.httpServer.listenHttp(kj::mv(stream.stream))
-          .attach(kj::mv(conn))
-          .attach(kj::addRef(*this));  // two attach()es because `this` must outlive `conn`
-      });
+      static auto constexpr listen = [](kj::Own<HttpListener> self,
+                                        kj::Own<Connection> conn,
+                                        kj::Own<kj::AsyncIoStream> stream) -> kj::Promise<void> {
+        try {
+          co_await conn->listedHttp.httpServer.listenHttp(kj::mv(stream));
+        } catch (...) {
+          KJ_LOG(ERROR, kj::getCaughtExceptionAsKj());
+        }
+      };
 
       // Run the connection handler loop in the global task set, so that run() waits for open
       // connections to finish before returning, even if the listener loop is canceled. However,
       // do not consider exceptions from a specific connection to be fatal.
-      owner.tasks.add(promise.catch_([](kj::Exception&& exception) {
-        KJ_LOG(ERROR, exception);
-      }));
-
-      return run();
-    });
+      owner.tasks.add(listen(kj::addRef(*this), kj::mv(conn), kj::mv(stream.stream)));
+    }
   }
 
 private:
@@ -2269,8 +3114,101 @@ private:
   Service& service;
   kj::HttpHeaderTable& headerTable;
   kj::Timer& timer;
+  capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
   kj::StringPtr physicalProtocol;
   kj::Own<HttpRewriter> rewriter;
+
+  kj::Maybe<capnp::TwoPartyServer> capnpServer;
+
+  kj::Promise<void> acceptCapnpConnection(kj::AsyncIoStream& conn) {
+    KJ_IF_SOME(s, capnpServer) {
+      return s.accept(conn);
+    }
+
+    // Capnp server not initialized. Create in now.
+    auto& s = capnpServer.emplace(kj::heap<WorkerdBootstrapImpl>(*this));
+    return s.accept(conn);
+  }
+
+  class WorkerdBootstrapImpl final: public rpc::WorkerdBootstrap::Server {
+  public:
+    WorkerdBootstrapImpl(HttpListener& parent): parent(parent) {}
+
+    kj::Promise<void> startEvent(StartEventContext context) {
+      // TODO(someday): Use cfBlobJson from the connection if there is one, or from RPC params
+      //   if we add that? (Note that if a connection-level cf blob exists, it should take
+      //   priority; we should only accept a cf blob from the client if we have a cfBlobHeader
+      //   configrued, which hints that this service trusts the client to provide the cf blob.)
+
+      context.initResults(capnp::MessageSize {4, 1}).setDispatcher(
+          kj::heap<EventDispatcherImpl>(parent, parent.service.startRequest({})));
+      return kj::READY_NOW;
+    }
+
+  private:
+    HttpListener& parent;
+  };
+
+  class EventDispatcherImpl final: public rpc::EventDispatcher::Server {
+  public:
+    EventDispatcherImpl(HttpListener& parent, kj::Own<WorkerInterface> worker)
+        : parent(parent), worker(kj::mv(worker)) {}
+
+    kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+      context.initResults(capnp::MessageSize{4, 1})
+          .setHttp(parent.httpOverCapnpFactory.kjToCapnp(getWorker()));
+      return kj::READY_NOW;
+    }
+
+    kj::Promise<void> sendTraces(SendTracesContext context) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<void> prewarm(PrewarmContext context) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<void> runScheduled(RunScheduledContext context) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<void> runAlarm(RunAlarmContext context) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<void> queue(QueueContext context) override {
+      throwUnsupported();
+    }
+
+    kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
+      auto customEvent = kj::heap<api::JsRpcSessionCustomEventImpl>(
+          api::JsRpcSessionCustomEventImpl::WORKER_RPC_EVENT_TYPE);
+
+      auto cap = customEvent->getCap();
+      capnp::PipelineBuilder<JsRpcSessionResults> pipelineBuilder;
+      pipelineBuilder.setTopLevel(cap);
+      context.setPipeline(pipelineBuilder.build());
+      context.getResults().setTopLevel(kj::mv(cap));
+
+      auto worker = getWorker();
+      return worker->customEvent(kj::mv(customEvent)).ignoreResult().attach(kj::mv(worker));
+    }
+
+  private:
+    HttpListener& parent;
+    kj::Maybe<kj::Own<WorkerInterface>> worker;
+
+    kj::Own<WorkerInterface> getWorker() {
+      auto result = kj::mv(KJ_ASSERT_NONNULL(worker,
+          "EventDispatcher can only be used for one request"));
+      worker = kj::none;
+      return result;
+    }
+
+    [[noreturn]] void throwUnsupported() {
+      JSG_FAIL_REQUIRE(Error, "RPC connections don't yet support this event type.");
+    }
+  };
 
   struct Connection final: public kj::HttpService, public kj::HttpServerErrorHandler {
     Connection(HttpListener& parent, kj::Maybe<kj::String> cfBlobJson)
@@ -2291,13 +3229,15 @@ private:
 
       kj::Own<kj::AsyncOutputStream> send(
           uint statusCode, kj::StringPtr statusText, const kj::HttpHeaders& headers,
-          kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
+          kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+        TRACE_EVENT("workerd", "ResponseWrapper::send()");
         auto rewrite = headers.cloneShallow();
         rewriter.rewriteResponse(rewrite);
         return inner.send(statusCode, statusText, rewrite, expectedBodySize);
       }
 
       kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+        TRACE_EVENT("workerd", "ResponseWrapper::acceptWebSocket()");
         auto rewrite = headers.cloneShallow();
         rewriter.rewriteResponse(rewrite);
         return inner.acceptWebSocket(rewrite);
@@ -2314,6 +3254,7 @@ private:
     kj::Promise<void> request(
         kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
         kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
+      TRACE_EVENT("workerd", "Connection:request()");
       IoChannelFactory::SubrequestMetadata metadata;
       metadata.cfBlobJson = cfBlobJson.map([](kj::StringPtr s) { return kj::str(s); });
 
@@ -2323,20 +3264,37 @@ private:
         wrappedResponse = ownResponse = kj::heap<ResponseWrapper>(response, *parent.rewriter);
       }
 
-      if (parent.rewriter->needsRewriteRequest() || cfBlobJson != nullptr) {
+      if (parent.rewriter->needsRewriteRequest() || cfBlobJson != kj::none) {
         auto rewrite = KJ_UNWRAP_OR(
             parent.rewriter->rewriteIncomingRequest(
                 url, parent.physicalProtocol, headers, metadata.cfBlobJson), {
-          return response.sendError(400, "Bad Request", parent.headerTable);
+          co_return co_await response.sendError(400, "Bad Request", parent.headerTable);
         });
         auto worker = parent.service.startRequest(kj::mv(metadata));
-        return worker->request(method, url, *rewrite.headers, requestBody, *wrappedResponse)
-            .attach(kj::mv(rewrite), kj::mv(worker), kj::mv(ownResponse));
+        co_return co_await worker->request(method, url, *rewrite.headers, requestBody,
+                                           *wrappedResponse);
       } else {
         auto worker = parent.service.startRequest(kj::mv(metadata));
-        return worker->request(method, url, headers, requestBody, *wrappedResponse)
-            .attach(kj::mv(worker), kj::mv(ownResponse));
+        co_return co_await worker->request(method, url, headers, requestBody, *wrappedResponse);
       }
+    }
+
+    kj::Promise<void> connect(kj::StringPtr host,
+                              const kj::HttpHeaders& headers,
+                              kj::AsyncIoStream& connection,
+                              ConnectResponse& response,
+                              kj::HttpConnectSettings settings) override {
+      KJ_IF_SOME(h, parent.rewriter->getCapnpConnectHost()) {
+        if (h == host) {
+          // Client is requesting to open a capnp session!
+          response.accept(200, "OK", kj::HttpHeaders(parent.headerTable));
+          return parent.acceptCapnpConnection(connection);
+        }
+      }
+
+      // TODO(someday): Deliver connect() event to to worker? For now we call the default
+      //   implementation which throws an exception.
+      return kj::HttpService::connect(host, headers, connection, response, kj::mv(settings));
     }
 
     // ---------------------------------------------------------------------------
@@ -2345,10 +3303,8 @@ private:
     kj::Promise<void> handleApplicationError(
         kj::Exception exception, kj::Maybe<kj::HttpService::Response&> response) override {
       KJ_LOG(ERROR, kj::str("Uncaught exception: ", exception));
-      KJ_IF_MAYBE(r, response) {
-        return r->sendError(500, "Internal Server Error", parent.headerTable);
-      } else {
-        return kj::READY_NOW;
+      KJ_IF_SOME(r, response) {
+        co_return co_await r.sendError(500, "Internal Server Error", parent.headerTable);
       }
     }
   };
@@ -2359,15 +3315,29 @@ kj::Promise<void> Server::listenHttp(
     kj::StringPtr physicalProtocol, kj::Own<HttpRewriter> rewriter) {
   auto obj = kj::refcounted<HttpListener>(*this, kj::mv(listener), service,
                                           physicalProtocol, kj::mv(rewriter),
-                                          globalContext->headerTable, timer);
-  return obj->run().attach(kj::mv(obj));
+                                          globalContext->headerTable, timer,
+                                          globalContext->httpOverCapnpFactory);
+  co_return co_await obj->run();
 }
 
 // =======================================================================================
 // Server::run()
 
+kj::Promise<void> Server::handleDrain(kj::Promise<void> drainWhen) {
+  co_await drainWhen;
+  TRACE_EVENT("workerd", "Server::handleDrain()");
+  // Tell all HttpServers to drain. This causes them to disconnect any connections that don't
+  // have a request in-flight.
+  auto drainPromises = kj::heapArrayBuilder<kj::Promise<void>>(httpServers.size());
+  for (auto& httpServer: httpServers) {
+    drainPromises.add(httpServer.httpServer.drain());
+  }
+  co_await kj::joinPromisesFailFast(drainPromises.finish());
+}
+
 kj::Promise<void> Server::run(jsg::V8System& v8System, config::Config::Reader config,
                               kj::Promise<void> drainWhen) {
+  TRACE_EVENT("workerd", "Server.run");
   kj::HttpHeaderTable::Builder headerTableBuilder;
   globalContext = kj::heap<GlobalContext>(*this, v8System, headerTableBuilder);
   invalidConfigServiceSingleton = kj::heap<InvalidConfigService>();
@@ -2375,25 +3345,18 @@ kj::Promise<void> Server::run(jsg::V8System& v8System, config::Config::Reader co
   auto [ fatalPromise, fatalFulfiller ] = kj::newPromiseAndFulfiller<void>();
   this->fatalFulfiller = kj::mv(fatalFulfiller);
 
-  auto forkedDrainWhen = drainWhen
-      .then([this]() mutable {
-    // Tell all HttpServers to drain. This causes them to disconnect any connections that don't
-    // have a request in-flight.
-    for (auto& httpServer: httpServers) {
-      httpServer.httpServer.drain();
-    }
-  }).fork();
+  auto forkedDrainWhen = handleDrain(kj::mv(drainWhen)).fork();
 
   startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
 
   auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen);
 
-  // We should have registered all headers synchronously. This is important becaues we want to
+  // We should have registered all headers synchronously. This is important because we want to
   // be able to start handling requests as soon as the services are available, even if some other
   // services take longer to get ready.
   auto ownHeaderTable = headerTableBuilder.build();
 
-  return listenPromise.exclusiveJoin(kj::mv(fatalPromise)).attach(kj::mv(ownHeaderTable));
+  co_return co_await listenPromise.exclusiveJoin(kj::mv(fatalPromise));
 }
 
 void Server::startAlarmScheduler(config::Config::Reader config) {
@@ -2407,35 +3370,61 @@ void Server::startAlarmScheduler(config::Config::Reader config) {
       .attach(kj::mv(vfs));
 }
 
+// Configure and start the inspector socket, returning the port the socket started on.
+uint startInspector(kj::StringPtr inspectorAddress,
+                    Server::InspectorServiceIsolateRegistrar& registrar) {
+  static constexpr uint UNASSIGNED_PORT = 0;
+  static constexpr uint DEFAULT_PORT = 9229;
+  kj::MutexGuarded<uint> inspectorPort(UNASSIGNED_PORT);
+
+  kj::Thread thread([inspectorAddress, &inspectorPort, &registrar](){
+    kj::AsyncIoContext io = kj::setupAsyncIo();
+
+    kj::HttpHeaderTable::Builder headerTableBuilder;
+
+    // Create the special inspector service.
+    auto inspectorService(
+        kj::heap<Server::InspectorService>(io.provider->getTimer(), headerTableBuilder, registrar));
+    auto ownHeaderTable = headerTableBuilder.build();
+
+    // Configure and start the inspector socket.
+
+    auto& network = io.provider->getNetwork();
+
+    // TODO(cleanup): There's an issue here that if listen fails, nothing notices. The
+    // server will continue running but will no longer accept inspector connections.
+    // This should be fixed by:
+    // 1. Replacing the kj::NEVER_DONE with listen
+    // 2. Making the thread's lambda `noexcept` so that if it throws the process crashes
+    // 3. Probably also throw if listen completes without an exception (even if unlikely to
+    //    happen)
+    auto listen = (kj::coCapture([&network, &inspectorAddress, &inspectorPort,
+                                   &inspectorService]() -> kj::Promise<void> {
+      auto parsed = co_await network.parseAddress(inspectorAddress, DEFAULT_PORT);
+      auto listener = parsed->listen();
+      // EW-7716: Signal to thread that started the inspector service that the inspector is ready.
+      *inspectorPort.lockExclusive() = listener->getPort();
+      KJ_LOG(INFO, "Inspector is listening");
+      co_await inspectorService->listen(kj::mv(listener));
+    }))();
+
+    kj::NEVER_DONE.wait(io.waitScope);
+  });
+  thread.detach();
+
+  // EW-7716: Wait for the InspectorService instance to be initialized before proceeding.
+  return inspectorPort.when(
+    [](const uint& port) { return port != UNASSIGNED_PORT; },
+    [](const uint& port) { return port; }
+  );
+}
+
 void Server::startServices(jsg::V8System& v8System, config::Config::Reader config,
                            kj::HttpHeaderTable::Builder& headerTableBuilder,
                            kj::ForkedPromise<void>& forkedDrainWhen) {
   // ---------------------------------------------------------------------------
-  // Configure inspector.
-
-  KJ_IF_MAYBE(inspector, inspectorOverride) {
-    // Create the special inspector service.
-    auto& inspectorService = *maybeInspectorService.emplace(
-        makeInspectorService(headerTableBuilder));
-
-    // Configure and start the inspector socket.
-    static constexpr uint DEFAULT_PORT = 9229;
-
-    auto inspectorListener = network.parseAddress(*inspector, DEFAULT_PORT)
-        .then([](kj::Own<kj::NetworkAddress> parsed) {
-      return parsed->listen();
-    });
-
-    tasks.add(inspectorListener.then(
-        [&inspectorService](kj::Own<kj::ConnectionReceiver> listener) mutable {
-      KJ_LOG(INFO, "Inspector is listening");
-      return inspectorService.listen(kj::mv(listener));
-    }).exclusiveJoin(forkedDrainWhen.addBranch()));
-  }
-
-  // ---------------------------------------------------------------------------
   // Configure services
-
+  TRACE_EVENT("workerd", "startServices");
   // First pass: Extract actor namespace configs.
   for (auto serviceConf: config.getServices()) {
     kj::StringPtr name = serviceConf.getName();
@@ -2449,16 +3438,19 @@ void Server::startServices(jsg::V8System& v8System, config::Config::Reader confi
           case config::Worker::DurableObjectNamespace::UNIQUE_KEY:
             hadDurable = true;
             serviceActorConfigs.insert(kj::str(ns.getClassName()),
-                Durable { kj::str(ns.getUniqueKey()) });
+                Durable {
+                    .uniqueKey = kj::str(ns.getUniqueKey()),
+                    .isEvictable = !ns.getPreventEviction() });
             continue;
           case config::Worker::DurableObjectNamespace::EPHEMERAL_LOCAL:
             if (!experimental) {
               reportConfigError(kj::str(
-                  "Ephemeral objects (Durable Object namespaces with type 'ehpmeralLocal') are an "
+                  "Ephemeral objects (Durable Object namespaces with type 'ephemeralLocal') are an "
                   "experimental feature which may change or go away in the future. You must run "
                   "workerd with `--experimental` to use this feature."));
             }
-            serviceActorConfigs.insert(kj::str(ns.getClassName()), Ephemeral {});
+            serviceActorConfigs.insert(kj::str(ns.getClassName()),
+                Ephemeral { .isEvictable = !ns.getPreventEviction() });
             continue;
         }
         reportConfigError(kj::str(
@@ -2494,6 +3486,22 @@ void Server::startServices(jsg::V8System& v8System, config::Config::Reader confi
     actorConfigs.upsert(kj::str(name), kj::mv(serviceActorConfigs), [&](auto&&...) {
       reportConfigError(kj::str("Config defines multiple services named \"", name, "\"."));
     });
+  }
+
+  // If we are using the inspector, we need to register the Worker::Isolate
+  // with the inspector service.
+  KJ_IF_SOME(inspectorAddress, inspectorOverride) {
+    auto registrar = kj::heap<InspectorServiceIsolateRegistrar>();
+    auto port = startInspector(inspectorAddress, *registrar);
+    KJ_IF_SOME(stream, controlOverride) {
+      auto message = kj::str("{\"event\":\"listen-inspector\",\"port\":", port, "}\n");
+      try {
+        stream->write(message.begin(), message.size());
+      } catch (kj::Exception& e) {
+        KJ_LOG(ERROR, e);
+      }
+    }
+    inspectorIsolateRegistrar = kj::mv(registrar);
   }
 
   // Second pass: Build services.
@@ -2537,10 +3545,11 @@ void Server::startServices(jsg::V8System& v8System, config::Config::Reader confi
 
 kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
                                           kj::HttpHeaderTable::Builder& headerTableBuilder,
-                                          kj::ForkedPromise<void>& forkedDrainWhen) {
+                                          kj::ForkedPromise<void>& forkedDrainWhen,
+                                          bool forTest) {
   // ---------------------------------------------------------------------------
   // Start sockets
-
+  TRACE_EVENT("workerd", "listenOnSockets");
   for (auto sock: config.getSockets()) {
     kj::StringPtr name = sock.getName();
     kj::StringPtr addrStr = nullptr;
@@ -2549,8 +3558,8 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
 
     Service& service = lookupService(sock.getService(), kj::str("Socket \"", name, "\""));
 
-    KJ_IF_MAYBE(override, socketOverrides.findEntry(name)) {
-      KJ_SWITCH_ONEOF(override->value) {
+    KJ_IF_SOME(override, socketOverrides.findEntry(name)) {
+      KJ_SWITCH_ONEOF(override.value) {
         KJ_CASE_ONEOF(str, kj::String) {
           addrStr = ownAddrStr = kj::mv(str);
           break;
@@ -2560,7 +3569,7 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
           break;
         }
       }
-      socketOverrides.erase(*override);
+      socketOverrides.erase(override);
     } else if (sock.hasAddress()) {
       addrStr = sock.getAddress();
     } else {
@@ -2595,39 +3604,47 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
     continue;
 
   validSocket:
-    kj::Promise<kj::Own<kj::ConnectionReceiver>> listener = nullptr;
-    KJ_IF_MAYBE(l, listenerOverride) {
-      listener = kj::mv(*l);
+    using PromisedReceived = kj::Promise<kj::Own<kj::ConnectionReceiver>>;
+    PromisedReceived listener = nullptr;
+    KJ_IF_SOME(l, listenerOverride) {
+      listener = kj::mv(l);
     } else {
-      listener = network.parseAddress(addrStr, defaultPort)
-          .then([](kj::Own<kj::NetworkAddress> parsed) {
-        return parsed->listen();
-      });
+      listener = ([](kj::Promise<kj::Own<kj::NetworkAddress>> promise) -> PromisedReceived {
+        auto parsed = co_await promise;
+        co_return parsed->listen();
+      })(network.parseAddress(addrStr, defaultPort));
     }
 
-    KJ_IF_MAYBE(t, tls) {
-      listener = listener.then([tls = kj::mv(*t)](kj::Own<kj::ConnectionReceiver> port) mutable {
-        return tls->wrapPort(kj::mv(port)).attach(kj::mv(tls));
-      });
+    KJ_IF_SOME(t, tls) {
+      listener = ([](kj::Promise<kj::Own<kj::ConnectionReceiver>> promise,
+                     kj::Own<kj::TlsContext> tls)
+          -> PromisedReceived {
+        auto port = co_await promise;
+        co_return tls->wrapPort(kj::mv(port)).attach(kj::mv(tls));
+      })(kj::mv(listener), kj::mv(t));
     }
 
     // Need to create rewriter before waiting on anything since `headerTableBuilder` will no longer
     // be available later.
     auto rewriter = kj::heap<HttpRewriter>(httpOptions, headerTableBuilder);
 
-    tasks.add(listener
-        .then([this, &service, rewriter = kj::mv(rewriter), physicalProtocol, name]
-              (kj::Own<kj::ConnectionReceiver> listener) mutable {
-      KJ_IF_MAYBE(stream, controlOverride) {
+    auto handle = kj::coCapture(
+        [this, &service, rewriter = kj::mv(rewriter), physicalProtocol, name]
+        (kj::Promise<kj::Own<kj::ConnectionReceiver>> promise)
+            mutable -> kj::Promise<void> {
+      TRACE_EVENT("workerd", "setup listenHttp");
+      auto listener = co_await promise;
+      KJ_IF_SOME(stream, controlOverride) {
         auto message = kj::str("{\"event\":\"listen\",\"socket\":\"", name, "\",\"port\":", listener->getPort(), "}\n");
         try {
-          (*stream)->write(message.begin(), message.size());
+          stream->write(message.begin(), message.size());
         } catch (kj::Exception& e) {
           KJ_LOG(ERROR, e);
         }
       }
-      return listenHttp(kj::mv(listener), service, physicalProtocol, kj::mv(rewriter));
-    }).exclusiveJoin(forkedDrainWhen.addBranch()));
+      co_await listenHttp(kj::mv(listener), service, physicalProtocol, kj::mv(rewriter));
+    });
+    tasks.add(handle(kj::mv(listener)).exclusiveJoin(forkedDrainWhen.addBranch()));
   }
 
   for (auto& unmatched: socketOverrides) {
@@ -2643,114 +3660,35 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
   }
 
   for (auto& unmatched: directoryOverrides) {
+    if (forTest && unmatched.key == "TEST_TMPDIR") {
+      // Due to a historical bug, `workerd test` didn't check for the existence of unmatched
+      // overrides, and our own tests became dependent on the ability to override TEST_TMPDIR
+      // even if it was not used in the config. For now, we ignore this problem.
+      //
+      // TODO(cleanup): Figure out the right solution here.
+      continue;
+    }
+
     reportConfigError(kj::str(
         "Config did not define any disk service named \"", unmatched.key, "\" to match the "
         "override provided on the command line."));
   }
 
-  return tasks.onEmpty();
+  co_await tasks.onEmpty();
+
+  // Give a chance for any errors to bubble up before we return success. In particular
+  // Server::taskFailed() fulfills `fatalFulfiller`, which causes the server to exit with an error.
+  // But the `TaskSet` may have become empty at the same time. We want the error to win the race
+  // against the success.
+  //
+  // TODO(cleanup): A better solution wolud be for `TaskSet` to have a new variant of the
+  //   `onEmpty()` method like `onEmptyOrException()`, which propagates any exception thrown by
+  //   any task.
+  co_await kj::evalLast([]() {});
 }
 
 // =======================================================================================
 // Server::test()
-
-namespace {
-
-class GlobFilter {
-  // Implements glob filters. Copied from kj/test.{h,c++}, modified only to avoid copying the
-  // pattern in the constructor.
-  //
-  // TODO(cleanup): Should this be a public API in KJ?
-
-public:
-  explicit GlobFilter(kj::StringPtr pattern): pattern(pattern) {}
-
-  bool matches(kj::StringPtr name) {
-    // Get out your computer science books. We're implementing a non-deterministic finite automaton.
-    //
-    // Our NDFA has one "state" corresponding to each character in the pattern.
-    //
-    // As you may recall, an NDFA can be transformed into a DFA where every state in the DFA
-    // represents some combination of states in the NDFA. Therefore, we actually have to store a
-    // list of states here. (Actually, what we really want is a set of states, but because our
-    // patterns are mostly non-cyclic a list of states should work fine and be a bit more efficient.)
-
-    // Our state list starts out pointing only at the start of the pattern.
-    states.resize(0);
-    states.add(0);
-
-    kj::Vector<uint> scratch;
-
-    // Iterate through each character in the name.
-    for (char c: name) {
-      // Pull the current set of states off to the side, so that we can populate `states` with the
-      // new set of states.
-      kj::Vector<uint> oldStates = kj::mv(states);
-      states = kj::mv(scratch);
-      states.resize(0);
-
-      // The pattern can omit a leading path. So if we're at a '/' then enter the state machine at
-      // the beginning on the next char.
-      if (c == '/' || c == '\\') {
-        states.add(0);
-      }
-
-      // Process each state.
-      for (uint state: oldStates) {
-        applyState(c, state);
-      }
-
-      // Store the previous state vector for reuse.
-      scratch = kj::mv(oldStates);
-    }
-
-    // If any one state is at the end of the pattern (or at a wildcard just before the end of the
-    // pattern), we have a match.
-    for (uint state: states) {
-      while (state < pattern.size() && pattern[state] == '*') {
-        ++state;
-      }
-      if (state == pattern.size()) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-private:
-  kj::StringPtr pattern;
-  kj::Vector<uint> states;
-
-  void applyState(char c, int state) {
-    if (state < pattern.size()) {
-      switch (pattern[state]) {
-        case '*':
-          // At a '*', we both re-add the current state and attempt to match the *next* state.
-          if (c != '/' && c != '\\') {  // '*' doesn't match '/'.
-            states.add(state);
-          }
-          applyState(c, state + 1);
-          break;
-
-        case '?':
-          // A '?' matches one character (never a '/').
-          if (c != '/' && c != '\\') {
-            states.add(state + 1);
-          }
-          break;
-
-        default:
-          // Any other character matches only itself.
-          if (c == pattern[state]) {
-            states.add(state + 1);
-          }
-          break;
-      }
-    }
-  }
-};
-
-}  // namespace
 
 kj::Promise<bool> Server::test(jsg::V8System& v8System, config::Config::Reader config,
                                kj::StringPtr servicePattern,
@@ -2762,17 +3700,25 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System, config::Config::Reader c
   auto [ fatalPromise, fatalFulfiller ] = kj::newPromiseAndFulfiller<void>();
   this->fatalFulfiller = kj::mv(fatalFulfiller);
 
-  auto forkedDrainWhen = kj::Promise<void>(kj::READY_NOW).fork();
+  auto forkedDrainWhen = kj::Promise<void>(kj::NEVER_DONE).fork();
 
   startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
+
+  // Tests usually do not configure sockets, but they can, especially loopback sockets. Arrange
+  // to wait on them. Crash if listening fails.
+  auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen,
+                                       /* forTest = */ true)
+      .eagerlyEvaluate([](kj::Exception&& e) noexcept {
+    kj::throwFatalException(kj::mv(e));
+  });
 
   auto ownHeaderTable = headerTableBuilder.build();
 
   // TODO(someday): If the inspector is enabled, pause and wait for an inspector connection before
   //   proceeding?
 
-  GlobFilter serviceGlob(servicePattern);
-  GlobFilter entrypointGlob(entrypointPattern);
+  kj::GlobFilter serviceGlob(servicePattern);
+  kj::GlobFilter entrypointGlob(entrypointPattern);
 
   uint passCount = 0, failCount = 0;
 

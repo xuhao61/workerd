@@ -1,25 +1,119 @@
-load("//:build/wd_cc_capnp_library.bzl", "wd_cc_capnp_library")
 load("//:build/kj_test.bzl", "kj_test")
+load("//:build/wd_cc_capnp_library.bzl", "wd_cc_capnp_library")
+load("//:build/wd_cc_library.bzl", "wd_cc_library")
 load("//:build/wd_test.bzl", "wd_test")
 
 filegroup(
     name = "srcs",
-    srcs = glob(
-        ["**/*.c++"],
-        exclude = [
-            "**/*test*.c++",
-        ],
-    ),
+    srcs = select({
+        "//src/workerd/io:set_enable_experimental_webgpu": glob(
+            ["**/*.c++"],
+            exclude = [
+                "html-rewriter.c++",
+                "rtti.c++",
+                "**/*test*.c++",
+                "pyodide.c++",
+                "pyodide/pyodide.c++",
+            ],
+        ),
+        "//conditions:default": glob(
+            ["**/*.c++"],
+            exclude = [
+                "html-rewriter.c++",
+                "rtti.c++",
+                "**/*test*.c++",
+                "pyodide.c++",
+                "pyodide/pyodide.c++",
+                "gpu/*.c++",
+            ],
+        ),
+    }),
     visibility = ["//visibility:public"],
 )
 
 filegroup(
     name = "hdrs",
-    srcs = glob(
-        ["**/*.h"],
-        exclude = ["*test*.h"],
-    ),
+    srcs = select({
+        "//src/workerd/io:set_enable_experimental_webgpu": glob(
+            ["**/*.h"],
+            exclude = [
+                "html-rewriter.h",
+                "modules.h",
+                "rtti.h",
+                "**/*test*.h",
+                "pyodide.h",
+            ],
+        ),
+        "//conditions:default": glob(
+            ["**/*.h"],
+            exclude = [
+                "html-rewriter.h",
+                "modules.h",
+                "rtti.h",
+                "**/*test*.h",
+                "pyodide.h",
+                "gpu/*.h",
+            ],
+        ),
+    }),
     visibility = ["//visibility:public"],
+)
+
+wd_cc_library(
+    name = "rtti",
+    srcs = ["rtti.c++"],
+    hdrs = [
+        "modules.h",
+        "rtti.h",
+        "//src/pyodide:generated/pyodide_extra.capnp.h",
+        "//src/workerd/server:workerd.capnp.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":html-rewriter",
+        "//src/pyodide",
+        "//src/pyodide:pyodide_extra_capnp",
+        "//src/workerd/io",
+        "//src/workerd/jsg:rtti",
+        "//src/workerd/server:workerd_capnp",
+    ],
+)
+
+# Moved out of io library so that it does not depend on lolhtml and the associated rust crates.
+# This reduces the linker input size for tests based on io.
+wd_cc_library(
+    name = "html-rewriter",
+    srcs = ["html-rewriter.c++"],
+    hdrs = ["html-rewriter.h"],
+    implementation_deps = [
+        "@com_cloudflare_lol_html//:lolhtml",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/workerd/io",
+    ],
+)
+
+wd_cc_library(
+    name = "pyodide",
+    srcs = [
+        "pyodide.c++",
+        "pyodide/pyodide.c++",
+    ],
+    hdrs = [
+        "pyodide.h",
+        "pyodide/pyodide.h",
+        "//src/pyodide:generated/pyodide_extra.capnp.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/pyodide",
+        "//src/pyodide:pyodide_extra_capnp",
+        "//src/workerd/jsg",
+        "//src/workerd/server:workerd_capnp",
+        "//src/workerd/util:autogate",
+        "//src/workerd/io",
+    ],
 )
 
 wd_cc_capnp_library(
@@ -38,17 +132,41 @@ wd_cc_capnp_library(
     src = f,
     deps = [
         "//src/workerd/io",
-        "//src/workerd/jsg:rtti",
     ],
 ) for f in glob(
     ["**/*-test.c++"],
     exclude = [
+        "api-rtti-test.c++",
+        "actor-state-iocontext-test.c++",
+        "cf-property-test.c++",
         "node/*-test.c++",
     ],
 )]
 
 kj_test(
+    src = "actor-state-iocontext-test.c++",
+    deps = [
+        "//src/workerd/io",
+        "//src/workerd/tests:test-fixture",
+    ],
+)
+
+kj_test(
     src = "node/buffer-test.c++",
+    deps = ["//src/workerd/tests:test-fixture"],
+)
+
+kj_test(
+    src = "api-rtti-test.c++",
+    deps = [
+        ":html-rewriter",
+        "//src/workerd/io",
+        "//src/workerd/jsg:rtti",
+    ],
+)
+
+kj_test(
+    src = "cf-property-test.c++",
     deps = ["//src/workerd/tests:test-fixture"],
 )
 
@@ -58,4 +176,20 @@ kj_test(
     data = [f.removesuffix(".wd-test") + ".js"],
 ) for f in glob(
     ["**/*.wd-test"],
+)]
+
+# Enable GPU tests if experimental GPU support is enabled. Unfortunately, this depends on the right
+# drivers being available on Linux and macOS, so turn it off by default. Run GPU tests with
+# `bazel test //src/workerd/api:gpu/<test name>`.
+[wd_test(
+    src = f,
+    args = ["--experimental"],
+    data = [f.removesuffix(".gpu-wd-test") + ".js"],
+    tags = ["off-by-default"],
+    target_compatible_with = select({
+        "//src/workerd/io:set_enable_experimental_webgpu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+) for f in glob(
+    ["**/*.gpu-wd-test"],
 )]

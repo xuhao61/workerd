@@ -5,6 +5,8 @@
 #pragma once
 
 #include "jsg.h"
+#include "struct.h"
+#include <workerd/jsg/memory.h>
 #include <concepts>
 #include <deque>
 
@@ -16,56 +18,57 @@ namespace workerd::jsg {
 template <typename TypeWrapper>
 class GeneratorWrapper;
 
+// GeneratorNext is used internally by jsg::Generator and jsg::AsyncGenerator.
 template <typename T>
 struct GeneratorNext {
-  // GeneratorNext is used internally by jsg::Generator and jsg::AsyncGenerator.
   bool done;
-  kj::Maybe<T> value;
+
   // Value should only be nullptr if done is true. It does not
   // *have* to be nullptr if done is true, however.
+  kj::Maybe<T> value;
 };
 
 template <typename T>
 class GeneratorContext final {
   // See the documentation in jsg.h
 public:
-  void return_(Lock& js, kj::Maybe<T> maybeValue = nullptr) {
-    // Signal early return on the generator. The value given will be returned by the
-    // generator's forEach once the generator completes returning.
+  // Signal early return on the generator. The value given will be returned by the
+  // generator's forEach once the generator completes returning.
+  void return_(Lock& js, kj::Maybe<T> maybeValue = kj::none) {
     returning = true;
     if (state.template is<Init>()) {
       state = kj::mv(maybeValue);
     }
   }
 
-  inline bool isReturning() const { return returning; }
   // Indicates that return_() has been called and that an early return on the generator
   // is pending. The generator can still yield additional values.
+  inline bool isReturning() const { return returning; }
 
-  inline bool isErroring() const { return state.template is<Erroring>(); }
   // Indicates that the generator's throw() handler has been called and that the generator
   // is likely expecting a throw. The generator can still yield additional values and could
   // even exit normally without throwing.
+  inline bool isErroring() const { return state.template is<Erroring>(); }
 
 private:
   struct Init {};
   struct Erroring {};
   using Returning = kj::Maybe<T>;
 
-  kj::OneOf<Init, Erroring, Returning> state = Init();
-  bool returning = false;
   // Active = The generator is active and producing values.
   // Errored = The generator has errored and may produce one final value.
   // Returning = return_() has been called, inserting a pending return value.
+  kj::OneOf<Init, Erroring, Returning> state = Init();
+  bool returning = false;
 
   kj::Maybe<kj::Maybe<T>> tryClearPendingReturn(Lock& js) {
-    KJ_IF_MAYBE(pending, state.template tryGet<Returning>()) {
+    KJ_IF_SOME(pending, state.template tryGet<Returning>()) {
       // pending here is a kj::Maybe<T> which might be nullptr.
-      auto value = kj::mv(*pending);
+      auto value = kj::mv(pending);
       state.template init<Init>();
       return kj::Maybe<kj::Maybe<T>>(kj::mv(value));
     }
-    return nullptr;
+    return kj::none;
   }
 
   inline void setErroring() { state.template init<Erroring>(); }
@@ -74,9 +77,9 @@ private:
   friend class AsyncGenerator<T>;
 };
 
+// Provides underlying state for Generator and AsyncGenerator instances.
 template <typename Generator>
 class GeneratorImpl {
-  // Provides underlying state for Generator and AsyncGenerator instances.
 public:
   using T = typename Generator::Type;
   using NextSignature = typename Generator::NextSignature;
@@ -98,7 +101,7 @@ public:
           .maybeThrow = tryGetFunction<ThrowSignature>(isolate, object, "throw"_kj, typeWrapper)
         }) {
     // If there is no next function, there's nothing to do. Go ahead and mark finished.
-    if (state.template get<Active>().maybeNext == nullptr) {
+    if (state.template get<Active>().maybeNext == kj::none) {
       setFinished();
     }
   }
@@ -106,8 +109,8 @@ public:
   inline bool isFinished() const { return state.template is<Finished>(); }
 
   void visitForGc(GcVisitor& visitor) {
-    KJ_IF_MAYBE(active, state) {
-      visitor.visit(active->maybeNext, active->maybeReturn, active->maybeThrow);
+    KJ_IF_SOME(active, state) {
+      visitor.visit(active.maybeNext, active.maybeReturn, active.maybeThrow);
     }
   }
 
@@ -136,7 +139,7 @@ private:
                              object);
   }
 
-  void setFinished(kj::Maybe<T> maybeReturnValue = nullptr) {
+  void setFinished(kj::Maybe<T> maybeReturnValue = kj::none) {
     returnValue = kj::mv(maybeReturnValue);
     state.template init<Finished>();
   }
@@ -184,17 +187,17 @@ public:
   // Func should have a signature of void(Lock&, T, GeneratorContext<T>&)
   template <GeneratorCallback<T> Func>
   kj::Maybe<T> forEach(Lock& js, Func func) {
-    KJ_IF_MAYBE(i, this->impl) {
-      auto& impl = *i;
+    KJ_IF_SOME(i, this->impl) {
+      auto& impl = i;
       KJ_SWITCH_ONEOF(impl->state) {
         KJ_CASE_ONEOF(finished, typename Impl::Finished) {
-          return nullptr;
+          return kj::none;
         }
         KJ_CASE_ONEOF(active, typename Impl::Active) {
-          KJ_IF_MAYBE(next, active.maybeNext) {
+          KJ_IF_SOME(next, active.maybeNext) {
             while(!impl->isFinished()) {
               js.tryCatch([&] {
-                auto result = (*next)(js);
+                auto result = next(js);
                 if (impl->processResultMaybeDone(js, func, result)) {
                   return;
                 }
@@ -203,16 +206,16 @@ public:
                 // check to see if early return has been indicated. That will
                 // return a result that might indicate done. If it does, we
                 // return, otherwise we continue the loop until done is signaled.
-                KJ_IF_MAYBE(returned, active.context.tryClearPendingReturn(js)) {
+                KJ_IF_SOME(returned, active.context.tryClearPendingReturn(js)) {
                   // returned here is a kj::Maybe<T> ...
                   // If a return() handler is not provided by the generator, then
                   // we will set the return value and break out early. Otherwise,
                   // we let the return() handler tell us what to do next.
-                  KJ_IF_MAYBE(return_, active.maybeReturn) {
-                    auto result = (*return_)(js, kj::mv(*returned));
+                  KJ_IF_SOME(return_, active.maybeReturn) {
+                    auto result = return_(js, kj::mv(returned));
                     impl->processResultMaybeDone(js, func, result);
                   } else {
-                    impl->setFinished(kj::mv(*returned));
+                    impl->setFinished(kj::mv(returned));
                   }
                 }
               }, [&](Value exception) {
@@ -240,8 +243,8 @@ public:
                 // again will return { done: false, value: 'd' }. Calling next() again
                 // after that will result in the pending 'boom' exception being thrown.
 
-                KJ_IF_MAYBE(throw_, active.maybeThrow) {
-                  auto result = (*throw_)(js, kj::mv(exception));
+                KJ_IF_SOME(throw_, active.maybeThrow) {
+                  auto result = throw_(js, kj::mv(exception));
                   active.context.setErroring();
                   // The throw_() handler could just end up throwing the exception
                   // synchronously, in which case we break out here and do nothing
@@ -270,8 +273,8 @@ public:
   }
 
   void visitForGc(GcVisitor& visitor) {
-    KJ_IF_MAYBE(i, impl) {
-      (*i)->visitForGc(visitor);
+    KJ_IF_SOME(i, impl) {
+      i->visitForGc(visitor);
     }
   }
 
@@ -307,24 +310,24 @@ public:
   // Func should have a signature of Promise<void>(Lock&, T, GeneratorContext<T>&)
   template <AsyncGeneratorCallback<T> Func>
   Promise<kj::Maybe<T>> forEach(Lock& js, Func func) {
-    KJ_IF_MAYBE(i, this->impl) {
+    KJ_IF_SOME(i, this->impl) {
       // It is important to note that the returned Promise takes over ownership
       // of the underlying Impl state here, keeping it alive until the async
       // generator completes. Once the generator is consumed once, it cannot
       // be consumed again.
-      return loop(js, **i, kj::mv(func)).then(js,
-          JSG_VISITABLE_LAMBDA((impl = kj::mv(*i)), (impl), (auto& js) mutable {
+      return loop(js, *i, kj::mv(func)).then(js,
+          JSG_VISITABLE_LAMBDA((impl = kj::mv(i)), (impl), (auto& js) mutable {
         return js.resolvedPromise(kj::mv(impl->returnValue));
       }));
     } else {
-      return js.template resolvedPromise<kj::Maybe<T>>(nullptr);
+      return js.template resolvedPromise<kj::Maybe<T>>(kj::none);
     }
-    return js.template resolvedPromise<kj::Maybe<T>>(nullptr);
+    return js.template resolvedPromise<kj::Maybe<T>>(kj::none);
   }
 
   void visitForGc(GcVisitor& visitor) {
-    KJ_IF_MAYBE(i, impl) {
-      i->visitForGc(visitor);
+    KJ_IF_SOME(i, impl) {
+      i.visitForGc(visitor);
     }
   }
 
@@ -353,9 +356,9 @@ private:
         return js.resolvedPromise();
       }
       KJ_CASE_ONEOF(active, typename Impl::Active) {
-        KJ_IF_MAYBE(next, active.maybeNext) {
+        KJ_IF_SOME(next, active.maybeNext) {
           // Call next to get the next item...
-          return (*next)(js).then(js, [&impl, func = kj::mv(func)](auto& js, auto result) {
+          return next(js).then(js, [&impl, func = kj::mv(func)](auto& js, auto result) {
             // Impl should still be active here because nothing should have been able
             // to invalidate it yet.
             auto& active = impl.state.template get<typename Impl::Active>();
@@ -380,9 +383,9 @@ private:
               auto& active = impl.state.template get<typename Impl::Active>();
 
               // If we got this far, we check to see if early return was requested.
-              KJ_IF_MAYBE(returned, active.context.tryClearPendingReturn(js)) {
-                KJ_IF_MAYBE(return_, active.maybeReturn) {
-                  return js.evalNow([&] { return (*return_)(js, kj::mv(*returned)); })
+              KJ_IF_SOME(returned, active.context.tryClearPendingReturn(js)) {
+                KJ_IF_SOME(return_, active.maybeReturn) {
+                  return js.evalNow([&] { return return_(js, kj::mv(returned)); })
                       .then(js, [&impl, func = kj::cp(func)](auto& js, auto result) {
                     if (impl.isFinished()) {
                       return js.resolvedPromise();
@@ -394,9 +397,9 @@ private:
                   }, [&impl, func = kj::mv(func)](auto& js, Value exception) {
                     if (!impl.isFinished()) {
                       auto& active = impl.state.template get<typename Impl::Active>();
-                      KJ_IF_MAYBE(throw_, active.maybeThrow) {
+                      KJ_IF_SOME(throw_, active.maybeThrow) {
                         active.context.setErroring();
-                        return js.evalNow([&] { return (*throw_)(js, kj::mv(exception)); })
+                        return js.evalNow([&] { return throw_(js, kj::mv(exception)); })
                             .then(js, [&impl, func = kj::mv(func)](auto& js, auto result) {
                           if (impl.processResultMaybeDone(js, func, result)) {
                             return js.resolvedPromise();
@@ -409,7 +412,7 @@ private:
                   });
                 }
 
-                impl.setFinished(kj::mv(*returned));
+                impl.setFinished(kj::mv(returned));
                 return js.resolvedPromise();
               }
 
@@ -417,9 +420,9 @@ private:
             }, [&impl, func = kj::mv(func)](auto& js, Value exception) {
               if (!impl.isFinished()) {
                 auto& active = impl.state.template get<typename Impl::Active>();
-                KJ_IF_MAYBE(throw_, active.maybeThrow) {
+                KJ_IF_SOME(throw_, active.maybeThrow) {
                   active.context.setErroring();
-                  return js.evalNow([&] { return (*throw_)(js, kj::mv(exception)); })
+                  return js.evalNow([&] { return throw_(js, kj::mv(exception)); })
                       .then(js, [&impl, func = kj::mv(func)](auto& js, auto result) {
                     if (impl.processResultMaybeDone(js, func, result)) {
                       return js.resolvedPromise();
@@ -504,7 +507,7 @@ public:
         if (value->IsUndefined()) {
           return GeneratorNext<T> {
             .done = true,
-            .value = nullptr,
+            .value = kj::none,
           };
         } else {
           return GeneratorNext<T> {
@@ -514,10 +517,10 @@ public:
         }
       }
 
-      KJ_IF_MAYBE(v, typeWrapper.tryUnwrap(context, value, (T*)nullptr, parentObject)) {
+      KJ_IF_SOME(v, typeWrapper.tryUnwrap(context, value, (T*)nullptr, parentObject)) {
         return GeneratorNext<T> {
           .done = false,
-          .value = kj::mv(*v),
+          .value = kj::mv(v),
         };
       } else {
         throwTypeError(context->GetIsolate(),
@@ -526,7 +529,7 @@ public:
       }
     }
 
-    return nullptr;
+    return kj::none;
   }
 
   template <typename T>
@@ -547,7 +550,7 @@ public:
         }
       }
     }
-    return nullptr;
+    return kj::none;
   }
 
   template <typename T>
@@ -568,7 +571,7 @@ public:
         }
       }
     }
-    return nullptr;
+    return kj::none;
   }
 };
 
@@ -631,15 +634,15 @@ public:
       kj::Maybe<v8::Local<v8::Object>> parentObject) {
     auto isolate = context->GetIsolate();
     auto& typeWrapper = TypeWrapper::from(isolate);
-    KJ_IF_MAYBE(gen, typeWrapper.tryUnwrap(context, handle, (Generator<U>*)nullptr, parentObject)) {
+    KJ_IF_SOME(gen, typeWrapper.tryUnwrap(context, handle, (Generator<U>*)nullptr, parentObject)) {
       kj::Vector<U> items;
       // We intentionally ignore the forEach return value.
-      gen->forEach(Lock::from(isolate), [&items](Lock&, U item, auto&) {
+      gen.forEach(Lock::from(isolate), [&items](Lock&, U item, auto&) {
         items.add(kj::mv(item));
       });
       return Sequence<U>(items.releaseAsArray());
     }
-    return nullptr;
+    return kj::none;
   }
 };
 
@@ -668,14 +671,22 @@ public:
     }
   }
 
+  JSG_MEMORY_INFO(IteratorBase) {
+    if constexpr (MemoryRetainer<State>) {
+      tracker.trackField("state", state);
+    } else {
+      tracker.trackFieldWithSize("state", sizeof(State));
+    }
+  }
+
 private:
   State state;
 
   Next nextImpl(Lock& js, NextSignature nextFunc) {
-    KJ_IF_MAYBE(value, nextFunc(js, state)) {
-      return Next { .done = false, .value = kj::mv(*value) };
+    KJ_IF_SOME(value, nextFunc(js, state)) {
+      return Next { .done = false, .value = kj::mv(value) };
     }
-    return Next { .done = true, .value = nullptr, };
+    return Next { .done = true, .value = kj::none, };
   }
 
   friend SelfType;
@@ -702,62 +713,65 @@ public:
     JSG_STRUCT(done, value);
   };
 
+  JSG_MEMORY_INFO(AsyncIteratorImpl) {
+    // TODO(soon): Implement memory tracking
+  }
+
 private:
   std::deque<Promise<void>> pendingStack;
 };
 
+// Provides the base implementation of JSG_ASYNC_ITERATOR types. See the documentation
+// for JSG_ASYNC_ITERATOR for details.
+//
+// Objects that use AsyncIteratorBase will be usable with the for await syntax in
+// JavaScript, e.g.:
+//
+//   const obj = new MyNewAsyncIterableObject();
+//   for await (const chunk of obj) {
+//     console.log(chunk);
+//   }
+//
+// The for await syntax is just sugar for using an async generator object.
+// All async iterable objects will have a method that will return an instance
+// of the AsyncIteratorBase. This is typically a method named values() or
+// entries().
+//
+// const obj = new MyNewAsyncIterableObject();
+// const gen = obj.values();
+//
+// The async generator object has two methods: next() and return()
+// next() is called to fetch the next item from the iterator, and should
+// be called until there is no more data to return. The return() method
+// is called to signal early termination of the iterator. Both methods
+// return a JavaScript promise that resolves to an IteratorResult object
+// (an ordinary JavaScript object with a done and value property).
+//
+// const result = await gen.next();
+// console.log(result.done);   // true or false
+// console.log(result.value);  // the value yielded in this iteration.
+//
+// const result = await gen.return("foo");
+// console.log(result.done);   // true
+// console.log(result.value);  // "foo" ... whatever value was passed in.
+//
+// It is important for the generator to queue and properly sequence concurrent
+// next() and return() calls. Specifically, the following pattern should read
+// five elements off the iterator before terminating it early:
+//
+// await Promise.all([
+//   gen.next(),         // must resolve to the first item
+//   gen.next(),         // must resolve to the second item
+//   gen.next(),         // must resolve to the third item
+//   gen.next(),         // must resolve to the fourth item
+//   gen.next(),         // must resolve to the fifth item
+//   gen.return("boom"), // must not be processed until after the fifth next()
+// ]);
+//
+// Once return() is called, all subsequent next() and return() calls must just
+// return an immediately resolved promise indicating that the iterator is done.
 template <typename SelfType, typename Type, typename State>
 class AsyncIteratorBase: public Object {
-  // Provides the base implementation of JSG_ASYNC_ITERATOR types. See the documentation
-  // for JSG_ASYNC_ITERATOR for details.
-  //
-  // Objects that use AsyncIteratorBase will be usable with the for await syntax in
-  // JavaScript, e.g.:
-  //
-  //   const obj = new MyNewAsyncIterableObject();
-  //   for await (const chunk of obj) {
-  //     console.log(chunk);
-  //   }
-  //
-  // The for await syntax is just sugar for using an async generator object.
-  // All async iterable objects will have a method that will return an instance
-  // of the AsyncIteratorBase. This is typically a method named values() or
-  // entries().
-  //
-  // const obj = new MyNewAsyncIterableObject();
-  // const gen = obj.values();
-  //
-  // The async generator object has two methods: next() and return()
-  // next() is called to fetch the next item from the iterator, and should
-  // be called until there is no more data to return. The return() method
-  // is called to signal early termination of the iterator. Both methods
-  // return a JavaScript promise that resolves to an IteratorResult object
-  // (an ordinary JavaScript object with a done and value property).
-  //
-  // const result = await gen.next();
-  // console.log(result.done);   // true or false
-  // console.log(result.value);  // the value yielded in this iteration.
-  //
-  // const result = await gen.return("foo");
-  // console.log(result.done);   // true
-  // console.log(result.value);  // "foo" ... whatever value was passed in.
-  //
-  // It is important for the generator to queue and properly sequence concurrent
-  // next() and return() calls. Specifically, the following pattern should read
-  // five elements off the iterator before terminating it early:
-  //
-  // await Promise.all([
-  //   gen.next(),         // must resolve to the first item
-  //   gen.next(),         // must resolve to the second item
-  //   gen.next(),         // must resolve to the third item
-  //   gen.next(),         // must resolve to the fourth item
-  //   gen.next(),         // must resolve to the fifth item
-  //   gen.return("boom"), // must not be processed until after the fifth next()
-  // ]);
-  //
-  // Once return() is called, all subsequent next() and return() calls must just
-  // return an immediately resolved promise indicating that the iterator is done.
-
 public:
   using NextSignature = Promise<kj::Maybe<Type>>(Lock&, State&);
   using ReturnSignature = Promise<void>(Lock&, State&, Optional<Value>);
@@ -771,11 +785,22 @@ public:
   }
 
   void visitForGc(GcVisitor& visitor) {
-    KJ_IF_MAYBE(inner, state.template tryGet<InnerState>()) {
+    KJ_IF_SOME(inner, state.template tryGet<InnerState>()) {
       if constexpr (hasPublicVisitForGc<State>()) {
-        visitor.visit(inner->state);
+        visitor.visit(inner.state);
       }
-      visitor.visit(inner->impl);
+      visitor.visit(inner.impl);
+    }
+  }
+
+  JSG_MEMORY_INFO(AsyncIteratorBase) {
+    KJ_SWITCH_ONEOF(state) {
+      KJ_CASE_ONEOF(fin, Finished) {
+        tracker.trackFieldWithSize("state", sizeof(Finished));
+      }
+      KJ_CASE_ONEOF(state, InnerState) {
+        tracker.trackField("state", state);
+      }
     }
   }
 
@@ -783,22 +808,31 @@ private:
   struct InnerState {
     State state;
     AsyncIteratorImpl impl;
+
+    JSG_MEMORY_INFO(InnerState) {
+      if constexpr (MemoryRetainer<State>) {
+        tracker.trackField("state", state);
+      } else {
+        tracker.trackFieldWithSize("state", sizeof(State));
+      }
+      tracker.trackField("impl", impl);
+    }
   };
 
   kj::OneOf<Finished, InnerState> state;
 
   void pushCurrent(jsg::Lock& js, jsg::Promise<void> promise) {
     auto& inner = state.template get<InnerState>();
-    inner.impl.pushCurrent(promise.whenResolved().then(js,
+    inner.impl.pushCurrent(promise.whenResolved(js).then(js,
         [this, self = JSG_THIS](jsg::Lock& js) {
       // If state is Finished, then there's nothing we need to do here.
-      KJ_IF_MAYBE(inner, state.template tryGet<InnerState>()) {
-        inner->impl.popCurrent();
+      KJ_IF_SOME(inner, state.template tryGet<InnerState>()) {
+        inner.impl.popCurrent();
       }
       return js.resolvedPromise();
     }, [this, self = JSG_THIS](jsg::Lock& js, jsg::Value value) {
-      KJ_IF_MAYBE(inner, state.template tryGet<InnerState>()) {
-        inner->impl.popCurrent();
+      KJ_IF_SOME(inner, state.template tryGet<InnerState>()) {
+        inner.impl.popCurrent();
       }
       return js.rejectedPromise<void>(kj::mv(value));
     }));
@@ -825,11 +859,11 @@ private:
             }
             KJ_CASE_ONEOF(inner, InnerState) {
               auto promise = nextFunc(js, inner.state);
-              pushCurrent(js, promise.whenResolved());
+              pushCurrent(js, promise.whenResolved(js));
               return promise.then(js,
                   [this, self = kj::mv(self)](Lock& js, kj::Maybe<Type> maybeResult) mutable {
-                KJ_IF_MAYBE(result, maybeResult) {
-                  return js.resolvedPromise(Next { .done = false, .value = kj::mv(*result) });
+                KJ_IF_SOME(result, maybeResult) {
+                  return js.resolvedPromise(Next { .done = false, .value = kj::mv(result) });
                 } else {
                   state.template init<Finished>();
                   return js.resolvedPromise(Next { .done = true });
@@ -840,9 +874,9 @@ private:
           KJ_UNREACHABLE;
         };
 
-        KJ_IF_MAYBE(current, inner.impl.maybeCurrent()) {
-          auto promise = current->whenResolved().then(js, kj::mv(callNext));
-          pushCurrent(js, promise.whenResolved());
+        KJ_IF_SOME(current, inner.impl.maybeCurrent()) {
+          auto promise = current.whenResolved(js).then(js, kj::mv(callNext));
+          pushCurrent(js, promise.whenResolved(js));
           return kj::mv(promise);
         }
 
@@ -896,8 +930,8 @@ private:
 
         // If there is something on the pending stack, we are going to wait for that promise
         // to resolve then call callReturn.
-        KJ_IF_MAYBE(current, inner.impl.maybeCurrent()) {
-          return current->whenResolved().then(js, kj::mv(callReturn));
+        KJ_IF_SOME(current, inner.impl.maybeCurrent()) {
+          return current.whenResolved(js).then(js, kj::mv(callReturn));
         }
 
         // Otherwise, we call callReturn immediately.
@@ -910,18 +944,6 @@ private:
   friend SelfType;
 };
 
-#define JSG_ITERATOR(Name, Label, Type, State, NextFunc)                                       \
-  class Name final: public jsg::IteratorBase<Name, Type, State> {                              \
-  public:                                                                                       \
-    using jsg::IteratorBase<Name, Type, State>::IteratorBase;                                  \
-    inline Next next(jsg::Lock& js) { return nextImpl(js, NextFunc); }                         \
-    JSG_RESOURCE_TYPE(Name) {                                                                  \
-      JSG_INHERIT_INTRINSIC(v8::kIteratorPrototype);                                           \
-      JSG_METHOD(next);                                                                        \
-      JSG_ITERABLE(self);                                                                      \
-    }                                                                                           \
-  };                                                                                            \
-  jsg::Ref<Name> Label(jsg::Lock&, CompatibilityFlags::Reader featureFlags);
 // The JSG_ITERATOR macro provides a mechanism for easily implementing JavaScript-style iterators
 // for JSG_RESOURCE_TYPES.
 //
@@ -965,6 +987,18 @@ private:
 // A member function named entries(Lock&) will be added to MyApiType that returns a
 // jsg::Ref<MyApiTypeIterator>() instance. It will be necessary for uses to provide the
 // implementation of the entries(Lock&) member function.
+#define JSG_ITERATOR(Name, Label, Type, State, NextFunc)                                        \
+  class Name final: public jsg::IteratorBase<Name, Type, State> {                               \
+  public:                                                                                       \
+    using jsg::IteratorBase<Name, Type, State>::IteratorBase;                                   \
+    inline Next next(jsg::Lock& js) { return nextImpl(js, NextFunc); }                          \
+    JSG_RESOURCE_TYPE(Name) {                                                                   \
+      JSG_INHERIT_INTRINSIC(v8::kIteratorPrototype);                                            \
+      JSG_METHOD(next);                                                                         \
+      JSG_ITERABLE(self);                                                                       \
+    }                                                                                           \
+  };                                                                                            \
+  jsg::Ref<Name> Label(jsg::Lock&);
 
 #define JSG_ASYNC_ITERATOR_TYPE(Name, Type, State, NextFunc, ReturnFunc)                       \
   class Name final: public jsg::AsyncIteratorBase<Name, Type, State> {                         \
@@ -982,14 +1016,6 @@ private:
     }                                                                                           \
   };
 
-#define JSG_ASYNC_ITERATOR(Name, Label, Type, State, NextFunc, ReturnFunc)                     \
-  JSG_ASYNC_ITERATOR_TYPE(Name, Type, State, NextFunc, ReturnFunc)                             \
-  jsg::Ref<Name> Label(jsg::Lock&);
-
-#define JSG_ASYNC_ITERATOR_WITH_OPTIONS(Name, Label, Type, State, NextFunc,                    \
-                                         ReturnFunc, Options)                                   \
-  JSG_ASYNC_ITERATOR_TYPE(Name, Type, State, NextFunc, ReturnFunc)                             \
-  jsg::Ref<Name> Label(jsg::Lock&, jsg::Optional<Options>);
 // The JSG_ASYNC_ITERATOR and JSG_ASYNC_ITERATOR_WITH_OPTIONS macros provide a mechanism for
 // easily implementing JavaScript-style asynchronous iterators for JSG_RESOURCE_TYPES.
 //
@@ -1047,5 +1073,13 @@ private:
 // A member function named entries(Lock&) will be added to MyApiType that returns a
 // jsg::Ref<MyApiTypeIterator>() instance. It will be necessary for uses to provide the
 // implementation of the entries(Lock&) member function.
+#define JSG_ASYNC_ITERATOR(Name, Label, Type, State, NextFunc, ReturnFunc)                     \
+  JSG_ASYNC_ITERATOR_TYPE(Name, Type, State, NextFunc, ReturnFunc)                             \
+  jsg::Ref<Name> Label(jsg::Lock&);
+
+#define JSG_ASYNC_ITERATOR_WITH_OPTIONS(Name, Label, Type, State, NextFunc,                    \
+                                         ReturnFunc, Options)                                   \
+  JSG_ASYNC_ITERATOR_TYPE(Name, Type, State, NextFunc, ReturnFunc)                             \
+  jsg::Ref<Name> Label(jsg::Lock&, jsg::Optional<Options>);
 
 }  // namespace workerd::jsg

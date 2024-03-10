@@ -5,26 +5,30 @@
 #pragma once
 
 #include <workerd/jsg/jsg.h>
-#include "http.h"
+#include "streams.h"
 #include <workerd/io/limit-enforcer.h>
 
 namespace workerd { class IoContext; }
 namespace workerd::api {
 
+// A capability to a KV namespace.
 class KvNamespace: public jsg::Object {
-  // A capability to a KV namespace.
-
 public:
   struct AdditionalHeader {
     kj::String name;
     kj::String value;
+
+    JSG_MEMORY_INFO(AdditionalHeader) {
+      tracker.trackField("name", name);
+      tracker.trackField("value", value);
+    }
   };
 
-  explicit KvNamespace(kj::Array<AdditionalHeader> additionalHeaders, uint subrequestChannel)
-      : additionalHeaders(kj::mv(additionalHeaders)), subrequestChannel(subrequestChannel) {}
   // `subrequestChannel` is what to pass to IoContext::getHttpClient() to get an HttpClient
   // representing this namespace.
   // `additionalHeaders` is what gets appended to every outbound request.
+  explicit KvNamespace(kj::Array<AdditionalHeader> additionalHeaders, uint subrequestChannel)
+      : additionalHeaders(kj::mv(additionalHeaders)), subrequestChannel(subrequestChannel) {}
 
   struct GetOptions {
     jsg::Optional<kj::String> type;
@@ -37,21 +41,27 @@ public:
   };
 
   using GetResult = kj::Maybe<
-      kj::OneOf<jsg::Ref<ReadableStream>, kj::Array<byte>, kj::String, jsg::Value>>;
+      kj::OneOf<jsg::Ref<ReadableStream>,
+                kj::Array<byte>,
+                kj::String,
+                jsg::JsRef<jsg::JsValue>>>;
 
   jsg::Promise<GetResult> get(
       jsg::Lock& js,
       kj::String name,
-      jsg::Optional<kj::OneOf<kj::String, GetOptions>> options);
+      jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
+      CompatibilityFlags::Reader flags);
 
   struct GetWithMetadataResult {
     GetResult value;
-    kj::Maybe<jsg::Value> metadata;
+    kj::Maybe<jsg::JsRef<jsg::JsValue>> metadata;
+    kj::Maybe<jsg::JsRef<jsg::JsValue>> cacheStatus;
 
-    JSG_STRUCT(value, metadata);
+    JSG_STRUCT(value, metadata, cacheStatus);
     JSG_STRUCT_TS_OVERRIDE(KVNamespaceGetWithMetadataResult<Value, Metadata> {
       value: Value | null;
       metadata: Metadata | null;
+      cacheStatus: string | null;
     });
   };
 
@@ -69,25 +79,24 @@ public:
     JSG_STRUCT_TS_OVERRIDE(KVNamespaceListOptions);
   };
 
-  jsg::Promise<jsg::Value> list(jsg::Lock& js, jsg::Optional<ListOptions> options);
+  jsg::Promise<jsg::JsRef<jsg::JsValue>> list(jsg::Lock& js, jsg::Optional<ListOptions> options);
 
+  // Optional parameter for passing options into a Fetcher::put. Initially
+  // intended for supporting expiration times in KV bindings.
   struct PutOptions {
-    // Optional parameter for passing options into a Fetcher::put. Initially
-    // intended for supporting expiration times in KV bindings.
-
     jsg::Optional<int> expiration;
     jsg::Optional<int> expirationTtl;
-    jsg::Optional<kj::Maybe<jsg::Value>> metadata;
+    jsg::Optional<kj::Maybe<jsg::JsRef<jsg::JsValue>>> metadata;
 
     JSG_STRUCT(expiration, expirationTtl, metadata);
     JSG_STRUCT_TS_OVERRIDE(KVNamespacePutOptions);
   };
 
-  using PutBody = kj::OneOf<kj::String, v8::Local<v8::Object>>;
   // We can't just list the supported types in this OneOf because if we did then arbitrary objects
   // would get coerced into meaningless strings like "[object Object]". Instead we first use this
   // OneOf to differentiate between primitives and objects, and check the object for the types that
   // we specifically support later.
+  using PutBody = kj::OneOf<kj::String, jsg::JsObject>;
 
   using PutSupportedTypes = kj::OneOf<kj::String, kj::Array<byte>, jsg::Ref<ReadableStream>>;
 
@@ -116,8 +125,8 @@ public:
         metadata?: Metadata;
       }
       type KVNamespaceListResult<Metadata, Key extends string = string> =
-        | { list_complete: false; keys: KVNamespaceListKey<Metadata, Key>[]; cursor: string; }
-        | { list_complete: true; keys: KVNamespaceListKey<Metadata, Key>[]; };
+        | { list_complete: false; keys: KVNamespaceListKey<Metadata, Key>[]; cursor: string; cacheStatus: string | null; }
+        | { list_complete: true; keys: KVNamespaceListKey<Metadata, Key>[]; cacheStatus: string | null; };
     );
     // `Metadata` before `Key` type parameter for backwards-compatibility with `workers-types@3`.
     // `Key` is also an optional type parameter, which must come after required parameters.
@@ -151,18 +160,22 @@ public:
     });
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const  {
+    tracker.trackField("additionalHeaders", additionalHeaders.asPtr());
+  }
+
 protected:
-  kj::Own<kj::HttpClient> getHttpClient(
-      IoContext& context,
-      kj::HttpHeaders& headers,
-      kj::OneOf<LimitEnforcer::KvOpType, kj::StringPtr> opTypeOrName,
-      kj::StringPtr urlStr
-  );
   // Do the boilerplate work of constructing an HTTP client to KV. Setting a KvOptType causes
   // the limiter for that op type to be checked. If a string is used, that's used as the operation
   // name for the HttpClient without any limiter enforcement.
   // NOTE: The urlStr is added to the headers as a non-owning reference and thus must outlive
   // the usage of the headers.
+  kj::Own<kj::HttpClient> getHttpClient(
+      IoContext& context,
+      kj::HttpHeaders& headers,
+      kj::OneOf<LimitEnforcer::KvOpType, kj::LiteralStringConst> opTypeOrName,
+      kj::StringPtr urlStr
+  );
 
 private:
   kj::Array<AdditionalHeader> additionalHeaders;

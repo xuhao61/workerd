@@ -29,7 +29,8 @@ public:
   v8::Local<v8::Promise> wrap(
       v8::Local<v8::Context> context, kj::Maybe<v8::Local<v8::Object>> creator,
       kj::Promise<T> promise) {
-    auto jsPromise = IoContext::current().awaitIoLegacy(kj::mv(promise));
+    auto& js = jsg::Lock::from(context->GetIsolate());
+    auto jsPromise = IoContext::current().awaitIoLegacy(js, kj::mv(promise));
     return static_cast<Self&>(*this).wrap(context, kj::mv(creator), kj::mv(jsPromise));
   }
 
@@ -39,8 +40,9 @@ public:
         kj::Maybe<v8::Local<v8::Object>> parentObject) {
     auto& wrapper = static_cast<Self&>(*this);
     auto jsPromise = KJ_UNWRAP_OR_RETURN(wrapper.tryUnwrap(
-        context, handle, (jsg::Promise<T>*)nullptr, parentObject), nullptr);
-    return IoContext::current().awaitJs(kj::mv(jsPromise));
+        context, handle, (jsg::Promise<T>*)nullptr, parentObject), kj::none);
+    auto& js = jsg::Lock::from(context->GetIsolate());
+    return IoContext::current().awaitJs(js, kj::mv(jsPromise));
   }
 
   template <typename T>

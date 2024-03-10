@@ -58,7 +58,7 @@ namespace workerd {
 const capnp::TextCodec TEXT_CODEC;
 
 kj::String canonicalizeCapnpText(capnp::StructSchema schema, kj::StringPtr text,
-                                 kj::Maybe<kj::StringPtr> capName = nullptr);
+                                 kj::Maybe<kj::StringPtr> capName = kj::none);
 
 class MockClient: public capnp::DynamicCapability::Client {
 public:
@@ -85,7 +85,7 @@ public:
         KJ_FAIL_ASSERT_AT(location, "expected call to throw exception but instead it returned",
             expectedType, expectedMessageSubstring);
       }, [&](kj::Exception&& e) {
-        KJ_ASSERT_AT(kj::_::hasSubstring(e.getDescription(), expectedMessageSubstring), location,
+        KJ_ASSERT_AT(e.getDescription().contains(expectedMessageSubstring), location,
             expectedMessageSubstring, e);
         KJ_ASSERT_AT(e.getType() == expectedType, location, e);
       }).wait(ws);
@@ -102,11 +102,10 @@ public:
   }
 };
 
+// Infrastructure to mock a capability!
+//
+// TODO(cleanup): This should obviously go in Cap'n Proto!
 class MockServer: public kj::Refcounted {
-  // Infrastructure to mock a capability!
-  //
-  // TODO(cleanup): This should obviously go in Cap'n Proto!
-
   struct ReceivedCall;
 public:
   MockServer(capnp::InterfaceSchema schema): schema(schema) {}
@@ -130,17 +129,17 @@ public:
       received.expectedCall = this;
     }
     ExpectedCall(ExpectedCall&& other): maybeReceived(kj::mv(other.maybeReceived)) {
-      KJ_IF_MAYBE(r, maybeReceived) r->expectedCall = *this;
+      KJ_IF_SOME(r, maybeReceived) r.expectedCall = *this;
     }
     ~ExpectedCall() noexcept(false) {
-      KJ_IF_MAYBE(r, maybeReceived) {
-        KJ_ASSERT(&KJ_ASSERT_NONNULL(r->expectedCall) == this);
-        r->expectedCall = nullptr;
+      KJ_IF_SOME(r, maybeReceived) {
+        KJ_ASSERT(&KJ_ASSERT_NONNULL(r.expectedCall) == this);
+        r.expectedCall = nullptr;
       }
     }
 
     ExpectedCall withParams(kj::StringPtr paramsText,
-                            kj::Maybe<kj::StringPtr> capName = nullptr,
+                            kj::Maybe<kj::StringPtr> capName = kj::none,
                             kj::SourceLocation location = {}) &&
                             KJ_WARN_UNUSED_RESULT {
       // Expect that the call had the given parameters.
@@ -156,36 +155,33 @@ public:
       return kj::mv(*this);
     }
 
+    // Helper for cases where the received call is expected to invoke some callback capability.
+    //
+    // Expect that the params contain a field named `callbackName` whose type is an interface.
+    // `func()` will be invoked and passed a `MockClient` representing this capability. It can
+    // then invoke the callback as it seems fit.
+    //
+    // Note that it's explicitly OK if `func` captures a `WaitScope` and uses it. In this way,
+    // the incoming call can be delayed from returning until the callback completes.
     template <typename Func>
     ExpectedCall useCallback(kj::StringPtr callbackName, Func&& func,
                              kj::SourceLocation location = {}) && KJ_WARN_UNUSED_RESULT {
-      // Helper for cases where the received call is expected to invoke some callback capability.
-      //
-      // Expect that the params contain a field named `callbackName` whose type is an interface.
-      // `func()` will be invoked and passed a `MockClient` representing this capability. It can
-      // then invoke the callback as it seems fit.
-      //
-      // Note that it's explicitly OK if `func` captures a `WaitScope` and uses it. In this way,
-      // the incoming call can be delayed from returning until the callback completes.
-
       auto& received = getReceived(location);
       func(received.context.getParams().get(callbackName).as<capnp::DynamicCapability>());
       return kj::mv(*this);
     }
 
+    // Causes the method to return the given result message, which is parsed from text.
     void thenReturn(kj::StringPtr message, kj::SourceLocation location = {}) && {
-      // Causes the method to return the given result message, which is parsed from text.
-
       auto& received = getReceived(location);
       TEXT_CODEC.decode(message, received.context.getResults());
       received.fulfiller.fulfill();
     }
 
+    // Causes the method to return the given result message, which is parsed from text.
+    // All capabilities in the result message will be filled in, with MockServer instances
+    // returned in the hashmap.
     kj::HashMap<kj::String, kj::Own<MockServer>> thenReturnWithMocks(kj::StringPtr message, kj::SourceLocation location = {}) && {
-      // Causes the method to return the given result message, which is parsed from text.
-      // All capabilities in the result message will be filled in, with MockServer instances
-      // returned in the hashmap.
-
       auto& received = getReceived(location);
       auto callResults = received.context.getResults();
       auto results = kj::HashMap<kj::String, kj::Own<MockServer>>();
@@ -203,18 +199,16 @@ public:
       return kj::mv(results);
     }
 
+    // Causes the method to throw an exception
     void thenThrow(kj::Exception&& e, kj::SourceLocation location = {}) && {
-      // Causes the method to throw an exception
-
       auto& received = getReceived(location);
       received.fulfiller.reject(kj::mv(e));
     }
 
+    // Return a new mock capability. The method result type is expected to contain a single
+    // field with the given name whose type is an interface type. It will be filled in with a
+    // new mock object, and the MockServer is returned in order to set further expectations.
     kj::Own<MockServer> returnMock(kj::StringPtr fieldName, kj::SourceLocation location = {}) && {
-      // Return a new mock capability. The method result type is expected to contain a single
-      // field with the given name whose type is an interface type. It will be filled in with a
-      // new mock object, and the MockServer is returned in order to set further expectations.
-
       auto& received = getReceived(location);
       auto field = received.method.getResultType().getFieldByName(fieldName);
       auto result = kj::refcounted<MockServer>(field.getType().asInterface());
@@ -224,7 +218,7 @@ public:
     }
 
     void expectCanceled(kj::SourceLocation location = {}) {
-      KJ_ASSERT_AT(maybeReceived == nullptr, location, "call has not been canceled");
+      KJ_ASSERT_AT(maybeReceived == kj::none, location, "call has not been canceled");
     }
 
   private:
@@ -287,16 +281,16 @@ private:
                  capnp::CallContext<capnp::DynamicStruct, capnp::DynamicStruct> context)
         : fulfiller(fulfiller), mock(mock), method(method), context(kj::mv(context)) {
       mock.receivedCalls.add(*this);
-      KJ_IF_MAYBE(w, mock.waiter) {
-        w->get()->fulfill();
+      KJ_IF_SOME(w, mock.waiter) {
+        w.get()->fulfill();
       }
     }
     ~ReceivedCall() noexcept(false) {
       if (link.isLinked()) {
         mock.receivedCalls.remove(*this);
       }
-      KJ_IF_MAYBE(e, expectedCall) {
-        e->maybeReceived = nullptr;
+      KJ_IF_SOME(e, expectedCall) {
+        e.maybeReceived = nullptr;
       }
     }
     KJ_DISALLOW_COPY_AND_MOVE(ReceivedCall);
@@ -318,7 +312,7 @@ private:
       auto paf = kj::newPromiseAndFulfiller<void>();
       waiter = kj::mv(paf.fulfiller);
       if (!paf.promise.poll(waitScope)) {
-        waiter = nullptr;
+        waiter = kj::none;
         return false;
       }
       paf.promise.wait(waitScope);
@@ -333,8 +327,8 @@ private:
           mock(kj::addRef(mock)) {}
     ~Server() noexcept(false) {
       mock->dropped = true;
-      KJ_IF_MAYBE(w, mock->waiter) {
-        w->get()->fulfill();
+      KJ_IF_SOME(w, mock->waiter) {
+        w.get()->fulfill();
       }
     }
 
@@ -348,10 +342,10 @@ private:
   };
 };
 
-#define CAPNP(...) ("(" #__VA_ARGS__ ")"_kj)
 // Wraps a "capnp struct literal". This actually just stringifies the arguments, adding enclosing
 // parentheses. The nice thing about it, though, is that you don't have to escape quotes inside
 // the literal.
+#define CAPNP(...) ("(" #__VA_ARGS__ ")"_kj)
 
 template<typename Schema, typename InitFunc>
 kj::String Capnp(InitFunc func) {

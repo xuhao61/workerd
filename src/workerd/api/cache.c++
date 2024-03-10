@@ -36,22 +36,23 @@ constexpr auto CACHE_API_PREVIEW_WARNING =
 //   } \
 // })
 
+// Throw an application-visible exception if the URL won't be parsed correctly at a lower
+// layer. If the URL is valid then just return it. The purpose of this function is to avoid
+// throwing an "internal error".
 kj::StringPtr validateUrl(kj::StringPtr url) {
-  // Throw an application-visible exception if the URL won't be parsed correctly at a lower
-  // layer. If the URL is valid then just return it. The purpose of this function is to avoid
-  // throwing an "internal error".
-
   // TODO(bug): We should parse and process URLs the same way we would URLs passed to fetch().
   //   But, that might mean e.g. discarding fragments ("hashes", stuff after a '#'), which would
   //   be a change in behavior that could subtly affect production workers...
 
-  constexpr auto urlOptions = kj::Url::Options { .percentDecode = false, .allowEmpty = true };
-  KJ_IF_MAYBE(parsed, kj::Url::tryParse(url, kj::Url::HTTP_PROXY_REQUEST, urlOptions)) {
-    return url;
-  } else {
-    JSG_FAIL_REQUIRE(TypeError,
-                      "Invalid URL. Cache API keys must be fully-qualified, valid URLs.");
-  }
+  static constexpr auto urlOptions = kj::Url::Options {
+    .percentDecode = false,
+    .allowEmpty = true,
+  };
+
+  JSG_REQUIRE(kj::Url::tryParse(url, kj::Url::HTTP_PROXY_REQUEST, urlOptions) != kj::none,
+              TypeError, "Invalid URL. Cache API keys must be fully-qualified, valid URLs.");
+
+  return url;
 }
 
 }  // namespace
@@ -67,27 +68,26 @@ jsg::Unimplemented Cache::addAll(kj::Array<Request::Info> requests) {
 }
 
 jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
-    jsg::Lock& js, Request::Info requestOrUrl, jsg::Optional<CacheQueryOptions> options,
-    CompatibilityFlags::Reader flags) {
+    jsg::Lock& js, Request::Info requestOrUrl, jsg::Optional<CacheQueryOptions> options) {
   // TODO(someday): Implement Cache API in preview.
   auto& context = IoContext::current();
   if (context.isFiddle()) {
     context.logWarningOnce(CACHE_API_PREVIEW_WARNING);
-    return js.resolvedPromise(jsg::Optional<jsg::Ref<Response>>(nullptr));
+    return js.resolvedPromise(jsg::Optional<jsg::Ref<Response>>());
   }
 
   // This use of evalNow() is obsoleted by the capture_async_api_throws compatibility flag, but
   // we need to keep it here for people who don't have that flag set.
   return js.evalNow([&]() -> jsg::Promise<jsg::Optional<jsg::Ref<Response>>> {
-    auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), nullptr);
+    auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), kj::none);
 
     if (!options.orDefault({}).ignoreMethod.orDefault(false) &&
         jsRequest->getMethodEnum() != kj::HttpMethod::GET) {
-      return js.resolvedPromise(jsg::Optional<jsg::Ref<Response>>(nullptr));
+      return js.resolvedPromise(jsg::Optional<jsg::Ref<Response>>());
     }
 
     auto httpClient = getHttpClient(context, jsRequest->serializeCfBlobJson(js),
-                                    "cache_match"_kj);
+                                    "cache_match"_kjc);
     auto requestHeaders = kj::HttpHeaders(context.getHeaderTable());
     jsRequest->shallowCopyHeadersTo(requestHeaders);
     requestHeaders.set(context.getHeaderIds().cacheControl, "only-if-cached");
@@ -95,14 +95,14 @@ jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
         kj::HttpMethod::GET, validateUrl(jsRequest->getUrl()), requestHeaders, uint64_t(0));
 
     return context.awaitIo(js, kj::mv(nativeRequest.response),
-        [httpClient = kj::mv(httpClient), &context, flags = kj::mv(flags)]
+        [httpClient = kj::mv(httpClient), &context]
         (jsg::Lock& js, kj::HttpClient::Response&& response)
         mutable -> jsg::Optional<jsg::Ref<Response>> {
       response.body = response.body.attach(kj::mv(httpClient));
 
       kj::StringPtr cacheStatus;
-      KJ_IF_MAYBE(cs, response.headers->get(context.getHeaderIds().cfCacheStatus)) {
-        cacheStatus = *cs;
+      KJ_IF_SOME(cs, response.headers->get(context.getHeaderIds().cfCacheStatus)) {
+        cacheStatus = cs;
       } else {
         // This is an internal error representing a violation of the contract between us and
         // the cache. Since it is always conformant to return undefined from Cache::match()
@@ -110,7 +110,7 @@ jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
         // script fail. However, it might be indicative of a larger problem, and should be
         // investigated.
         LOG_CACHE_ERROR_ONCE("Response to Cache API GET has no CF-Cache-Status: ", response);
-        return nullptr;
+        return kj::none;
       }
 
       // The status code should be a 504 on cache miss, but we need to rely on CF-Cache-Status
@@ -123,52 +123,51 @@ jsg::Promise<jsg::Optional<jsg::Ref<Response>>> Cache::match(
       //   this URL result in a 200, causing us to return true from Cache::delete_()? If so, that's
       //   a small inconsistency: we shouldn't have a match failure but a delete success.
       if (cacheStatus == "MISS" || cacheStatus == "EXPIRED" || cacheStatus == "UPDATING") {
-        return nullptr;
+        return kj::none;
       } else if (cacheStatus != "HIT") {
         // Another internal error. See above comment where we retrieve the CF-Cache-Status header.
         LOG_CACHE_ERROR_ONCE("Response to Cache API GET has invalid CF-Cache-Status: ", response);
-        return nullptr;
+        return kj::none;
       }
 
       return makeHttpResponse(
           js, kj::HttpMethod::GET, {},
           response.statusCode, response.statusText, *response.headers,
-          kj::mv(response.body), nullptr, flags);
+          kj::mv(response.body), kj::none);
     });
   });
 }
 
-jsg::Promise<void> Cache::put(
-    jsg::Lock& js, Request::Info requestOrUrl, jsg::Ref<Response> jsResponse) {
-  // Send a PUT request to the cache whose URL is the original request URL and whose body is the
-  // HTTP response we'd like to cache for that request.
-  //
-  // The HTTP response in the PUT request body (the "PUT payload") must itself be an HTTP message,
-  // except that it MUST NOT have chunked encoding applied to it, even if it has a
-  // Transfer-Encoding: chunked header. To be clear, the PUT request itself may be chunked, but it
-  // must not have any nested chunked encoding.
-  //
-  // In order to extract the response's data to serialize it, we'll need to call
-  // `jsResponse->send()`, which will properly encode the response's body if a Content-Encoding
-  // header is present. This means we'll need to create an instance of kj::HttpService::Response.
+// Send a PUT request to the cache whose URL is the original request URL and whose body is the
+// HTTP response we'd like to cache for that request.
+//
+// The HTTP response in the PUT request body (the "PUT payload") must itself be an HTTP message,
+// except that it MUST NOT have chunked encoding applied to it, even if it has a
+// Transfer-Encoding: chunked header. To be clear, the PUT request itself may be chunked, but it
+// must not have any nested chunked encoding.
+//
+// In order to extract the response's data to serialize it, we'll need to call
+// `jsResponse->send()`, which will properly encode the response's body if a Content-Encoding
+// header is present. This means we'll need to create an instance of kj::HttpService::Response.
+jsg::Promise<void> Cache::put(jsg::Lock& js, Request::Info requestOrUrl,
+    jsg::Ref<Response> jsResponse, CompatibilityFlags::Reader flags) {
 
+  // Fake kj::HttpService::Response implementation that allows us to reuse jsResponse->send() to
+  // serialize the response (headers + body) in the format needed to serve as the payload of
+  // our cache PUT request.
   class ResponseSerializer final: public kj::HttpService::Response {
-    // Fake kj::HttpService::Response implementation that allows us to reuse jsResponse->send() to
-    // serialize the response (headers + body) in the format needed to serve as the payload of
-    // our cache PUT request.
-
   public:
     struct Payload {
-      kj::Own<kj::AsyncInputStream> stream;
       // The serialized form of the response to be cached. This stream itself contains a full
       // HTTP response, with headers and body, representing the content of jsResponse to be written
       // to the cache.
+      kj::Own<kj::AsyncInputStream> stream;
 
-      kj::Promise<void> writeHeadersPromise;
       // A promise which resolves once the payload's headers have been written. Normally, this
       // couldn't possibly resolve until the body has been written, and jsRepsonse->send() won't
       // complete until then -- except if the body is empty, in which case jsResponse->send() may
       // return immediately.
+      kj::Promise<void> writeHeadersPromise;
     };
 
     Payload getPayload() {
@@ -182,8 +181,8 @@ jsg::Promise<void> Cache::put(
       kj::String contentLength;
 
       kj::StringPtr connectionHeaders[kj::HttpHeaders::CONNECTION_HEADERS_COUNT];
-      KJ_IF_MAYBE(ebs, expectedBodySize) {
-        contentLength = kj::str(*ebs);
+      KJ_IF_SOME(ebs, expectedBodySize) {
+        contentLength = kj::str(ebs);
         connectionHeaders[kj::HttpHeaders::BuiltinIndices::CONTENT_LENGTH] = contentLength;
       } else {
         connectionHeaders[kj::HttpHeaders::BuiltinIndices::TRANSFER_ENCODING] = "chunked";
@@ -210,12 +209,15 @@ jsg::Promise<void> Cache::put(
       // which will have to be awaited separately.
       auto payloadPipe = kj::newOneWayPipe(expectedPayloadSize);
 
-      auto headersPromises =
-          payloadPipe.out->write(serializedHeaders.begin(), serializedHeaders.size())
-          .then([serializedHeaders = kj::mv(serializedHeaders),
-                 payloadOut = kj::mv(payloadPipe.out)]() mutable {
-        return kj::tuple(kj::mv(payloadOut), false);
-      }).split();
+      static auto constexpr handleHeaders = [](kj::Own<kj::AsyncOutputStream> out,
+                                               kj::String serializedHeaders)
+          -> kj::Promise<kj::Tuple<kj::Own<kj::AsyncOutputStream>, bool>> {
+        co_await out->write(serializedHeaders.begin(), serializedHeaders.size());
+        co_return kj::tuple(kj::mv(out), false);
+      };
+
+      auto headersPromises = handleHeaders(kj::mv(payloadPipe.out),
+                                           kj::mv(serializedHeaders)).split();
 
       payload = Payload {
         .stream = kj::mv(payloadPipe.in),
@@ -235,7 +237,7 @@ jsg::Promise<void> Cache::put(
   // This use of evalNow() is obsoleted by the capture_async_api_throws compatibility flag, but
   // we need to keep it here for people who don't have that flag set.
   return js.evalNow([&] {
-    auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), nullptr);
+    auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), kj::none);
 
     // TODO(conform): Require that jsRequest's url has an http or https scheme. This is only
     //   important if api::Request is changed to parse its URL eagerly (as required by spec), rather
@@ -248,8 +250,8 @@ jsg::Promise<void> Cache::put(
         TypeError, "Cannot cache response to a range request (206 Partial Content).");
 
     auto responseHeadersRef = jsResponse->getHeaders(js);
-    KJ_IF_MAYBE(vary, responseHeadersRef->get(jsg::ByteString(kj::str("vary")))) {
-      JSG_REQUIRE(vary->findFirst('*') == nullptr,
+    KJ_IF_SOME(vary, responseHeadersRef->get(jsg::ByteString(kj::str("vary")))) {
+      JSG_REQUIRE(vary.findFirst('*') == kj::none,
           TypeError, "Cannot cache response with 'Vary: *' header.");
     }
 
@@ -278,7 +280,7 @@ jsg::Promise<void> Cache::put(
     // We need to send the response to our serializer immediately in order to fulfill Cache.put()'s
     // contract: the caller should be able to observe that the response body is disturbed as soon
     // as put() returns.
-    auto serializePromise = jsResponse->send(js, serializer, {}, nullptr);
+    auto serializePromise = jsResponse->send(js, serializer, {}, kj::none);
     auto payload = serializer.getPayload();
 
     // TODO(someday): Implement Cache API in preview. This bail-out lives all the way down here,
@@ -296,8 +298,8 @@ jsg::Promise<void> Cache::put(
     auto makeCachePutStream = [&context, stream = kj::mv(payload.stream)](jsg::Lock& js) mutable {
       return context.makeCachePutStream(js, kj::mv(stream));
     };
-    KJ_IF_MAYBE(p, context.waitForOutputLocksIfNecessary()) {
-      startStreamPromise = context.awaitIo(js, kj::mv(*p), kj::mv(makeCachePutStream));
+    KJ_IF_SOME(p, context.waitForOutputLocksIfNecessary()) {
+      startStreamPromise = context.awaitIo(js, kj::mv(p), kj::mv(makeCachePutStream));
     } else {
       startStreamPromise = makeCachePutStream(js);
     }
@@ -308,7 +310,7 @@ jsg::Promise<void> Cache::put(
          writePayloadHeadersPromise = kj::mv(payload.writeHeadersPromise)]
         (jsg::Lock& js, kj::Maybe<IoOwn<kj::AsyncInputStream>> maybeStream) mutable
         -> jsg::Promise<void> {
-      if (maybeStream == nullptr) {
+      if (maybeStream == kj::none) {
         // Cache API PUT quota must have been exceeded.
         return js.resolvedPromise();
       }
@@ -317,7 +319,7 @@ jsg::Promise<void> Cache::put(
 
       // Make the PUT request to cache.
       auto httpClient = getHttpClient(context, jsRequest->serializeCfBlobJson(js),
-                                      "cache_put"_kj);
+                                      "cache_put"_kjc);
       auto requestHeaders = kj::HttpHeaders(context.getHeaderTable());
       jsRequest->shallowCopyHeadersTo(requestHeaders);
       auto nativeRequest = httpClient->request(
@@ -325,14 +327,18 @@ jsg::Promise<void> Cache::put(
           requestHeaders, payloadStream->tryGetLength());
 
       auto pumpRequestBodyPromise = payloadStream->pumpTo(*nativeRequest.body)
-          .ignoreResult()
+          .ignoreResult();
           // NOTE: We don't attach nativeRequest.body here because we want to control its
           //   destruction timing in the event of an error; see below.
-          .attach(kj::mv(payloadStream));
 
-      // Weird: It's important that these objects be torn down in the right order (specifically,
-      // reverse order). Lambda captures do not specify destruction ordering, so let's wrap them
-      // into a struct.
+      // The next step is a bit complicated as it occurs in two separate async flows.
+      // First, we await the serialization promise, then enter "deferred proxying" by issuing
+      // `KJ_CO_MAGIC BEGIN_DEFERRED_PROXYING` from our coroutine. Everything after that
+      // `KJ_CO_MAGIC` constitutes the second async flow that actually handles the request and
+      // response.
+      //
+      // Weird: It's important that these objects be torn down in the right order and that the
+      // DeferredProxy promise is handled separately from the inner promise.
       //
       // Moreover, there is an interesting property: In the event that `httpClient` is destroyed
       // immediately after `bodyStream` (i.e. without returning to the KJ event loop in between),
@@ -347,23 +353,6 @@ jsg::Promise<void> Cache::put(
       // important to us that we don't write incomplete cache entries, so we rely on this hack for
       // now. See EW-812 for the broader problem.
       //
-      // In short: If the PutInfo is destroyed all at once, then no terminal chunk will be written,
-      // and the cache will know not to commit the entry. If we destroy `bodyStream` and then
-      // actually wait for `responsePromise` to complete before destroying `httpClient`, then the
-      // terminal chunk is written.
-      struct PutInfo {
-        kj::Own<kj::HttpClient> httpClient;
-        kj::Promise<kj::HttpClient::Response> responsePromise;
-        kj::Own<kj::AsyncOutputStream> bodyStream;
-        kj::Promise<void> pumpRequestBodyPromise;
-      };
-      PutInfo putInfo {
-        kj::mv(httpClient),
-        kj::mv(nativeRequest.response),
-        kj::mv(nativeRequest.body),
-        kj::mv(pumpRequestBodyPromise)
-      };
-
       // A little funky: The process of "serializing" the cache entry payload means reading all the
       // data from the payload body stream and writing it to cache. But, the payload body might
       // originate from the app's own JavaScript, rather than being the response to some remote
@@ -397,51 +386,95 @@ jsg::Promise<void> Cache::put(
       // will properly treat it as pending I/O, but only *after* the outer promise completes. This
       // gets us everything we want.
       //
-      // Hence, what you see here: we do serializePromise.then() and, inside there, add all our
-      // additional work onto the inner "deferred proxy" promise. Then we `awaitDeferredProxy()`
-      // the whole thing.
-      return context.awaitDeferredProxy(serializePromise
-          .then([putInfo = kj::mv(putInfo),
-                 writePayloadHeadersPromise = kj::mv(writePayloadHeadersPromise)]
-                (DeferredProxy<void> deferred) mutable {
-        return DeferredProxy<void> { deferred.proxyTask
-            .then([writePayloadHeadersPromise = kj::mv(writePayloadHeadersPromise)]() mutable {
+      // Hence, what you see here: we first await the serializePromise, then enter deferred proxying
+      // with our magic `KJ_CO_MAGIC`, then perform all our additional work. Then we
+      // `awaitDeferredProxy()` the whole thing.
+
+      // Here we handle the promise for the DeferredProxy itself.
+      static auto constexpr handleSerialize = [](
+          kj::Promise<DeferredProxy<void>> serialize,
+          kj::Own<kj::HttpClient> httpClient,
+          kj::Promise<kj::HttpClient::Response> responsePromise,
+          kj::Own<kj::AsyncOutputStream> bodyStream,
+          kj::Promise<void> pumpRequestBodyPromise,
+          kj::Promise<void> writePayloadHeadersPromise,
+          kj::Own<kj::AsyncInputStream> payloadStream)
+              -> kj::Promise<DeferredProxy<void>> {
+        // This is extremely odd and a bit annoying but we have to make sure
+        // these are destroyed in a particular order due to cross-dependencies
+        // for each. If the kj::Promise returned by handleSerialize is dropped
+        // before the co_await serialize completes, then these won't ever be
+        // moved away into the handleResponse method (which ensures proper
+        // cleanup order). In such a case, we explicitly layout a cleanup order
+        // here to make it clear.
+        // Note: we could do this by ordering the arguments in a particular way,
+        // or by doing what a previous iteration of this code did and put everything
+        // into a struct in a particular order but pulling things out like this makes
+        // what is going on here much more intentional and explicit.
+        //
+        // If these are not cleaned up in the right order, there can be subtle
+        // use-after-free issues reported by asan and certain flows can end up
+        // hanging.
+        KJ_DEFER({
+          pumpRequestBodyPromise = nullptr;
+          payloadStream = nullptr;
+          bodyStream = nullptr;
+          responsePromise = nullptr;
+          writePayloadHeadersPromise = nullptr;
+          httpClient = nullptr;
+        });
+        try {
+          auto deferred = co_await serialize;
+
+          // With our `serialize` promise having resolved to a DeferredProxy, we can now enter
+          // deferred proxying ourselves.
+          KJ_CO_MAGIC BEGIN_DEFERRED_PROXYING;
+
+          co_await deferred.proxyTask;
           // Make sure headers get written even if the body was empty -- see comments earlier.
-          return kj::mv(writePayloadHeadersPromise);
-        }).then([pumpRequestBodyPromise = kj::mv(putInfo.pumpRequestBodyPromise)]() mutable {
+          co_await writePayloadHeadersPromise;
           // Make sure the request body is done being pumped and had no errors. If serialization
           // completed successfully, then this should also complete immediately thereafter.
-          return kj::mv(pumpRequestBodyPromise);
-        }).then([putInfo = kj::mv(putInfo)]() mutable -> kj::Promise<void> {
-          // Wait for the response from the cache.
-          return putInfo.responsePromise
-              .then([httpClient = kj::mv(putInfo.httpClient)]
-                    (kj::HttpClient::Response putResponse) {
-            // We expect to see either 204 (success) or 413 (failure). Any other status code is a
-            // violation of the contract between us and the cache, and is an internal
-            // error, which we log. However, there's no need to throw, since the Cache API is an
-            // ephemeral K/V store, and we never guaranteed the script we'd actually cache anything.
-            if (putResponse.statusCode != 204 && putResponse.statusCode != 413) {
-              LOG_CACHE_ERROR_ONCE(
-                  "Response to Cache API PUT was neither 204 nor 413: ", putResponse);
-            }
-          });
-        }).catch_([](kj::Exception&& e) {
-          if (e.getType() != kj::Exception::Type::DISCONNECTED) {
-            kj::throwFatalException(kj::mv(e));
-          } else {
-            // If the origin or the cache disconnected, we don't treat this as an error, as put()
-            // doesn't guarantee that it stores anything anyway.
-            //
-            // TODO(someday): I (Kenton) don't undestand why we'd explicitly want to hide this
-            //   error, even though hiding it is technically not a violation of the contract. To me
-            //   this seems undesirable, especially when it was the origin that failed. The caller
-            //   can always choose to ignore errors if they want (and many do, by passing to
-            //   waitUntil()). However, there is at least one test which depends on this behavior,
-            //   and probably production Workers in the wild, so I'm not changing it for now.
+          co_await pumpRequestBodyPromise;
+          // It is important to destroy the bodyStream before actually waiting on the
+          // responsePromise to ensure that the terminal chunk is written since the bodyStream
+          // may only write the terminal chunk in the streams destructor.
+          bodyStream = nullptr;
+          payloadStream = nullptr;
+          auto response = co_await responsePromise;
+          // We expect to see either 204 (success) or 413 (failure). Any other status code is a
+          // violation of the contract between us and the cache, and is an internal
+          // error, which we log. However, there's no need to throw, since the Cache API is an
+          // ephemeral K/V store, and we never guaranteed the script we'd actually cache anything.
+          if (response.statusCode != 204 && response.statusCode != 413) {
+            LOG_CACHE_ERROR_ONCE(
+                "Response to Cache API PUT was neither 204 nor 413: ", response);
           }
-        })};
-      }));
+        } catch (...) {
+          auto exception = kj::getCaughtExceptionAsKj();
+          if (exception.getType() != kj::Exception::Type::DISCONNECTED) {
+            kj::throwFatalException(kj::mv(exception));
+          }
+          // If the origin or the cache disconnected, we don't treat this as an error, as put()
+          // doesn't guarantee that it stores anything anyway.
+          //
+          // TODO(someday): I (Kenton) don't undestand why we'd explicitly want to hide this
+          //   error, even though hiding it is technically not a violation of the contract. To me
+          //   this seems undesirable, especially when it was the origin that failed. The caller
+          //   can always choose to ignore errors if they want (and many do, by passing to
+          //   waitUntil()). However, there is at least one test which depends on this behavior,
+          //   and probably production Workers in the wild, so I'm not changing it for now.
+        }
+      };
+
+      return context.awaitDeferredProxy(js, handleSerialize(
+          kj::mv(serializePromise),
+          kj::mv(httpClient),
+          kj::mv(nativeRequest.response),
+          kj::mv(nativeRequest.body),
+          kj::mv(pumpRequestBodyPromise),
+          kj::mv(writePayloadHeadersPromise),
+          kj::mv(payloadStream)));
     }));
   });
 }
@@ -458,7 +491,7 @@ jsg::Promise<bool> Cache::delete_(
   // This use of evalNow() is obsoleted by the capture_async_api_throws compatibility flag, but
   // we need to keep it here for people who don't have that flag set.
   return js.evalNow([&]() -> jsg::Promise<bool> {
-    auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), nullptr);
+    auto jsRequest = Request::coerce(js, kj::mv(requestOrUrl), kj::none);
 
     if (!options.orDefault({}).ignoreMethod.orDefault(false) &&
         jsRequest->getMethodEnum() != kj::HttpMethod::GET) {
@@ -468,7 +501,7 @@ jsg::Promise<bool> Cache::delete_(
     // Make the PURGE request to cache.
 
     auto httpClient = getHttpClient(context, jsRequest->serializeCfBlobJson(js),
-                                    "cache_delete"_kj);
+                                    "cache_delete"_kjc);
     auto requestHeaders = kj::HttpHeaders(context.getHeaderTable());
     jsRequest->shallowCopyHeadersTo(requestHeaders);
     // HACK: The cache doesn't permit PURGE requests from the outside world. It does this by
@@ -481,9 +514,9 @@ jsg::Promise<bool> Cache::delete_(
     auto nativeRequest = httpClient->request(
         kj::HttpMethod::PURGE, validateUrl(jsRequest->getUrl()), requestHeaders, uint64_t(0));
 
-    return context.awaitIo(kj::mv(nativeRequest.response),
+    return context.awaitIo(js, kj::mv(nativeRequest.response),
         [httpClient = kj::mv(httpClient)]
-        (kj::HttpClient::Response&& response) -> bool {
+        (jsg::Lock&, kj::HttpClient::Response&& response) -> bool {
       if (response.statusCode == 200) {
         return true;
       } else if (response.statusCode == 404) {
@@ -501,8 +534,8 @@ jsg::Promise<bool> Cache::delete_(
 
 kj::Own<kj::HttpClient> Cache::getHttpClient(IoContext& context,
                                              kj::Maybe<kj::String> cfBlobJson,
-                                             kj::StringPtr operationName) {
-  auto span = context.makeTraceSpan(operationName);
+                                             kj::ConstString operationName) {
+  auto span = context.makeTraceSpan(kj::mv(operationName));
 
   auto cacheClient = context.getCacheClient();
   auto httpClient = cacheName.map([&](kj::String& n) {
@@ -527,12 +560,15 @@ jsg::Promise<jsg::Ref<Cache>> CacheStorage::open(jsg::Lock& js, kj::String cache
       TypeError, "Cache name is too long.");  // Mah spoon is toooo big.
 
   // TODO(someday): Implement Cache API in preview.
-  // TODO(someday): Calling IoContext::current() here means .open() can't be called in the
-  //   global scope. Do we want that to be possible? It returns a promise, so isn't very useful in
-  //   the global scope anyway. But the returned object also is not tied to any particular request.
-  auto& context = IoContext::current();
-  if (context.isFiddle()) {
-    context.logWarningOnce(CACHE_API_PREVIEW_WARNING);
+
+  // It is possible here that open() will be called in the global scope in fiddle
+  // mode in which case the warning will not be emitted. But that's ok? The warning
+  // is not critical by any stretch.
+  if (IoContext::hasCurrent()) {
+    auto& context = IoContext::current();
+    if (context.isFiddle()) {
+      context.logWarningOnce(CACHE_API_PREVIEW_WARNING);
+    }
   }
 
   return js.resolvedPromise(jsg::alloc<Cache>(kj::mv(cacheName)));

@@ -1,0 +1,9 @@
+cc_library(
+    name = "ada-url",
+    srcs = ["ada.cpp"],
+    hdrs = [
+        "ada.h",
+        "ada_c.h",
+    ],
+    visibility = ["//visibility:public"],
+)

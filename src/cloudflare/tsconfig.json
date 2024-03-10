@@ -18,17 +18,23 @@
     "noUnusedParameters": true,
     "strictNullChecks": true,
     "esModuleInterop": true,
+    "moduleResolution": "node",
+    "declaration": true,
     "types": [
       // todo: consume generated workerd types
       // "@cloudflare/workers-types"
     ],
     "paths": {
       "cloudflare:*": ["./*"],
-      "cloudflare-internal:*": ["./internal/*"]
+      "cloudflare-internal:*": ["./internal/*"],
+      "workerd:compatibility-flags": ["./internal/compatibility-flags.d.ts"]
     }
   },
   "include": [
     "*.ts",
     "internal/*.ts"
   ],
+  "files": [
+    "./internal/vectorize.d.ts"
+  ]
 }

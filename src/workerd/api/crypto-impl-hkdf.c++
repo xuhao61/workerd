@@ -16,9 +16,17 @@ public:
       : CryptoKey::Impl(extractable, usages),
         keyData(kj::mv(keyData)), keyAlgorithm(kj::mv(keyAlgorithm)) {}
 
+  kj::StringPtr jsgGetMemoryName() const override { return "HkdfKey"; }
+  size_t jsgGetMemorySelfSize() const override { return sizeof(HkdfKey); }
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
+    tracker.trackFieldWithSize("keyData", keyData.size());
+    tracker.trackField("keyAlgorithm", keyAlgorithm);
+  }
+
 private:
   kj::Array<kj::byte> deriveBits(
-      SubtleCrypto::DeriveKeyAlgorithm&& algorithm, kj::Maybe<uint32_t> maybeLength) const override {
+      jsg::Lock& js, SubtleCrypto::DeriveKeyAlgorithm&& algorithm,
+      kj::Maybe<uint32_t> maybeLength) const override {
     kj::StringPtr hashName = api::getAlgorithmName(JSG_REQUIRE_NONNULL(algorithm.hash, TypeError,
         "Missing field \"hash\" in \"algorithm\"."));
     const EVP_MD* hashType = lookupDigestAlgorithm(hashName).second;
@@ -51,7 +59,7 @@ private:
   }
 
   kj::StringPtr getAlgorithmName() const override { return "HKDF"; }
-  CryptoKey::AlgorithmVariant getAlgorithm() const override { return keyAlgorithm; }
+  CryptoKey::AlgorithmVariant getAlgorithm(jsg::Lock& js) const override { return keyAlgorithm; }
 
   bool equals(const CryptoKey::Impl& other) const override final {
     return this == &other || (other.getType() == "secret"_kj && other.equals(keyData));
@@ -62,14 +70,14 @@ private:
            CRYPTO_memcmp(keyData.begin(), other.begin(), keyData.size()) == 0;
   }
 
-  kj::Array<kj::byte> keyData;
+  ZeroOnFree keyData;
   CryptoKey::KeyAlgorithm keyAlgorithm;
 };
 
 }  // namespace
 
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::importHkdf(
-    kj::StringPtr normalizedName, kj::StringPtr format,
+    jsg::Lock& js, kj::StringPtr normalizedName, kj::StringPtr format,
     SubtleCrypto::ImportKeyData keyData,
     SubtleCrypto::ImportKeyAlgorithm&& algorithm, bool extractable,
     kj::ArrayPtr<const kj::String> keyUsages) {

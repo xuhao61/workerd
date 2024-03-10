@@ -6,7 +6,6 @@
 
 #include "r2-bucket.h"
 #include <workerd/jsg/jsg.h>
-#include <workerd/api/http.h>
 
 namespace edgeworker::api {
 class R2CrossAccount;
@@ -14,23 +13,24 @@ class R2CrossAccount;
 
 namespace workerd::api::public_beta {
 
+// A capability to an R2 Admin interface.
 class R2Admin: public jsg::Object {
 
-  struct friend_tag_t {};
   // A friend tag that grants access to an internal constructor for the R2CrossAccount binding
-
-  // A capability to an R2 Admin interface.
+  struct friend_tag_t {};
 
   struct FeatureFlags: public R2Bucket::FeatureFlags {
     using R2Bucket::FeatureFlags::FeatureFlags;
   };
 
 public:
-  explicit R2Admin(CompatibilityFlags::Reader featureFlags, uint subrequestChannel)
-      : featureFlags(featureFlags), subrequestChannel(subrequestChannel) {}
   // `subrequestChannel` is what to pass to IoContext::getHttpClient() to get an HttpClient
   // representing this namespace.
+  explicit R2Admin(CompatibilityFlags::Reader featureFlags, uint subrequestChannel)
+      : featureFlags(featureFlags), subrequestChannel(subrequestChannel) {}
 
+  // This constructor is intended to be used by the R2CrossAccount binding, which has access to the
+  // friend_tag
   R2Admin(FeatureFlags featureFlags,
           uint subrequestChannel,
           kj::String jwt,
@@ -38,8 +38,6 @@ public:
       : featureFlags(featureFlags),
         subrequestChannel(subrequestChannel),
         jwt(kj::mv(jwt)) {}
-  // This constructor is intended to be used by the R2CrossAccount binding, which has access to the
-  // friend_tag
 
   struct ListOptions {
     jsg::Optional<int> limit;
@@ -72,7 +70,7 @@ public:
   };
 
   struct ListResult {
-    jsg::Value buckets;
+    jsg::JsRef<jsg::JsMap> buckets;
     bool truncated = false;
     jsg::Optional<kj::String> cursor;
 
@@ -86,13 +84,17 @@ public:
       const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType);
   jsg::Promise<ListResult> list(jsg::Lock& js, jsg::Optional<ListOptions> options,
       const jsg::TypeHandler<jsg::Ref<RetrievedBucket>>& retrievedBucketType,
-      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType);
+      const jsg::TypeHandler<jsg::Ref<R2Error>>& errorType, CompatibilityFlags::Reader flags);
 
   JSG_RESOURCE_TYPE(R2Admin) {
     JSG_METHOD(create);
     JSG_METHOD(get);
     JSG_METHOD_NAMED(delete, delete_);
     JSG_METHOD(list);
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("jwt", jwt);
   }
 
 private:

@@ -6,6 +6,7 @@
 #include <kj/encoding.h>
 #include <kj/filesystem.h>
 #include <kj/map.h>
+#include <kj/async-queue.h>
 #include <capnp/message.h>
 #include <capnp/serialize.h>
 #include <capnp/schema-parser.h>
@@ -19,6 +20,12 @@
 #include <workerd/jsg/setup.h>
 #include <openssl/rand.h>
 #include <workerd/io/compatibility-date.capnp.h>
+#include <workerd/io/supported-compatibility-date.capnp.h>
+#include <workerd/util/autogate.h>
+
+#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
+#include <workerd/api/gpu/gpu.h>
+#endif
 
 #if _WIN32
 #include <iostream>
@@ -53,6 +60,8 @@
 #include <crt_externs.h>
 #define environ (*_NSGetEnviron())
 #endif
+
+#include <workerd/util/use-perfetto-categories.h>
 
 namespace workerd::server {
 
@@ -93,12 +102,12 @@ auto cliMethod(Func&& func) {
   };
 }
 
-#define CLI_METHOD(name) cliMethod(KJ_BIND_METHOD(*this, name))
 // Pass to MainBuilder when a function returning kj::MainBuilder::Validity is needed, implemented
 // by a method of this class.
+#define CLI_METHOD(name) cliMethod(KJ_BIND_METHOD(*this, name))
 
-#define CLI_ERROR(...) throw CliError(kj::str(__VA_ARGS__))
 // Throws an exception that is caught and reported as a usage error.
+#define CLI_ERROR(...) throw CliError(kj::str(__VA_ARGS__))
 
 constexpr capnp::ReaderOptions CONFIG_READER_OPTIONS = {
   .traversalLimitInWords = kj::maxValue
@@ -110,9 +119,8 @@ constexpr capnp::ReaderOptions CONFIG_READER_OPTIONS = {
 
 #if __linux__
 
+// Class which uses inotify to watch a set of files and alert when they change.
 class FileWatcher {
-  // Class which uses inotify to watch a set of files and alert when they change.
-
 public:
   FileWatcher(kj::UnixEventPort& port)
       : inotifyFd(makeInotify()),
@@ -121,7 +129,7 @@ public:
   bool isSupported() { return true; }
 
   void watch(kj::PathPtr path, kj::Maybe<const kj::ReadableFile&> file) {
-    // `file` is provided if available. The Linux implemnetation doesn't use it.
+    // `file` is provided if available. The Linux implementation doesn't use it.
 
     auto pathStr = path.parent().toNativeString(true);
 
@@ -148,9 +156,8 @@ public:
 
       if (n < 0) {
         // No more data to read.
-        return observer.whenBecomesReadable().then([this]() -> kj::Promise<void> {
-          return onChange();
-        });
+        co_await observer.whenBecomesReadable();
+        continue;
       }
 
       kj::byte* ptr = buffer;
@@ -166,9 +173,9 @@ public:
 
         if (event.len > 0 && event.name[0] != '\0') {
           auto& watched = KJ_ASSERT_NONNULL(filesWatched.find(event.wd));
-          if (watched.find(kj::StringPtr(event.name)) != nullptr) {
+          if (watched.find(kj::StringPtr(event.name)) != kj::none) {
             // HIT! We saw a change.
-            return kj::READY_NOW;
+            co_return;
           }
         }
       }
@@ -191,18 +198,17 @@ private:
 
 #elif WORKERD_USE_KQUEUE_FOR_FILE_WATCHER
 
+// Class which uses inotify to watch a set of files and alert when they change.
+//
+// This version uses kqueue to watch for changes in files. kqueue typically doesn't scale well
+// to watching whole directory trees, since it must keep a file descriptor opne for each watched
+// file. However, for our use case, we don't really want to watch a directory tree anyway, we
+// want to watch the specific set of files which were opened while parsing the config. This is
+// not so bad, probably.
+//
+// Apple provides the FSEvents API as an alternative, but it seems way more complicated and I
+// can't tell if it would provide a real advantage. Plus, kqueue works on BSD systems.
 class FileWatcher {
-  // Class which uses inotify to watch a set of files and alert when they change.
-  //
-  // This version uses kqueue to watch for changes in files. kqueue typically doesn't scale well
-  // to watching whole directory trees, since it must keep a file descriptor opne for each watched
-  // file. However, for our use case, we don't really want to watch a directory tree anyway, we
-  // want to watch the specific set of files which were opened while parsing the config. This is
-  // not so bad, probably.
-  //
-  // Apple provides the FSEvents API as an alternative, but it seems way more complicated and I
-  // can't tell if it would provide a real advantage. Plus, kqueue works on BSD systems.
-
 public:
   FileWatcher(kj::UnixEventPort& port)
       : kqueueFd(makeKqueue()),
@@ -211,12 +217,12 @@ public:
   bool isSupported() { return true; }
 
   void watch(kj::PathPtr path, kj::Maybe<const kj::ReadableFile&> file) {
-    KJ_IF_MAYBE(f, file) {
-      KJ_IF_MAYBE(fd, f->getFd()) {
+    KJ_IF_SOME(f, file) {
+      KJ_IF_SOME(fd, f.getFd()) {
         // We need to duplicate the FD becasue the original will probably be closed later and
         // closing the FD unregisters it from kqueue.
         int duped;
-        KJ_SYSCALL(duped = dup(*fd));
+        KJ_SYSCALL(duped = dup(fd));
         watchFd(kj::AutoCloseFd(duped));
         return;
       }
@@ -241,13 +247,12 @@ public:
       if (n == 0) {
         // No events, wait for the kqueue to become readable indicating an event has been
         // delivered.
-        return observer.whenBecomesReadable().then([this]() -> kj::Promise<void> {
-          return onChange();
-        });
+        co_await observer.whenBecomesReadable();
+        continue;
       } else {
         // We only pay attention to events that indicate changes in the first place, so there's
         // no need to examine the event, it definitely means something changed.
-        return kj::READY_NOW;
+        co_return;
       }
     }
   }
@@ -295,9 +300,8 @@ private:
 
 #else
 
+// Dummy FileWatcher implementation for operating systems that aren't supported yet.
 class FileWatcher {
-  // Dummy FileWatcher implementation for operating systems that aren't supported yet.
-
 public:
   FileWatcher(kj::UnixEventPort& port) {}
 
@@ -315,13 +319,12 @@ private:
 
 kj::Maybe<kj::Own<capnp::SchemaFile>> tryImportBulitin(kj::StringPtr name);
 
+// Callbacks for capnp::SchemaFileLoader. Implementing this interface lets us control import
+// resolution, which we want to do mainly so that we can set watches on all imported files.
+//
+// These callbacks also give us more control over error reporting, in particular the ability
+// to not throw an exception on the first error seen.
 class SchemaFileImpl final: public capnp::SchemaFile {
-  // Callbacks for capnp::SchemaFileLoader. Implementing this interface lets us control import
-  // resolution, which we want to do mainly so that we can set watches on all imported files.
-  //
-  // These callbacks also give us more control over error reporting, in particular the ability
-  // to not throw an exception on the first error seen.
-
 public:
   class ErrorReporter {
   public:
@@ -346,8 +349,8 @@ public:
       displayName = fullPath.toNativeString(true);
     }
 
-    KJ_IF_MAYBE(w, watcher) {
-      w->watch(fullPath, *file);
+    KJ_IF_SOME(w, watcher) {
+      w.watch(fullPath, *file);
     }
   }
 
@@ -365,10 +368,10 @@ public:
       for (auto& candidate: importPath) {
         auto newFullPath = candidate.append(parsedPath);
 
-        KJ_IF_MAYBE(newFile, root.tryOpenFile(newFullPath)) {
+        KJ_IF_SOME(newFile, root.tryOpenFile(newFullPath)) {
           return kj::implicitCast<kj::Own<SchemaFile>>(kj::heap<SchemaFileImpl>(
               root, current, kj::mv(newFullPath), candidate, importPath,
-              kj::mv(*newFile), watcher, errorReporter));
+              kj::mv(newFile), watcher, errorReporter));
         }
       }
       // No matching file found. Check if we have a builtin.
@@ -378,12 +381,12 @@ public:
       auto parsed = relativeTo.parent().eval(target);
       auto newFullPath = basePath.append(parsed);
 
-      KJ_IF_MAYBE(newFile, root.tryOpenFile(newFullPath)) {
+      KJ_IF_SOME(newFile, root.tryOpenFile(newFullPath)) {
         return kj::implicitCast<kj::Own<SchemaFile>>(kj::heap<SchemaFileImpl>(
-            root, current, kj::mv(newFullPath), basePath, importPath, kj::mv(*newFile),
+            root, current, kj::mv(newFullPath), basePath, importPath, kj::mv(newFile),
             watcher, errorReporter));
       } else {
-        return nullptr;
+        return kj::none;
       }
     }
   }
@@ -395,9 +398,7 @@ public:
       return false;
     }
   }
-  bool operator!=(const SchemaFile& other) const override {
-    return !operator==(other);
-  }
+
   size_t hashCode() const override {
     return kj::hashCode(fullPath);
   }
@@ -410,33 +411,33 @@ private:
   const kj::Directory& root;
   kj::PathPtr current;
 
-  kj::Path fullPath;
   // Full path from root of filesystem to the file.
+  kj::Path fullPath;
 
-  kj::PathPtr basePath;
   // If this file was reached by scanning `importPath`, `basePath` is the particular import path
   // directory that was used, otherwise it is empty. `basePath` is always a prefix of `fullPath`.
+  kj::PathPtr basePath;
 
-  kj::ArrayPtr<const kj::Path> importPath;
   // Paths to search for absolute imports.
+  kj::ArrayPtr<const kj::Path> importPath;
 
   kj::Own<const kj::ReadableFile> file;
   kj::String displayName;
 
-  mutable kj::Maybe<FileWatcher&> watcher;
   // Mutable because the SchemaParser interface forces us to make all our methods `const` so that
   // parsing can happen on multiple threads, but we do not actually use multiple threads for
   // parsing, so we're good.
+  mutable kj::Maybe<FileWatcher&> watcher;
 
   ErrorReporter& errorReporter;
 };
 
+// A schema file whose text is embedded into the binary for convenience.
+//
+// TODO(someday): Could `capnp::SchemaParser` be updated such that it can use the compiled-in
+//   schema nodes rather than re-parse the file from scratch? This is tricky as some information
+//   is lost after compilation which is needed to compile dependents, e.g. aliases are erased.
 class BuiltinSchemaFileImpl final: public capnp::SchemaFile {
-  // A schema file whose text is embedded into the binary for convenience.
-  //
-  // TODO(someday): Could `capnp::SchemaParser` be updated such that it can use the compiled-in
-  //   schema nodes rather than re-parse the file from scratch? This is tricky as some information
-  //   is lost after compilation which is needed to compile dependents, e.g. aliases are erased.
 public:
   BuiltinSchemaFileImpl(kj::StringPtr name, kj::StringPtr content)
       : name(name), content(content) {}
@@ -460,9 +461,7 @@ public:
       return false;
     }
   }
-  bool operator!=(const SchemaFile& other) const override {
-    return !operator==(other);
-  }
+
   size_t hashCode() const override {
     return kj::hashCode(name);
   }
@@ -482,9 +481,126 @@ kj::Maybe<kj::Own<capnp::SchemaFile>> tryImportBulitin(kj::StringPtr name) {
   } else if (name == "/workerd/workerd.capnp") {
     return kj::heap<BuiltinSchemaFileImpl>("/workerd/workerd.capnp", WORKERD_CAPNP_SCHEMA);
   } else {
-    return nullptr;
+    return kj::none;
   }
 }
+
+// =======================================================================================
+
+// A kj::Network implementation which wraps some other network and optionally (if enabled)
+// implements "loopback:" network addresses, which are expected to be serviced within the same
+// process. Loopback addresses are enabled only when running `workerd test`. The purpose is to
+// allow end-to-end testing of the network stack without creating a real external-facing socket.
+//
+// There is no use for loopback sockets in production since direct service bindings are more
+// efficient while solving the same problems.
+class NetworkWithLoopback final: public kj::Network {
+public:
+  NetworkWithLoopback(kj::Network& inner, kj::AsyncIoProvider& ioProvider)
+      : inner(inner), ioProvider(ioProvider), loopbackEnabled(rootLoopbackEnabled) {}
+
+  NetworkWithLoopback(kj::Own<kj::Network> inner, kj::AsyncIoProvider& ioProvider,
+                      bool& loopbackEnabled)
+      : inner(*inner), ownInner(kj::mv(inner)), ioProvider(ioProvider),
+        loopbackEnabled(loopbackEnabled) {}
+
+  // Call once to enable loopback addresses.
+  void enableLoopback() { loopbackEnabled = true; }
+
+  kj::Promise<kj::Own<kj::NetworkAddress>> parseAddress(
+      kj::StringPtr addr, uint portHint = 0) override {
+    if (loopbackEnabled && addr.startsWith(PREFIX)) {
+      return kj::Own<kj::NetworkAddress>(kj::heap<LoopbackAddr>(*this, addr.slice(PREFIX.size())));
+    } else {
+      return inner.parseAddress(addr, portHint);
+    }
+  }
+
+  kj::Own<kj::NetworkAddress> getSockaddr(const void* sockaddr, uint len) override {
+    return inner.getSockaddr(sockaddr, len);
+  }
+
+  kj::Own<kj::Network> restrictPeers(
+      kj::ArrayPtr<const kj::StringPtr> allow,
+      kj::ArrayPtr<const kj::StringPtr> deny = nullptr) override {
+    return kj::heap<NetworkWithLoopback>(
+        inner.restrictPeers(allow, deny), ioProvider, loopbackEnabled);
+  }
+
+private:
+  kj::Network& inner;
+  kj::Own<kj::Network> ownInner;
+  kj::AsyncIoProvider& ioProvider KJ_UNUSED;
+  bool rootLoopbackEnabled = false;
+
+  // Reference to `rootLoopbackEnabled` of the root NetworkWithLoopback. All descendants
+  // (created using `restrictPeers()` will share the same flag value.
+  bool& loopbackEnabled;
+
+  using ConnectionQueue = kj::ProducerConsumerQueue<kj::Own<kj::AsyncIoStream>>;
+  kj::HashMap<kj::String, kj::Own<ConnectionQueue>> loopbackQueues;
+
+  ConnectionQueue& getLoopbackQueue(kj::StringPtr name) {
+    return *loopbackQueues.findOrCreate(name, [&]() {
+      return decltype(loopbackQueues)::Entry {
+        .key = kj::str(name),
+        .value = kj::heap<ConnectionQueue>(),
+      };
+    });
+  }
+
+  static constexpr kj::StringPtr PREFIX = "loopback:"_kj;
+
+  class LoopbackAddr final: public kj::NetworkAddress {
+  public:
+    LoopbackAddr(NetworkWithLoopback& parent, kj::StringPtr name)
+        : parent(parent), name(kj::str(name)) {}
+
+    kj::Promise<kj::Own<kj::AsyncIoStream>> connect() override {
+      // The purpose of loopback sockets is to actually test the network stack end-to-end. If
+      // people don't want to test the full stack, then they can create a direct service binding
+      // without going through a loopback socket.
+      //
+      // So, we create a real loopback socket here.
+      auto pipe = parent.ioProvider.newTwoWayPipe();
+
+      parent.getLoopbackQueue(name).push(kj::mv(pipe.ends[0]));
+      return kj::mv(pipe.ends[1]);
+    }
+
+    kj::Own<kj::ConnectionReceiver> listen() override {
+      return kj::heap<LoopbackReceiver>(parent.getLoopbackQueue(name));
+    }
+
+    kj::Own<kj::NetworkAddress> clone() override {
+      return kj::heap<LoopbackAddr>(parent, name);
+    }
+
+    kj::String toString() override {
+      return kj::str(PREFIX, name);
+    }
+
+  private:
+    NetworkWithLoopback& parent;
+    kj::String name;
+  };
+
+  class LoopbackReceiver final: public kj::ConnectionReceiver {
+  public:
+    LoopbackReceiver(ConnectionQueue& queue): queue(queue) {}
+
+    kj::Promise<kj::Own<kj::AsyncIoStream>> accept() override {
+      return queue.pop();
+    }
+
+    uint getPort() override {
+      return 0;
+    }
+
+  private:
+    ConnectionQueue& queue;
+  };
+};
 
 // =======================================================================================
 
@@ -492,9 +608,9 @@ class CliMain: public SchemaFileImpl::ErrorReporter {
 public:
   CliMain(kj::ProcessContext& context, char** argv)
       : context(context), argv(argv),
-        server(*fs, io.provider->getTimer(), io.provider->getNetwork(), entropySource,
-            [&](kj::String error) {
-          if (watcher == nullptr) {
+        server(*fs, io.provider->getTimer(), network, entropySource,
+            Worker::ConsoleMode::STDOUT, [&](kj::String error) {
+          if (watcher == kj::none) {
             // TODO(someday): Don't just fail on the first error, keep going in order to report
             //   additional errors. The tricky part is we don't currently have any signal of when
             //   the server has completely finished loading, and also we probably don't want to
@@ -508,8 +624,8 @@ public:
             context.error(error);
           }
         }) {
-    KJ_IF_MAYBE(e, exeInfo) {
-      auto& exe = *e->file;
+    KJ_IF_SOME(e, exeInfo) {
+      auto& exe = *e.file;
       auto size = exe.stat().size;
       KJ_ASSERT(size > sizeof(COMPILED_MAGIC_SUFFIX) + sizeof(uint64_t));
       kj::byte magic[sizeof(COMPILED_MAGIC_SUFFIX)];
@@ -544,7 +660,7 @@ public:
   }
 
   kj::MainFunc getMain() {
-    if (config == nullptr) {
+    if (config == kj::none) {
       return kj::MainBuilder(context, getVersionString(),
             "Runs the Workers JavaScript/Wasm runtime.")
           .addSubCommand("serve", KJ_BIND_METHOD(*this, getServe),
@@ -595,6 +711,13 @@ public:
                           "<addr> instead of the address specified in the config file.")
         .addOptionWithArg({'i', "inspector-addr"}, CLI_METHOD(enableInspector), "<addr>",
                           "Enable the inspector protocol to connect to the address <addr>.")
+#if defined(WORKERD_USE_PERFETTO)
+        // TODO(later): In the future, we might want to enable providing a perfetto
+        // TraceConfig structure here rather than just the categories.
+        .addOptionWithArg({"p", "perfetto-trace"}, CLI_METHOD(enablePerfetto),
+                           "<path>=<categories>",
+                           "Enable perfetto tracing output to the specified file.")
+#endif
         .addOption({'w', "watch"}, CLI_METHOD(watch),
                    "Watch configuration files (and server binary) and reload if they change. "
                    "Useful for development, but not recommended in production.")
@@ -685,7 +808,7 @@ public:
 
   void addImportPath(kj::StringPtr pathStr) {
     auto path = fs->getCurrentPath().evalNative(pathStr);
-    KJ_IF_MAYBE(dir, fs->getRoot().tryOpenSubdir(path)) {
+    if (fs->getRoot().tryOpenSubdir(path) != kj::none) {
       importPath.add(kj::mv(path));
     } else {
       CLI_ERROR("No such directory.");
@@ -770,6 +893,14 @@ public:
     server.overrideExternal(kj::mv(name), kj::str(value));
   }
 
+#if defined(WORKERD_USE_PERFETTO)
+  void enablePerfetto(kj::StringPtr param) {
+    auto [ name, value ] = parseOverride(param);
+    perfettoTraceDestination = kj::str(name);
+    perfettoTraceCategories = kj::str(value);
+  }
+#endif
+
   void enableInspector(kj::StringPtr param) {
     server.enableInspector(kj::str(param));
   }
@@ -790,8 +921,8 @@ public:
       CLI_ERROR("File watching is not yet implemented on your OS. Sorry! Pull requests welcome!");
     }
 
-    KJ_IF_MAYBE(e, exeInfo) {
-      w.watch(fs->getCurrentPath().eval(e->path), nullptr);
+    KJ_IF_SOME(e, exeInfo) {
+      w.watch(fs->getCurrentPath().eval(e.path), kj::none);
     } else {
       CLI_ERROR("Can't use --watch when we're unable to find our own executable.");
     }
@@ -851,6 +982,11 @@ public:
         }
       }
     }
+
+    // We'll fail at getConfig() if there are multiple top level Config objects.
+    // The error message says that you have to specify which config to use, but
+    // it's not clear that there is any mechanism to do that.
+    util::Autogate::initAutogate(getConfig().getAutogates());
   }
 
   void setConstName(kj::StringPtr name) {
@@ -886,9 +1022,9 @@ public:
     kj::Vector<kj::String> parts;
 
     for (;;) {
-      KJ_IF_MAYBE(pos, filter.findFirst(':')) {
-        parts.add(kj::str(filter.slice(0, *pos)));
-        filter = filter.slice(*pos + 1);
+      KJ_IF_SOME(pos, filter.findFirst(':')) {
+        parts.add(kj::str(filter.slice(0, pos)));
+        filter = filter.slice(pos + 1);
       } else {
         parts.add(kj::str(filter));
         break;
@@ -1014,31 +1150,45 @@ public:
   [[noreturn]] void serveImpl(Func&& func) noexcept {
     if (hadErrors) {
       // Can't start, stuff is broken.
-      KJ_IF_MAYBE(w, watcher) {
+      KJ_IF_SOME(w, watcher) {
         // In --watch mode, it's annoying if the server exits and stops watching. Let's wait for
         // someone to fix the config.
         context.warning(
             "Can't start server due to config errors, waiting for config files to change...");
-        waitForChanges(*w).wait(io.waitScope);
+        waitForChanges(w).wait(io.waitScope);
         reloadFromConfigChange();
       } else {
         // Errors were reported earlier, so context.exit() will exit with a non-zero status.
         context.exit();
       }
     } else {
+#ifdef WORKERD_USE_PERFETTO
+      kj::Maybe<PerfettoSession> maybePerfettoSession;
+      KJ_IF_SOME(dest, perfettoTraceDestination) {
+        maybePerfettoSession = PerfettoSession(dest,
+            kj::mv(perfettoTraceCategories).orDefault(kj::String()));
+      }
+#endif
+      TRACE_EVENT("workerd", "serveImpl()");
       auto config = getConfig();
       auto platform = jsg::defaultPlatform(0);
       WorkerdPlatform v8Platform(*platform);
       jsg::V8System v8System(v8Platform,
           KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; });
       auto promise = func(v8System, config);
-      KJ_IF_MAYBE(w, watcher) {
-        promise = promise.exclusiveJoin(waitForChanges(*w).then([this]() {
+      KJ_IF_SOME(w, watcher) {
+        promise = promise.exclusiveJoin(waitForChanges(w).then([this]() {
           // Watch succeeded.
           reloadFromConfigChange();
         }));
       }
       promise.wait(io.waitScope);
+#ifdef WORKERD_USE_PERFETTO
+      KJ_IF_SOME(perfettoSession, maybePerfettoSession) {
+        auto dropMe = kj::mv(perfettoSession);
+        maybePerfettoSession = kj::none;
+      }
+#endif
       context.exit();
     }
   }
@@ -1060,6 +1210,9 @@ public:
     // TODO(beta): This can be removed once we improve our error logging story.
     kj::_::Debug::setLogLevel(kj::LogSeverity::INFO);
 
+    // Enable loopback sockets in tests only.
+    network.enableLoopback();
+
     serveImpl([&](jsg::V8System& v8System, config::Config::Reader config) {
       return server.test(v8System, config,
           testServicePattern.map([](auto& s) -> kj::StringPtr { return s; }).orDefault("*"_kj),
@@ -1069,7 +1222,7 @@ public:
           context.error("Tests failed!");
         }
 
-        if (watcher == nullptr) {
+        if (watcher == kj::none) {
           return kj::READY_NOW;
         } else {
           // Pause forever waiting for watcher.
@@ -1123,6 +1276,7 @@ private:
 
   kj::Own<kj::Filesystem> fs = kj::newDiskFilesystem();
   kj::AsyncIoContext io = kj::setupAsyncIo();
+  NetworkWithLoopback network { io.provider->getNetwork(), *io.provider };
   EntropySourceImpl entropySource;
 
   kj::Vector<kj::Path> importPath;
@@ -1138,11 +1292,17 @@ private:
   kj::Maybe<kj::String> testServicePattern;
   kj::Maybe<kj::String> testEntrypointPattern;
 
+#if defined(WORKERD_USE_PERFETTO)
+  kj::Maybe<kj::String> perfettoTraceDestination;
+  kj::Maybe<kj::String> perfettoTraceCategories;
+#endif
+
   Server server;
 
+  // This is a randomly-generated 128-bit number that identifies when a binary has been compiled
+  // with a specific config in order to run stand-alone.
   static constexpr uint64_t COMPILED_MAGIC_SUFFIX[2] = {
-    // This is a randomly-generated 128-bit number that identifies when a binary has been compiled
-    // with a specific config in order to run stand-alone. The layout of such a binary is:
+    // The layout of such a binary is:
     //
     // - Binary executable data (copy of the Workers Runtime binary).
     // - Padding to 8-byte boundary.
@@ -1164,10 +1324,10 @@ private:
     // TODO(bug): Like with Unix below, we should probably use native CreateFile() here, but it has
     // sooooo many arguments, I don't want to deal with it.
     auto parsedPath = fs.getCurrentPath().evalNative(path);
-    KJ_IF_MAYBE(file, fs.getRoot().tryOpenFile(parsedPath)) {
-      return ExeInfo { kj::str(path), kj::mv(*file) };
+    KJ_IF_SOME(file, fs.getRoot().tryOpenFile(parsedPath)) {
+      return ExeInfo { kj::str(path), kj::mv(file) };
     }
-    return nullptr;
+    return kj::none;
   }
 #else
   static kj::Maybe<ExeInfo> tryOpenExe(kj::Filesystem& fs, kj::StringPtr path) {
@@ -1175,7 +1335,7 @@ private:
     // path resolution here, not KJ's logical path resolution.
     int fd = open(path.cStr(), O_RDONLY);
     if (fd < 0) {
-      return nullptr;
+      return kj::none;
     }
     return ExeInfo { kj::str(path), kj::newDiskFile(kj::AutoCloseFd(fd)) };
   }
@@ -1191,8 +1351,8 @@ private:
   #endif
 
   #if __linux__
-    KJ_IF_MAYBE(link, fs.getRoot().tryReadlink(kj::Path({"proc", "self", "exe"}))) {
-      return tryOpenExe(fs, *link);
+    KJ_IF_SOME(link, fs.getRoot().tryReadlink(kj::Path({"proc", "self", "exe"}))) {
+      return tryOpenExe(fs, link);
     }
   #endif
 
@@ -1216,12 +1376,12 @@ private:
   #endif
 
     // TODO(beta): Fall back to searching $PATH.
-    return nullptr;
+    return kj::none;
   }
 
   config::Config::Reader getConfig() {
-    KJ_IF_MAYBE(c, config) {
-      return *c;
+    KJ_IF_SOME(c, config) {
+      return c;
     } else {
       // The optional `<const-name>` parameter must not have been given -- otherwise we would have
       // a non-null `config` by this point. See if we can infer the correct constant...
@@ -1234,6 +1394,10 @@ private:
         auto names = KJ_MAP(cnst, topLevelConfigConstants) {
           return cnst.getShortDisplayName();
         };
+        // TODO: this error message says "you must specify which one to use".
+        // This is not actaully possible? Either fix the error message to say
+        // **how** to specify which config object to use or tell user to define
+        // exactly one top level Config constant.
         context.exitError(kj::str(
             "The config file defines multiple top-level constants of type 'Config', so you must "
             "specify which one to use. The options are: ", kj::strArray(names, ", ")));
@@ -1264,10 +1428,9 @@ private:
     KJ_UNIMPLEMENTED("Watching is not yet implemented on Windows");
   }
 #else
+  // Wait for the FileWatcher to report a change, and then wait a moment for changes to settle
+  // down, in case there's a bunch of changes all at once.
   kj::Promise<void> waitForChanges(FileWatcher& watcher) {
-    // Wait for the FileWatcher to report a change, and then wait a moment for changes to settle
-    // down, in case there's a bunch of changes all at once.
-
     co_await watcher.onChange();
 
     // Saw our first change!
@@ -1279,10 +1442,16 @@ private:
     kj::StringPtr message = "Noticed configuration change, reloading shortly...\r";
     kj::FdOutputStream(STDERR_FILENO).write(message.begin(), message.size());
 
+    static auto const waitForResult = [](kj::Promise<void> promise,
+                                         bool result = false) -> kj::Promise<bool> {
+      co_await promise;
+      co_return result;
+    };
+
     for (;;) {
-      auto nextChange = watcher.onChange().then([]() { return false; });
-      auto timeout = io.provider->getTimer()
-          .afterDelay(500 * kj::MILLISECONDS).then([]() { return true; });
+      auto nextChange = waitForResult(watcher.onChange());
+      auto timeout = waitForResult(
+          io.provider->getTimer().afterDelay(500 * kj::MILLISECONDS), true);
       bool sawTimeout = co_await nextChange.exclusiveJoin(kj::mv(timeout));
 
       // If we timed out, we end the loop. If we didn't time out, then we must have seen yet
@@ -1303,5 +1472,10 @@ int main(int argc, char* argv[]) {
   kj::UnixEventPort::captureSignal(SIGTERM);
 #endif
   workerd::server::CliMain mainObject(context, argv);
+
+#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
+  workerd::api::gpu::initialize();
+#endif
+
   return ::kj::runMainAndExit(context, mainObject.getMain(), argc, argv);
 }

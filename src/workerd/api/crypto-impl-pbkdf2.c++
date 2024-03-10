@@ -15,9 +15,16 @@ public:
       : CryptoKey::Impl(extractable, usages),
         keyData(kj::mv(keyData)), keyAlgorithm(kj::mv(keyAlgorithm)) {}
 
+  kj::StringPtr jsgGetMemoryName() const override { return "Pbkdf2Key"; }
+  size_t jsgGetMemorySelfSize() const override { return sizeof(Pbkdf2Key); }
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
+    tracker.trackFieldWithSize("keyData", keyData.size());
+    tracker.trackField("keyAlgorithm", keyAlgorithm);
+  }
+
 private:
   kj::Array<kj::byte> deriveBits(
-      SubtleCrypto::DeriveKeyAlgorithm&& algorithm,
+      jsg::Lock& js, SubtleCrypto::DeriveKeyAlgorithm&& algorithm,
       kj::Maybe<uint32_t> maybeLength) const override {
     kj::StringPtr hashName = api::getAlgorithmName(JSG_REQUIRE_NONNULL(algorithm.hash, TypeError,
         "Missing field \"hash\" in \"algorithm\"."));
@@ -38,15 +45,15 @@ private:
         "PBKDF2 requires a positive iteration count (requested ", iterations, ").");
 
     // Note: The user could DoS us by selecting a very high iteration count. Our dead man's switch
-    //   would kick in, resulting in a process restart. We guard against this by limiting the maximum
-    //   iteration count a user can select -- this is an intentional non-conformity. Another approach
-    //   might be to fork OpenSSL's PKCS5_PBKDF2_HMAC() function and insert a check for
-    //   v8::Isolate::IsExecutionTerminating() in the loop, but for now a hard cap seems wisest.
-    JSG_REQUIRE(iterations <= 100000, DOMNotSupportedError,
-        "PBKDF2 iteration counts above 100000 are not supported (requested ", iterations, ").");
+    // would kick in, resulting in a process restart. We guard against this by limiting the
+    // maximum iteration count a user can select -- this is an intentional non-conformity.
+    // Another approach might be to fork OpenSSL's PKCS5_PBKDF2_HMAC() function and insert a
+    // check for v8::Isolate::IsExecutionTerminating() in the loop, but for now a hard cap seems
+    // wisest.
+    checkPbkdfLimits(js, iterations);
 
     auto output = kj::heapArray<kj::byte>(length / 8);
-    OSSLCALL(PKCS5_PBKDF2_HMAC(keyData.asChars().begin(), keyData.size(),
+    OSSLCALL(PKCS5_PBKDF2_HMAC(keyData.asPtr().asChars().begin(), keyData.size(),
                                salt.begin(), salt.size(),
                                iterations, hashType, output.size(), output.begin()));
     return kj::mv(output);
@@ -65,7 +72,7 @@ private:
 //   }
 
   kj::StringPtr getAlgorithmName() const override { return "PBKDF2"; }
-  CryptoKey::AlgorithmVariant getAlgorithm() const override { return keyAlgorithm; }
+  CryptoKey::AlgorithmVariant getAlgorithm(jsg::Lock& js) const override { return keyAlgorithm; }
 
   bool equals(const CryptoKey::Impl& other) const override final {
     return this == &other || (other.getType() == "secret"_kj && other.equals(keyData));
@@ -76,14 +83,14 @@ private:
            CRYPTO_memcmp(keyData.begin(), other.begin(), keyData.size()) == 0;
   }
 
-  kj::Array<kj::byte> keyData;
+  ZeroOnFree keyData;
   CryptoKey::KeyAlgorithm keyAlgorithm;
 };
 
 }  // namespace
 
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::importPbkdf2(
-    kj::StringPtr normalizedName, kj::StringPtr format,
+    jsg::Lock& js, kj::StringPtr normalizedName, kj::StringPtr format,
     SubtleCrypto::ImportKeyData keyData,
     SubtleCrypto::ImportKeyAlgorithm&& algorithm, bool extractable,
     kj::ArrayPtr<const kj::String> keyUsages) {

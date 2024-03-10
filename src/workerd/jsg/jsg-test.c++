@@ -27,11 +27,17 @@ static_assert(!isGcVisitable<BoxBox>());
 static_assert(isGcVisitable<TestStruct>());
 static_assert(isGcVisitable<kj::Maybe<TestStruct>>());
 
+// jsg::Lock is not acceptable as a coroutine param
+static_assert(kj::_::isDisallowedInCoroutine<Lock>());
+static_assert(kj::_::isDisallowedInCoroutine<Lock&>());
+static_assert(kj::_::isDisallowedInCoroutine<Lock*>());
+
 // ========================================================================================
 
 V8System v8System;
+class ContextGlobalObject: public Object, public ContextGlobal {};
 
-struct TestContext: public Object {
+struct TestContext: public ContextGlobalObject {
   JSG_RESOURCE_TYPE(TestContext) {}
 };
 JSG_DECLARE_ISOLATE_TYPE(TestIsolate, TestContext);
@@ -56,7 +62,7 @@ KJ_TEST("context type is exposed in the global scope") {
 
 // ========================================================================================
 
-struct InheritContext: public Object {
+struct InheritContext: public ContextGlobalObject {
   struct Other: public Object {
     JSG_RESOURCE_TYPE(Other) {}
   };
@@ -119,7 +125,7 @@ KJ_TEST("inheritance") {
 
 // ========================================================================================
 
-struct Utf8Context: public Object {
+struct Utf8Context: public ContextGlobalObject {
   bool callWithBmpUnicode(Lock& js, jsg::Function<bool(kj::StringPtr)> function) {
     return function(js, "中国网络");
   }
@@ -149,7 +155,7 @@ KJ_TEST("utf-8 scripts") {
 
 // ========================================================================================
 
-struct RefContext: public Object {
+struct RefContext: public ContextGlobalObject {
   Ref<NumberBox> addAndReturnCopy(NumberBox& box, double value) {
     auto copy = jsg::alloc<NumberBox>(box.value);
     copy->value += value;
@@ -185,7 +191,7 @@ KJ_TEST("Ref") {
 
 // ========================================================================================
 
-struct ProtoContext: public Object {
+struct ProtoContext: public ContextGlobalObject {
   ProtoContext(): contextProperty(kj::str("default-context-property-value")) {}
 
   kj::StringPtr getContextProperty() { return contextProperty; }
@@ -264,7 +270,7 @@ KJ_TEST("can't use builtin as prototype") {
 
 // ========================================================================================
 
-struct IcuContext: public Object {
+struct IcuContext: public ContextGlobalObject {
   JSG_RESOURCE_TYPE(IcuContext) {}
 };
 JSG_DECLARE_ISOLATE_TYPE(IcuIsolate, IcuContext);
@@ -305,27 +311,27 @@ KJ_TEST("Uncaught JsExceptionThrown reports stack") {
 
 // ========================================================================================
 
-struct LockLogContext: public Object {
+struct LockLogContext: public ContextGlobalObject {
   JSG_RESOURCE_TYPE(LockLogContext) {}
 };
 JSG_DECLARE_ISOLATE_TYPE(LockLogIsolate, LockLogContext);
 
 KJ_TEST("jsg::Lock logWarning") {
-  LockLogIsolate isolate(v8System);
+  LockLogIsolate isolate(v8System, kj::heap<IsolateObserver>());
   bool called = false;
-  V8StackScope stackScope;
-  LockLogIsolate::Lock lock(isolate, stackScope);
-  lock.setLoggerCallback([&called](jsg::Lock& js, auto message) {
-    KJ_ASSERT(message == "Yes that happened"_kj);
-    called = true;
+  isolate.runInLockScope([&](LockLogIsolate::Lock& lock) {
+    lock.setLoggerCallback([&called](jsg::Lock& js, auto message) {
+      KJ_ASSERT(message == "Yes that happened"_kj);
+      called = true;
+    });
+    lock.logWarning("Yes that happened"_kj);
+    KJ_ASSERT(called);
   });
-  lock.logWarning("Yes that happened"_kj);
-  KJ_ASSERT(called);
 }
 
 // ========================================================================================
 // JSG_CALLABLE Test
-struct CallableContext: public Object {
+struct CallableContext: public ContextGlobalObject {
   struct MyCallable: public Object {
   public:
     static Ref<MyCallable> constructor() { return alloc<MyCallable>(); }
@@ -359,23 +365,63 @@ KJ_TEST("Test JSG_CALLABLE") {
   e.expectEval("let obj = getCallable(); new obj();", "boolean", "true");
 }
 
-}  // namespace
+// ========================================================================================
+struct InterceptContext: public ContextGlobalObject {
+  struct ProxyImpl: public jsg::Object {
+    static jsg::Ref<ProxyImpl> constructor() { return jsg::alloc<ProxyImpl>(); }
+
+    int getBar() { return 123; }
+
+    // JSG_WILDCARD_PROPERTY implementation
+    kj::Maybe<kj::StringPtr> testGetNamed(jsg::Lock& js, kj::String name) {
+      if (name == "foo") {
+        return "bar"_kj;
+      } else if (name == "abc") {
+        JSG_FAIL_REQUIRE(TypeError, "boom");
+      }
+      return kj::none;
+    }
+
+    JSG_RESOURCE_TYPE(ProxyImpl) {
+      JSG_READONLY_PROTOTYPE_PROPERTY(bar, getBar);
+      JSG_WILDCARD_PROPERTY(testGetNamed);
+    }
+  };
+
+  JSG_RESOURCE_TYPE(InterceptContext) {
+    JSG_NESTED_TYPE(ProxyImpl);
+  }
+};
+JSG_DECLARE_ISOLATE_TYPE(InterceptIsolate, InterceptContext, InterceptContext::ProxyImpl);
+
+KJ_TEST("Named interceptor") {
+  Evaluator<InterceptContext, InterceptIsolate> e(v8System);
+  e.expectEval("p = new ProxyImpl; p.bar", "number", "123");
+  e.expectEval("p = new ProxyImpl; Reflect.has(p, 'foo')", "boolean", "true");
+  e.expectEval("p = new ProxyImpl; Reflect.has(p, 'bar')", "boolean", "true");
+  e.expectEval("p = new ProxyImpl; Reflect.has(p, 'baz')", "boolean", "false");
+  e.expectEval("p = new ProxyImpl; p.abc", "throws", "TypeError: boom");
+}
 
 // ========================================================================================
-
-struct IsolateUuidContext: public Object {
+struct IsolateUuidContext: public ContextGlobalObject {
   JSG_RESOURCE_TYPE(IsolateUuidContext) {}
 };
 JSG_DECLARE_ISOLATE_TYPE(IsolateUuidIsolate, IsolateUuidContext);
 
 KJ_TEST("jsg::Lock getUuid") {
-  IsolateUuidIsolate isolate(v8System);
-  V8StackScope stackScope;
-  IsolateUuidIsolate::Lock lock(isolate, stackScope);
-  // Returns the same value
-  KJ_ASSERT(lock.getUuid() == lock.getUuid());
-  KJ_ASSERT(isolate.getUuid() == lock.getUuid());
-  KJ_ASSERT(lock.getUuid().size() == 36);
+  IsolateUuidIsolate isolate(v8System, kj::heap<IsolateObserver>());
+  bool called = false;
+  isolate.runInLockScope([&](IsolateUuidIsolate::Lock& lock) {
+    // Returns the same value
+    KJ_ASSERT(lock.getUuid() == lock.getUuid());
+    KJ_ASSERT(isolate.getUuid() == lock.getUuid());
+    KJ_ASSERT(lock.getUuid().size() == 36);
+    called = true;
+  });
+  KJ_ASSERT(called);
 }
+
+}  // namespace
 
 }  // namespace workerd::jsg::test

@@ -18,6 +18,13 @@ public:
       : CryptoKey::Impl(extractable, usages),
         keyData(kj::mv(keyData)), keyAlgorithm(kj::mv(keyAlgorithm)) {}
 
+  kj::StringPtr jsgGetMemoryName() const override { return "HmacKey"; }
+  size_t jsgGetMemorySelfSize() const override { return sizeof(HmacKey); }
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
+    tracker.trackFieldWithSize("keyData", keyData.size());
+    tracker.trackField("keyAlgorithm", keyAlgorithm);
+  }
+
 private:
   kj::Array<kj::byte> sign(
       SubtleCrypto::SignAlgorithm&& algorithm,
@@ -82,7 +89,7 @@ private:
   }
 
   kj::StringPtr getAlgorithmName() const override { return "HMAC"; }
-  CryptoKey::AlgorithmVariant getAlgorithm() const override { return keyAlgorithm; }
+  CryptoKey::AlgorithmVariant getAlgorithm(jsg::Lock& js) const override { return keyAlgorithm; }
 
   bool equals(const CryptoKey::Impl& other) const override final {
     return this == &other || (other.getType() == "secret"_kj && other.equals(keyData));
@@ -93,7 +100,7 @@ private:
            CRYPTO_memcmp(keyData.begin(), other.begin(), keyData.size()) == 0;
   }
 
-  kj::Array<kj::byte> keyData;
+  ZeroOnFree keyData;
   CryptoKey::HmacKeyAlgorithm keyAlgorithm;
 };
 
@@ -112,7 +119,7 @@ void zeroOutTrailingKeyBits(kj::Array<kj::byte>& keyDataArray, int keyBitLength)
 }  // namespace
 
 kj::OneOf<jsg::Ref<CryptoKey>, CryptoKeyPair> CryptoKey::Impl::generateHmac(
-      kj::StringPtr normalizedName,
+      jsg::Lock& js, kj::StringPtr normalizedName,
       SubtleCrypto::GenerateKeyAlgorithm&& algorithm, bool extractable,
       kj::ArrayPtr<const kj::String> keyUsages) {
   KJ_REQUIRE(normalizedName == "HMAC");
@@ -142,7 +149,7 @@ kj::OneOf<jsg::Ref<CryptoKey>, CryptoKeyPair> CryptoKey::Impl::generateHmac(
 }
 
 kj::Own<CryptoKey::Impl> CryptoKey::Impl::importHmac(
-    kj::StringPtr normalizedName, kj::StringPtr format,
+    jsg::Lock& js, kj::StringPtr normalizedName, kj::StringPtr format,
     SubtleCrypto::ImportKeyData keyData,
     SubtleCrypto::ImportKeyAlgorithm&& algorithm, bool extractable,
     kj::ArrayPtr<const kj::String> keyUsages) {
@@ -166,12 +173,12 @@ kj::Own<CryptoKey::Impl> CryptoKey::Impl::importHmac(
     keyDataArray = UNWRAP_JWK_BIGNUM(kj::mv(keyDataJwk.k), DOMDataError,
         "HMAC \"jwk\" key import requires a base64Url encoding of the key");
 
-    KJ_IF_MAYBE(alg, keyDataJwk.alg) {
+    KJ_IF_SOME(alg, keyDataJwk.alg) {
       if (hash.startsWith("SHA-")) {
         auto expectedAlg = kj::str("HS", hash.slice(4));
-        JSG_REQUIRE(*alg == expectedAlg, DOMDataError,
+        JSG_REQUIRE(alg == expectedAlg, DOMDataError,
             "HMAC \"jwk\" key import specifies \"alg\" that is incompatible with the hash name "
-            "(encountered \"", *alg, "\", expected \"", expectedAlg, "\").");
+            "(encountered \"", alg, "\", expected \"", expectedAlg, "\").");
       } else {
         // TODO(conform): Spec says this for non-SHA hashes:
         //     > Perform any key import steps defined by other applicable specifications, passing
@@ -179,7 +186,7 @@ kj::Own<CryptoKey::Impl> CryptoKey::Impl::importHmac(
         //   What other hashes should be supported (if any)? For example, technically we support MD5
         //   below in `lookupDigestAlgorithm` for "raw" keys...
         JSG_FAIL_REQUIRE(DOMNotSupportedError,
-            "Unrecognized or unimplemented hash algorithm requested", *alg);
+            "Unrecognized or unimplemented hash algorithm requested", alg);
       }
     }
   } else {

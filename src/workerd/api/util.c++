@@ -6,6 +6,7 @@
 #include <kj/encoding.h>
 #include <workerd/io/io-context.h>
 #include <workerd/util/thread-scopes.h>
+#include <workerd/util/mimetype.h>
 
 namespace workerd::api {
 
@@ -67,106 +68,37 @@ void parseQueryString(kj::Vector<kj::Url::QueryParam>& query, kj::ArrayPtr<const
   }
 }
 
-kj::Maybe<kj::ArrayPtr<const char>> readContentTypeParameter(kj::StringPtr contentType,
-                                                             kj::StringPtr param) {
-  KJ_IF_MAYBE(semiColon, contentType.findFirst(';')) {
-    // Get to the parameters
-    contentType = contentType.slice(*semiColon + 1);
-
-    // The attribute name of a MIME type parameter is always case-insensitive. See definition of
-    // the attribute production rule in https://tools.ietf.org/html/rfc2045#page-29
-    auto lowerParam = toLower(kj::str(param));
-
-    kj::StringPtr leftover = contentType;
-    while(true) {
-      while (leftover.startsWith(" ") || leftover.startsWith(";")) {
-        leftover = leftover.slice(1);
-      }
-
-      KJ_IF_MAYBE(equal, leftover.findFirst('=')) {
-        // Handle parameter
-        auto name = toLower(kj::str(leftover.slice(0, *equal)));
-        auto valueStart = *equal + 1;
-        kj::ArrayPtr<const char> value = nullptr;
-
-        if (leftover[valueStart] == '"') {
-          // parameter value surrounded by quotes
-          size_t pos = 0;
-          auto valueStr = leftover.slice(valueStart + 1);
-
-          while(pos < valueStr.size()) {
-            if (valueStr[pos] == '\\') {
-              pos++;
-            } else if (valueStr[pos] == '"') {
-              break;
-            }
-            pos++;
-          }
-
-          if (pos >= valueStr.size()) {
-            // invalid value, no closing "
-            break;
-          }
-
-          value = leftover.slice(valueStart + 1, valueStart + 1 + pos);
-          // skip name, =, value and quotes
-          leftover = leftover.slice(name.size() + 1 + value.size() + 2);
-
-        } else {
-          // parameter value with no quotes, just glob until the next ;
-          KJ_IF_MAYBE(valueEnd, leftover.slice(valueStart).findFirst(';')) {
-            value = leftover.slice(valueStart, valueStart + *valueEnd);
-            leftover = leftover.slice(valueStart + *valueEnd + 1);
-          } else {
-            // there's nothing else
-            value = leftover.slice(valueStart);
-            leftover = leftover.slice(leftover.size());
-          }
-
-          // since there are no quotes, remove spurious whitespace at the end
-          while(value.size() > 0 && value[value.size() - 1] == ' ') {
-            value = value.slice(0, value.size() - 1);
-          }
-        }
-
-        // have we got it?
-        if (name == lowerParam && value.size() > 0) {
-          return value;
-        }
-      } else {
-        // skip to next parameter
-        KJ_IF_MAYBE(nextParam, leftover.findFirst(';')) {
-          leftover = leftover.slice(*nextParam + 1);
-        } else {
-          // we are done and we didn't find the parameter
-          break;
-        }
-      }
-    }
+kj::Maybe<kj::String> readContentTypeParameter(kj::StringPtr contentType,
+                                               kj::StringPtr param) {
+  KJ_IF_SOME(parsed, MimeType::tryParse(contentType)) {
+    return parsed.params().find(toLower(param)).map([](auto& value) {
+      return kj::str(value);
+    });
   }
-
-  return nullptr;
+  return kj::none;
 }
 
 kj::Maybe<kj::Exception> translateKjException(const kj::Exception& exception,
     std::initializer_list<ErrorTranslation> translations) {
   for (auto& t: translations) {
-    if (strstr(exception.getDescription().cStr(), t.kjDescription.cStr()) != nullptr) {
+    if (exception.getDescription().contains(t.kjDescription)) {
       return kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
           kj::str(JSG_EXCEPTION(TypeError) ": ", t.jsDescription));
     }
   }
 
-  return nullptr;
+  return kj::none;
 }
 
 namespace {
 
 template <typename Func>
 auto translateTeeErrors(Func&& f) -> decltype(kj::fwd<Func>(f)()) {
-  return kj::evalNow(kj::fwd<Func>(f))
-      .catch_([](kj::Exception&& exception) -> decltype(kj::fwd<Func>(f)()) {
-    KJ_IF_MAYBE(e, translateKjException(exception, {
+  try {
+    co_return co_await f();
+  } catch (...) {
+    auto exception = kj::getCaughtExceptionAsKj();
+    KJ_IF_SOME(e, translateKjException(exception, {
       { "tee buffer size limit exceeded"_kj,
         "ReadableStream.tee() buffer limit exceeded. This error usually occurs when a Request or "
         "Response with a large body is cloned, then only one of the clones is read, forcing "
@@ -174,11 +106,10 @@ auto translateTeeErrors(Func&& f) -> decltype(kj::fwd<Func>(f)()) {
         "unnecessary calls to Request/Response.clone() and ReadableStream.tee(), and always read "
         "clones/tees in parallel."_kj },
     })) {
-      return kj::mv(*e);
+      kj::throwFatalException(kj::mv(e));
     }
-
-    return kj::mv(exception);
-  });
+    kj::throwFatalException(kj::mv(exception));
+  }
 }
 
 }
@@ -288,9 +219,22 @@ double dateNow() {
 kj::Maybe<jsg::V8Ref<v8::Object>> cloneRequestCf(
     jsg::Lock& js,
     kj::Maybe<jsg::V8Ref<v8::Object>> maybeCf) {
-  KJ_IF_MAYBE(cf, maybeCf) {
-    return cf->deepClone(js);
+  KJ_IF_SOME(cf, maybeCf) {
+    return cf.deepClone(js);
   }
-  return nullptr;
+  return kj::none;
+}
+
+void maybeWarnIfNotText(jsg::Lock& js, kj::StringPtr str) {
+  KJ_IF_SOME(parsed, MimeType::tryParse(str)) {
+    if (MimeType::isText(parsed)) return;
+  }
+  // A common mistake is to call .text() on non-text content, e.g. because you're implementing a
+  // search-and-replace across your whole site and you forgot that it'll apply to images too.
+  // When running in the fiddle, let's warn the developer if they do this.
+  js.logWarning(kj::str(
+      "Called .text() on an HTTP body which does not appear to be text. The body's "
+      "Content-Type is \"", str, "\". The result will probably be corrupted. Consider "
+      "checking the Content-Type header before interpreting entities as text."));
 }
 }  // namespace workerd::api

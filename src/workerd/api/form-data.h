@@ -4,21 +4,21 @@
 
 #pragma once
 
-#include <kj/vector.h>
-#include <kj/compat/url.h>
-#include <workerd/jsg/jsg.h>
 #include "blob.h"
+#include <kj/vector.h>
+#include <workerd/jsg/jsg.h>
 #include <workerd/io/compatibility-date.capnp.h>
 
 namespace workerd::api {
 
-namespace url {
-class URLSearchParams;
-}  // namespace url
-
+// Implements the FormData interface as prescribed by:
+// https://xhr.spec.whatwg.org/#interface-formdata
+//
+// NOTE: This class is actually reused by some internal code implementing the fiddle service, for
+//   lack of any other C++ form data parser implementation. In that usage, there is no isolate.
+//   It uses `parse()` and `getData()`. This relies on the ability to construct `File` objects
+//   without an isolate.
 class FormData: public jsg::Object {
-  // Implements the FormData interface as prescribed by:
-  // https://xhr.spec.whatwg.org/#interface-formdata
 private:
   using EntryType = kj::OneOf<jsg::Ref<File>, kj::String>;
   using EntryIteratorType = kj::Array<EntryType>;
@@ -32,45 +32,61 @@ private:
     void visitForGc(jsg::GcVisitor& visitor) {
       visitor.visit(parent);
     }
+
+    JSG_MEMORY_INFO(IteratorState) {
+      tracker.trackField("parent", parent);
+    }
   };
 
 public:
-  kj::Array<kj::byte> serialize(kj::ArrayPtr<const char> boundary);
   // Given a delimiter string `boundary`, serialize all fields in this form data to an array of
   // bytes suitable for use as an HTTP message body.
+  kj::Array<kj::byte> serialize(kj::ArrayPtr<const char> boundary);
 
-  void parse(kj::ArrayPtr<const char> rawText, kj::StringPtr contentType,
-             bool convertFilesToStrings);
   // Parse `rawText`, storing the results in this FormData object. `contentType` must be either
   // multipart/form-data or application/x-www-form-urlencoded.
   //
   // `convertFilesToStrings` is for backwards-compatibility. The first implementation of this
   // class in Workers incorrectly represented files as strings (of their content). Changing this
   // could break deployed code, so this has to be controlled by a compatibility flag.
+  void parse(kj::ArrayPtr<const char> rawText, kj::StringPtr contentType,
+             bool convertFilesToStrings);
 
   struct Entry {
     kj::String name;
     kj::OneOf<jsg::Ref<File>, kj::String> value;
+
+    JSG_MEMORY_INFO(Entry) {
+      tracker.trackField("name", name);
+      KJ_SWITCH_ONEOF(value) {
+        KJ_CASE_ONEOF(file, jsg::Ref<File>) {
+          tracker.trackField("value", file);
+        }
+        KJ_CASE_ONEOF(str, kj::String) {
+          tracker.trackField("value", str);
+        }
+      }
+    }
   };
 
   kj::ArrayPtr<const Entry> getData() { return data; }
 
   // JS API
 
-  static jsg::Ref<FormData> constructor();
   // The spec allows a FormData to be constructed from a <form> HTML element. We don't support that,
   // for obvious reasons, so this constructor doesn't take any parameters. If someone tries to use
   // FormData to represent a <form> element we probably don't have to worry about making the error
   // message they receive too pretty: they won't get farther than `document.getElementById()`.
+  static jsg::Ref<FormData> constructor();
 
   void append(kj::String name, kj::OneOf<jsg::Ref<File>, jsg::Ref<Blob>, kj::String> value,
               jsg::Optional<kj::String> filename);
 
   void delete_(kj::String name);
 
-  kj::Maybe<kj::OneOf<jsg::Ref<File>, kj::String>> get(kj::String name, v8::Isolate* isolate);
+  kj::Maybe<kj::OneOf<jsg::Ref<File>, kj::String>> get(kj::String name);
 
-  kj::Array<kj::OneOf<jsg::Ref<File>, kj::String>> getAll(kj::String name, v8::Isolate* isolate);
+  kj::Array<kj::OneOf<jsg::Ref<File>, kj::String>> getAll(kj::String name);
 
   bool has(kj::String name);
 
@@ -93,9 +109,8 @@ public:
 
   void forEach(
       jsg::Lock& js,
-      jsg::V8Ref<v8::Function> callback,
-      jsg::Optional<jsg::Value> thisArg,
-      const jsg::TypeHandler<EntryType>& handler);
+      jsg::Function<void(EntryType, kj::StringPtr, jsg::Ref<FormData>)> callback,
+      jsg::Optional<jsg::Value> thisArg);
 
   JSG_RESOURCE_TYPE(FormData, CompatibilityFlags::Reader flags) {
     JSG_METHOD(append);
@@ -143,29 +158,31 @@ public:
     }
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("data", data.asPtr());
+  }
+
 private:
   kj::Vector<Entry> data;
 
-  static EntryType clone(v8::Isolate* isolate, EntryType& value);
+  static EntryType clone(EntryType& value);
 
   template <typename Type>
   static kj::Maybe<Type> iteratorNext(jsg::Lock& js, IteratorState& state) {
     if (state.index >= state.parent->data.size()) {
-      return nullptr;
+      return kj::none;
     }
     auto& [key, value] = state.parent->data[state.index++];
     if constexpr (kj::isSameType<Type, EntryIteratorType>()) {
-      return kj::arr<EntryType>(kj::str(key), clone(js.v8Isolate, value));
+      return kj::arr<EntryType>(kj::str(key), clone(value));
     } else if constexpr (kj::isSameType<Type, KeyIteratorType>()) {
       return kj::str(key);
     } else if constexpr (kj::isSameType<Type, ValueIteratorType>()) {
-      return clone(js.v8Isolate, value);
+      return clone(value);
     } else {
       KJ_UNREACHABLE;
     }
   }
-
-  friend class url::URLSearchParams;
 };
 
 #define EW_FORMDATA_ISOLATE_TYPES     \

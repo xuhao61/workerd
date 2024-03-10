@@ -148,21 +148,21 @@ struct ActorCacheConvenienceWrappers {
   }
 
   auto list(kj::StringPtr begin, kj::StringPtr end,
-            kj::Maybe<uint> limit = nullptr, ActorCache::ReadOptions options = {}) {
+            kj::Maybe<uint> limit = kj::none, ActorCache::ReadOptions options = {}) {
     return stringifyValues(target.list(kj::str(begin), kj::str(end), limit, options));
   }
   auto listReverse(kj::StringPtr begin, kj::StringPtr end,
-                   kj::Maybe<uint> limit = nullptr, ActorCache::ReadOptions options = {}) {
+                   kj::Maybe<uint> limit = kj::none, ActorCache::ReadOptions options = {}) {
     return stringifyValues(target.listReverse(kj::str(begin), kj::str(end), limit, options));
   }
 
   auto list(kj::StringPtr begin, decltype(nullptr),
-            kj::Maybe<uint> limit = nullptr, ActorCache::ReadOptions options = {}) {
-    return stringifyValues(target.list(kj::str(begin), nullptr, limit, options));
+            kj::Maybe<uint> limit = kj::none, ActorCache::ReadOptions options = {}) {
+    return stringifyValues(target.list(kj::str(begin), kj::none, limit, options));
   }
   auto listReverse(kj::StringPtr begin, decltype(nullptr),
-                   kj::Maybe<uint> limit = nullptr, ActorCache::ReadOptions options = {}) {
-    return stringifyValues(target.listReverse(kj::str(begin), nullptr, limit, options));
+                   kj::Maybe<uint> limit = kj::none, ActorCache::ReadOptions options = {}) {
+    return stringifyValues(target.listReverse(kj::str(begin), kj::none, limit, options));
   }
 
   auto put(kj::StringPtr key, kj::StringPtr value, ActorCache::WriteOptions options = {}) {
@@ -268,7 +268,7 @@ KJ_TEST("ActorCache single-key basics") {
         .thenReturn(CAPNP());
 
     auto result = promise.wait(ws);
-    KJ_EXPECT(result == nullptr);
+    KJ_EXPECT(result == kj::none);
   }
 
   // Get cached.
@@ -278,7 +278,7 @@ KJ_TEST("ActorCache single-key basics") {
   }
   {
     auto result = expectCached(test.get("bar"));
-    KJ_EXPECT(result == nullptr);
+    KJ_EXPECT(result == kj::none);
   }
 
   // Overwrite with a put().
@@ -305,7 +305,7 @@ KJ_TEST("ActorCache single-key basics") {
 
   {
     auto result = expectCached(test.get("foo"));
-    KJ_EXPECT(result == nullptr);
+    KJ_EXPECT(result == kj::none);
   }
 }
 
@@ -421,14 +421,14 @@ KJ_TEST("ActorCache more deletes") {
     auto promise = expectUncached(test.delete_("foo"));
 
     // Value is immediately in cache.
-    KJ_ASSERT(expectCached(test.get("foo")) == nullptr);
+    KJ_ASSERT(expectCached(test.get("foo")) == kj::none);
 
     auto mockDelete = mockStorage->expectCall("delete", ws)
         .withParams(CAPNP(keys = ["foo"]));
 
     // Still in cache during flush.
     KJ_ASSERT(!promise.poll(ws));
-    KJ_ASSERT(expectCached(test.get("foo")) == nullptr);
+    KJ_ASSERT(expectCached(test.get("foo")) == kj::none);
 
     kj::mv(mockDelete).thenReturn(CAPNP(numDeleted = 1));
 
@@ -437,7 +437,7 @@ KJ_TEST("ActorCache more deletes") {
   }
 
   // Still in cache after transaction completion.
-  KJ_ASSERT(expectCached(test.get("foo")) == nullptr);
+  KJ_ASSERT(expectCached(test.get("foo")) == kj::none);
 
   // Try a case where the key isn't on disk.
   {
@@ -479,7 +479,7 @@ KJ_TEST("ActorCache more deletes") {
         .thenReturn(CAPNP(numDeleted = 1));
   }
 
-  KJ_ASSERT(expectCached(test.get("foo")) == nullptr);
+  KJ_ASSERT(expectCached(test.get("foo")) == kj::none);
 }
 
 KJ_TEST("ActorCache more multi-puts") {
@@ -974,9 +974,9 @@ KJ_TEST("ActorCache canceled deletes are coalesced") {
   auto& mockStorage = test.mockStorage;
 
   // A bunch of deletes where we immediately drop the returned promises.
-  expectUncached(test.delete_("foo"));
-  expectUncached(test.delete_({"bar"_kj, "baz"_kj}));
-  expectUncached(test.delete_("qux"));
+  (void)expectUncached(test.delete_("foo"));
+  (void)expectUncached(test.delete_({"bar"_kj, "baz"_kj}));
+  (void)expectUncached(test.delete_("qux"));
 
   // Keep one promise.
   auto promise = expectUncached(test.delete_("corge"));
@@ -1325,7 +1325,7 @@ KJ_TEST("ActorCache flush hard failure") {
   {
     mockStorage->expectCall("put", ws)
         .withParams(CAPNP(entries = [(key = "foo", value = "123")]))
-        .thenThrow(JSG_KJ_EXCEPTION(FAILED, Error, "flush failed hard"));
+        .thenThrow(KJ_EXCEPTION(FAILED, "jsg.Error: flush failed hard"));
   }
 
   KJ_EXPECT_THROW_MESSAGE("broken.outputGateBroken; jsg.Error: flush failed hard", promise.wait(ws));
@@ -1350,7 +1350,7 @@ KJ_TEST("ActorCache flush hard failure with output gate bypass") {
   {
     mockStorage->expectCall("put", ws)
         .withParams(CAPNP(entries = [(key = "foo", value = "123")]))
-        .thenThrow(JSG_KJ_EXCEPTION(FAILED, Error, "flush failed hard"));
+        .thenThrow(KJ_EXCEPTION(FAILED, "jsg.Error: flush failed hard"));
   }
 
   // The failure was still propagated to the output gate.
@@ -1530,9 +1530,9 @@ KJ_TEST("ActorCache get-multiple multiple blocks") {
     // At this point, "bar" and "baz" are considered cached.
     KJ_ASSERT(expectCached(test.get("bar")) == nullptr);
     KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("baz"))) == "456");
-    expectUncached(test.get("corge"));
-    expectUncached(test.get("foo"));
-    expectUncached(test.get("qux"));
+    (void)expectUncached(test.get("corge"));
+    (void)expectUncached(test.get("foo"));
+    (void)expectUncached(test.get("qux"));
 
     stream.call("values", CAPNP(list = [(key = "foo", value = "789")]))
         .expectReturns(CAPNP(), ws);
@@ -1542,7 +1542,7 @@ KJ_TEST("ActorCache get-multiple multiple blocks") {
     KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("baz"))) == "456");
     KJ_ASSERT(expectCached(test.get("corge")) == nullptr);
     KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("foo"))) == "789");
-    expectUncached(test.get("qux"));
+    (void)expectUncached(test.get("qux"));
 
     stream.call("end", CAPNP()).expectReturns(CAPNP(), ws);
 
@@ -1712,7 +1712,7 @@ KJ_TEST("ActorCache list() with limit") {
   KJ_ASSERT(expectCached(test.get("fon")) == nullptr);
 
   // Stuff after the last key is not in cache.
-  expectUncached(test.get("fooa"));
+  (void)expectUncached(test.get("fooa"));
 
   // Listing the same range again, with the same limit or lower, is fully cached.
   KJ_ASSERT(expectCached(test.list("bar", "qux", 3)) ==
@@ -1859,9 +1859,9 @@ KJ_TEST("ActorCache list() multiple ranges") {
   KJ_ASSERT(expectCached(test.list("a", "c")) == kvs({{"a", "1"}, {"b", "2"}}));
   KJ_ASSERT(expectCached(test.list("x", "z")) == kvs({{"y", "9"}}));
 
-  expectUncached(test.get("w"));
-  expectUncached(test.get("d"));
-  expectUncached(test.get("c"));
+  (void)expectUncached(test.get("w"));
+  (void)expectUncached(test.get("d"));
+  (void)expectUncached(test.get("c"));
 }
 
 KJ_TEST("ActorCache list() with some already-cached keys in range") {
@@ -2714,7 +2714,7 @@ KJ_TEST("ActorCache listReverse() with limit") {
   KJ_ASSERT(expectCached(test.get("fon")) == nullptr);
 
   // Stuff before the first key is not in cache.
-  expectUncached(test.get("baq"));
+  (void)expectUncached(test.get("baq"));
 
   // Listing the same range again, with the same limit or lower, is fully cached.
   KJ_ASSERT(expectCached(test.listReverse("bar", "qux", 3)) ==
@@ -2861,9 +2861,9 @@ KJ_TEST("ActorCache listReverse() multiple ranges") {
   KJ_ASSERT(expectCached(test.listReverse("a", "c")) == kvs({{"b", "2"}, {"a", "1"}}));
   KJ_ASSERT(expectCached(test.listReverse("x", "z")) == kvs({{"y", "9"}}));
 
-  expectUncached(test.get("w"));
-  expectUncached(test.get("d"));
-  expectUncached(test.get("c"));
+  (void)expectUncached(test.get("w"));
+  (void)expectUncached(test.get("d"));
+  (void)expectUncached(test.get("c"));
 }
 
 KJ_TEST("ActorCache listReverse() with some already-cached keys in range") {
@@ -3497,8 +3497,9 @@ KJ_TEST("ActorCache listReverse() retry on failure") {
 // =======================================================================================
 // LRU purge
 
+constexpr size_t ENTRY_SIZE = 128;
 KJ_TEST("ActorCache LRU purge") {
-  ActorCacheTest test({.softLimit = 128});  // big enough for one entry with small key/value
+  ActorCacheTest test({.softLimit = 1 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3523,11 +3524,11 @@ KJ_TEST("ActorCache LRU purge") {
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("bar"))) == "456");
 
   // But foo was evicted.
-  expectUncached(test.get("foo"));
+  (void)expectUncached(test.get("foo"));
 }
 
 KJ_TEST("ActorCache LRU purge ordering") {
-  ActorCacheTest test({.softLimit = 512});  // big enough for four entries
+  ActorCacheTest test({.softLimit = 4 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3554,15 +3555,15 @@ KJ_TEST("ActorCache LRU purge ordering") {
 
   // Foo and qux live, bar and baz evicted.
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("foo"))) == "123");
-  expectUncached(test.get("bar"));
-  expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("bar"));
+  (void)expectUncached(test.get("baz"));
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("qux"))) == "555");
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("xxx"))) == "aaa");
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("yyy"))) == "bbb");
 }
 
 KJ_TEST("ActorCache LRU purge larger") {
-  ActorCacheTest test({.softLimit = 4096});
+  ActorCacheTest test({.softLimit = 32 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3614,9 +3615,9 @@ KJ_TEST("ActorCache LRU purge larger") {
     test.gate.wait().wait(ws);
   }
 
-  expectUncached(test.get("bar"));
-  expectUncached(test.get("baz"));
-  expectUncached(test.get("qux"));
+  (void)expectUncached(test.get("bar"));
+  (void)expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("qux"));
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("corge"))) == kilobyte);
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("grault"))) == kilobyte);
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("garply"))) == kilobyte);
@@ -3642,9 +3643,9 @@ KJ_TEST("ActorCache LRU purge") {
 
   // Nothing was cached, because nothing fit in the LRU.
   KJ_ASSERT(test.lru.currentSize() == 0);
-  expectUncached(test.get("foo"));
-  expectUncached(test.get("bar"));
-  expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("foo"));
+  (void)expectUncached(test.get("bar"));
+  (void)expectUncached(test.get("baz"));
 }
 
 KJ_TEST("ActorCache evict on timeout") {
@@ -3653,7 +3654,7 @@ KJ_TEST("ActorCache evict on timeout") {
   auto& mockStorage = test.mockStorage;
 
   auto timePoint = kj::UNIX_EPOCH;
-  KJ_ASSERT(test.cache.evictStale(timePoint) == nullptr);
+  KJ_ASSERT(test.cache.evictStale(timePoint) == kj::none);
 
   auto ackFlush = [&]() {
     mockStorage->expectCall("put", ws).thenReturn(CAPNP());
@@ -3665,9 +3666,9 @@ KJ_TEST("ActorCache evict on timeout") {
   test.put("bar", "456");
   ackFlush();
 
-  KJ_ASSERT(test.cache.evictStale(timePoint + 100 * kj::MILLISECONDS) == nullptr);
-  KJ_ASSERT(test.cache.evictStale(timePoint + 200 * kj::MILLISECONDS) == nullptr);
-  KJ_ASSERT(test.cache.evictStale(timePoint + 500 * kj::MILLISECONDS) == nullptr);
+  KJ_ASSERT(test.cache.evictStale(timePoint + 100 * kj::MILLISECONDS) == kj::none);
+  KJ_ASSERT(test.cache.evictStale(timePoint + 200 * kj::MILLISECONDS) == kj::none);
+  KJ_ASSERT(test.cache.evictStale(timePoint + 500 * kj::MILLISECONDS) == kj::none);
 
   expectCached(test.get("foo"));
   expectCached(test.get("bar"));
@@ -3686,7 +3687,7 @@ KJ_TEST("ActorCache evict on timeout") {
   // Now foo should be evicted and bar and baz stale.
 
   // Verify foo is evicted.
-  expectUncached(test.get("foo"));
+  (void)expectUncached(test.get("foo"));
 
   // Touch bar.
   expectCached(test.get("bar"));
@@ -3695,12 +3696,11 @@ KJ_TEST("ActorCache evict on timeout") {
   // Now baz should have been evicted, but bar is still here because we keep touching it.
 
   expectCached(test.get("bar"));
-  expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("baz"));
 }
 
 KJ_TEST("ActorCache backpressure due to dirtyPressureThreshold") {
-  // Each Entry below ends up being about ~126 bytes, so a limit of 256 allows for 2 entries.
-  ActorCacheTest test({.dirtyListByteLimit = 256});
+  ActorCacheTest test({.dirtyListByteLimit = 2 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3754,7 +3754,7 @@ KJ_TEST("ActorCache backpressure due to dirtyPressureThreshold") {
 }
 
 KJ_TEST("ActorCache lru evict entry with known-empty gaps") {
-  ActorCacheTest test({.softLimit = 700});  // just big enough for the first list results
+  ActorCacheTest test({.softLimit = 5 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3781,9 +3781,9 @@ KJ_TEST("ActorCache lru evict entry with known-empty gaps") {
       kvs({{"bar", "456"}, {"baz", "789"}, {"corge", "555"}, {"foo", "123"}}));
 
   // touch some stuff so that "corge" is the oldest entry.
+  expectCached(test.list("foo", "qux"));
   expectCached(test.get("bar"));
   expectCached(test.get("baz"));
-  expectCached(test.get("foo"));
 
   // do a put() to force an eviction.
   {
@@ -3801,13 +3801,62 @@ KJ_TEST("ActorCache lru evict entry with known-empty gaps") {
   KJ_ASSERT(expectCached(test.list("foo", "qux")) == kvs({{"foo", "123"}}));
   KJ_ASSERT(expectCached(test.get("fooa")) == nullptr);
 
-  expectUncached(test.get("baza"));
-  expectUncached(test.get("corge"));
-  expectUncached(test.get("fo"));
+  (void)expectUncached(test.get("baza"));
+  (void)expectUncached(test.get("corge"));
+  (void)expectUncached(test.get("fo"));
+}
+
+KJ_TEST("ActorCache lru evict gap entry with known-empty gaps") {
+  ActorCacheTest test({.softLimit = 5 * ENTRY_SIZE});
+  auto& ws = test.ws;
+  auto& mockStorage = test.mockStorage;
+
+  // Populate cache.
+  {
+    auto promise = expectUncached(test.list("bar", "qux"));
+
+    mockStorage->expectCall("list", ws)
+        .withParams(CAPNP(start = "bar", end = "qux"), "stream"_kj)
+        .useCallback("stream", [&](MockClient stream) {
+      stream.call("values", CAPNP(list = [(key = "bar", value = "456"),
+                                          (key = "baz", value = "789"),
+                                          (key = "corge", value = "555"),
+                                          (key = "foo", value = "123")]))
+          .expectReturns(CAPNP(), ws);
+      stream.call("end", CAPNP()).expectReturns(CAPNP(), ws);
+    }).expectCanceled();
+
+    KJ_ASSERT(promise.wait(ws) ==
+        kvs({{"bar", "456"}, {"baz", "789"}, {"corge", "555"}, {"foo", "123"}}));
+  }
+
+  KJ_ASSERT(expectCached(test.list("bar", "qux")) ==
+      kvs({{"bar", "456"}, {"baz", "789"}, {"corge", "555"}, {"foo", "123"}}));
+
+  // touch some stuff so that "qux" is the oldest entry.
+  expectCached(test.get("bar"));
+  expectCached(test.get("baz"));
+  expectCached(test.get("corge"));
+  expectCached(test.get("foo"));
+
+  // We still have a cached gap between "foo" and "qux".
+  KJ_ASSERT(expectCached(test.get("foo+1")) == nullptr);
+
+  // do a put() to force an eviction.
+  {
+    test.put("xyzzy", "x");
+
+    mockStorage->expectCall("put", ws)
+        .withParams(CAPNP(entries = [(key = "xyzzy", value = "x")]))
+        .thenReturn(CAPNP());
+  }
+
+  // Okay, that gap is gone now.
+  (void)expectUncached(test.get("foo+1"));
 }
 
 KJ_TEST("ActorCache lru evict entry with trailing known-empty gap (followed by END_GAP)") {
-  ActorCacheTest test({.softLimit = 700});  // just big enough for the first list results
+  ActorCacheTest test({.softLimit = 5 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3851,15 +3900,15 @@ KJ_TEST("ActorCache lru evict entry with trailing known-empty gap (followed by E
   KJ_ASSERT(expectCached(test.list("bar", "corge")) == kvs({{"bar", "456"}, {"baz", "789"}}));
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("corge"))) == "555");
 
-  expectUncached(test.get("corgf"));
-  expectUncached(test.get("foo"));
-  expectUncached(test.get("quw"));
-  expectUncached(test.get("qux"));
-  expectUncached(test.get("quy"));
+  (void)expectUncached(test.get("corgf"));
+  (void)expectUncached(test.get("foo"));
+  (void)expectUncached(test.get("quw"));
+  (void)expectUncached(test.get("qux"));
+  (void)expectUncached(test.get("quy"));
 }
 
 KJ_TEST("ActorCache timeout entry with known-empty gaps") {
-  ActorCacheTest test({.softLimit = 700});  // just big enough for the first list results
+  ActorCacheTest test({.softLimit = 5 * ENTRY_SIZE});
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -3892,9 +3941,9 @@ KJ_TEST("ActorCache timeout entry with known-empty gaps") {
   test.cache.evictStale(startTime + 1 * kj::SECONDS);
 
   // touch some stuff so that "corge" is the only STALE entry.
+  expectCached(test.list("foo", "qux"));
   expectCached(test.get("bar"));
   expectCached(test.get("baz"));
-  expectCached(test.get("foo"));
 
   // Time out "corge".
   test.cache.evictStale(startTime + 2 * kj::SECONDS);
@@ -3906,9 +3955,50 @@ KJ_TEST("ActorCache timeout entry with known-empty gaps") {
   KJ_ASSERT(expectCached(test.list("foo", "qux")) == kvs({{"foo", "123"}}));
   KJ_ASSERT(expectCached(test.get("fooa")) == nullptr);
 
-  expectUncached(test.get("baza"));
-  expectUncached(test.get("corge"));
-  expectUncached(test.get("fo"));
+  (void)expectUncached(test.get("baza"));
+  (void)expectUncached(test.get("corge"));
+  (void)expectUncached(test.get("fo"));
+}
+
+
+KJ_TEST("ActorCache evictStale entire list with end marker") {
+  ActorCacheTest test;
+  auto& ws = test.ws;
+  auto& mockStorage = test.mockStorage;
+
+  auto timePoint = kj::UNIX_EPOCH;
+  KJ_ASSERT(test.cache.evictStale(timePoint) == nullptr);
+
+  {
+    // Populate a decent list.
+    auto promise = expectUncached(test.list("bar", "qux"));
+
+    mockStorage->expectCall("list", ws)
+        .withParams(CAPNP(start = "bar", end = "qux"), "stream"_kj)
+        .useCallback("stream", [&](MockClient stream) {
+      stream.call("values", CAPNP(list = [(key = "bar", value = "456"),
+                                          (key = "baz", value = "789"),
+                                          (key = "corge", value = "555"),
+                                          (key = "foo", value = "123")]))
+          .expectReturns(CAPNP(), ws);
+      stream.call("end", CAPNP()).expectReturns(CAPNP(), ws);
+    }).expectCanceled();
+
+    KJ_ASSERT(promise.wait(ws) ==
+        kvs({{"bar", "456"}, {"baz", "789"}, {"corge", "555"}, {"foo", "123"}}));
+  }
+
+  KJ_EXPECT(test.lru.currentSize() > 0);
+
+  // First mark the entire cache as stale.
+  timePoint += 1 * kj::SECONDS;
+  KJ_ASSERT(test.cache.evictStale(timePoint) == nullptr);
+  KJ_EXPECT(test.lru.currentSize() > 0);
+
+  // Evict the entire cache.
+  timePoint += 1 * kj::SECONDS;
+  KJ_ASSERT(test.cache.evictStale(timePoint) == nullptr);
+  KJ_EXPECT(test.lru.currentSize() == 0);
 }
 
 KJ_TEST("ActorCache purge everything while listing") {
@@ -3935,10 +4025,10 @@ KJ_TEST("ActorCache purge everything while listing") {
         kvs({{"bar", "456"}, {"baz", "789"}, {"corge", "555"}, {"foo", "123"}}));
   }
 
-  expectUncached(test.get("bar"));
-  expectUncached(test.get("baz"));
-  expectUncached(test.get("corge"));
-  expectUncached(test.get("foo"));
+  (void)expectUncached(test.get("bar"));
+  (void)expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("corge"));
+  (void)expectUncached(test.get("foo"));
 }
 
 KJ_TEST("ActorCache purge everything while listing; has previous entry") {
@@ -3974,7 +4064,11 @@ KJ_TEST("ActorCache purge everything while listing; has previous entry") {
 }
 
 KJ_TEST("ActorCache exceed hard limit on read") {
-  ActorCacheTest test({.monitorOutputGate = false, .softLimit = 256, .hardLimit = 256});
+  ActorCacheTest test({
+    .monitorOutputGate = false,
+    .softLimit = 2 * ENTRY_SIZE,
+    .hardLimit = 2 * ENTRY_SIZE
+  });
   auto& ws = test.ws;
   auto& mockStorage = test.mockStorage;
 
@@ -4019,7 +4113,11 @@ KJ_TEST("ActorCache exceed hard limit on read") {
 }
 
 KJ_TEST("ActorCache exceed hard limit on write") {
-  ActorCacheTest test({.monitorOutputGate = false, .softLimit = 256, .hardLimit = 256});
+  ActorCacheTest test({
+    .monitorOutputGate = false,
+    .softLimit = 2 * ENTRY_SIZE,
+    .hardLimit = 2 * ENTRY_SIZE
+  });
   auto& ws = test.ws;
 
   auto brokenPromise = test.gate.onBroken();
@@ -4112,7 +4210,7 @@ KJ_TEST("ActorCache skip cache") {
 
   // Do an uncached list.
   {
-    auto promise = expectUncached(test.list("bar", "qux", nullptr, {.noCache = true}));
+    auto promise = expectUncached(test.list("bar", "qux", kj::none, {.noCache = true}));
 
     mockStorage->expectCall("list", ws)
         .withParams(CAPNP(start = "bar", end = "qux"), "stream"_kj)
@@ -4131,16 +4229,16 @@ KJ_TEST("ActorCache skip cache") {
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("foo"))) == "qux");
 
   // The other things that were returned weren't cached.
-  expectUncached(test.get("bar"));
-  expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("bar"));
+  (void)expectUncached(test.get("baz"));
 
   // No gaps were cached as empty either.
-  expectUncached(test.get("corge"));
-  expectUncached(test.get("grault"));
+  (void)expectUncached(test.get("corge"));
+  (void)expectUncached(test.get("grault"));
 
   // Again, but reverse list.
   {
-    auto promise = expectUncached(test.listReverse("bar", "qux", nullptr, {.noCache = true}));
+    auto promise = expectUncached(test.listReverse("bar", "qux", kj::none, {.noCache = true}));
 
     mockStorage->expectCall("list", ws)
         .withParams(CAPNP(start = "bar", end = "qux", reverse = true), "stream"_kj)
@@ -4159,12 +4257,12 @@ KJ_TEST("ActorCache skip cache") {
   KJ_ASSERT(KJ_ASSERT_NONNULL(expectCached(test.get("foo"))) == "qux");
 
   // The other things that were returned weren't cached.
-  expectUncached(test.get("bar"));
-  expectUncached(test.get("baz"));
+  (void)expectUncached(test.get("bar"));
+  (void)expectUncached(test.get("baz"));
 
   // No gaps were cached as empty either.
-  expectUncached(test.get("corge"));
-  expectUncached(test.get("grault"));
+  (void)expectUncached(test.get("corge"));
+  (void)expectUncached(test.get("grault"));
 }
 
 // =======================================================================================
@@ -4748,13 +4846,13 @@ KJ_TEST("ActorCache alarm get/put") {
     mockStorage->expectCall("getAlarm", ws)
       .thenReturn(CAPNP(scheduledTimeMs = 0));
 
-    KJ_ASSERT(time.wait(ws) == nullptr);
+    KJ_ASSERT(time.wait(ws) == kj::none);
   }
 
   {
     auto time = expectCached(test.getAlarm());
 
-    KJ_ASSERT(time == nullptr);
+    KJ_ASSERT(time == kj::none);
   }
 
   auto oneMs = 1 * kj::MILLISECONDS + kj::UNIX_EPOCH;
@@ -4783,7 +4881,7 @@ KJ_TEST("ActorCache alarm get/put") {
 
   {
     // Test clearing alarm
-    test.setAlarm(nullptr);
+    test.setAlarm(kj::none);
 
     // When there are no other storage operations to be flushed, alarm modifications can be flushed
     // without a wrapping txn.
@@ -4797,11 +4895,11 @@ KJ_TEST("ActorCache alarm get/put") {
   {
     auto time = expectCached(test.getAlarm());
 
-    KJ_ASSERT(time == nullptr);
+    KJ_ASSERT(time == kj::none);
   }
 
   // we have a cached time == nullptr, so we should not attempt to run an alarm
-  KJ_ASSERT(test.cache.armAlarmHandler(10 * kj::SECONDS + kj::UNIX_EPOCH, false) == nullptr);
+  KJ_ASSERT(test.cache.armAlarmHandler(10 * kj::SECONDS + kj::UNIX_EPOCH, false) == kj::none);
 
   {
     test.setAlarm(oneMs);
@@ -4864,7 +4962,7 @@ KJ_TEST("ActorCache alarm get/put") {
     mockStorage->expectCall("getAlarm", ws)
       .thenReturn(CAPNP(scheduledTimeMs = 0));
 
-    KJ_ASSERT(time.wait(ws) == nullptr);
+    KJ_ASSERT(time.wait(ws) == kj::none);
   }
 }
 
@@ -4909,7 +5007,7 @@ KJ_TEST("ActorCache alarm delete when flush fails") {
     auto handle = test.cache.armAlarmHandler(oneMs, false);
 
     auto time = expectCached(test.getAlarm());
-    KJ_ASSERT(time == nullptr);
+    KJ_ASSERT(time == kj::none);
   }
 
   for(auto i = 0; i < 2; i++) {
@@ -4989,16 +5087,16 @@ KJ_TEST("ActorCache can wait for flush") {
     scheduledPromise.wait(ws);
     inFlightPromise.wait(ws);
 
-    KJ_IF_MAYBE(secondOperation, maybeSecondOperation) {
+    KJ_IF_SOME(secondOperation, maybeSecondOperation) {
       // This promise is for a later flush, so it should not have resolved yet.
-      KJ_ASSERT(!secondOperation->scheduledPromise.poll(ws));
+      KJ_ASSERT(!secondOperation.scheduledPromise.poll(ws));
 
       // Finish our secondary put and observe the second flush resolving.
       auto params =
-          kj::str(R"((entries = [(key = ")", secondOperation->key, R"(", value = "bar")]))");
+          kj::str(R"((entries = [(key = ")", secondOperation.key, R"(", value = "bar")]))");
       mockStorage->expectCall("put", ws).withParams(params).thenReturn(CAPNP());
 
-      secondOperation->scheduledPromise.wait(ws);
+      secondOperation.scheduledPromise.wait(ws);
     }
 
     // We finished our flush, nothing left to do.
@@ -5172,10 +5270,10 @@ KJ_TEST("ActorCache can shutdown") {
       KJ_EXPECT_THROW_MESSAGE(errorMessage, shutdownPromise.wait(ws));
       KJ_EXPECT(test.cache.onNoPendingFlush() == nullptr);
       KJ_EXPECT_THROW_MESSAGE(errorMessage, test.gate.wait().wait(ws));
-    } else KJ_IF_MAYBE(promise, maybeShutdownPromise) {
+    } else KJ_IF_SOME(promise, maybeShutdownPromise) {
       // The in-flight flush should resolve cleanly without any follow on or breaking the output
       // gate.
-      promise->wait(ws);
+      promise.wait(ws);
       KJ_EXPECT(test.cache.onNoPendingFlush() == nullptr);
       test.gate.wait().wait(ws);
     }
@@ -5196,14 +5294,14 @@ KJ_TEST("ActorCache can shutdown") {
   };
 
   auto verify = [&](auto&& beforeShutdown, auto&& afterShutdown) {
-    verifyWithOptions(beforeShutdown, afterShutdown, {.maybeError = nullptr});
+    verifyWithOptions(beforeShutdown, afterShutdown, {.maybeError = kj::none});
     verifyWithOptions(beforeShutdown, afterShutdown, {.maybeError = KJ_EXCEPTION(FAILED, "Nope.")});
   };
 
   verify([](ActorCacheTest& test){
     // Do nothing and expect nothing!
     return BeforeShutdownResult{
-      .maybeReq = nullptr,
+      .maybeReq = kj::none,
       .shouldBreakOutputGate = false,
     };
   }, [](ActorCacheTest& test, kj::Maybe<InFlightRequest>){
@@ -5217,7 +5315,7 @@ KJ_TEST("ActorCache can shutdown") {
 
     // Expect the put to be cancelled and break the gate.
     return BeforeShutdownResult{
-      .maybeReq = nullptr,
+      .maybeReq = kj::none,
       .shouldBreakOutputGate = true,
     };
   }, [](ActorCacheTest& test, kj::Maybe<InFlightRequest>){
@@ -5231,7 +5329,7 @@ KJ_TEST("ActorCache can shutdown") {
 
     // Expect the put to be cancelled and break the gate.
     return BeforeShutdownResult{
-      .maybeReq = nullptr,
+      .maybeReq = kj::none,
       .shouldBreakOutputGate = true,
     };
   }, [](ActorCacheTest& test, kj::Maybe<InFlightRequest>){

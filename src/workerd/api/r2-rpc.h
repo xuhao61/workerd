@@ -4,10 +4,15 @@
 
 #pragma once
 
-#include <workerd/api/http.h>
+#include <workerd/api/basics.h>
+#include <workerd/api/blob.h>
 #include <workerd/jsg/jsg.h>
 
 namespace workerd::api {
+
+class ReadableStreamSource;
+class ReadableStream;
+
 // NOTE: We don't currently actually use this as a structured object (hence the `kj::Own<R2Error>`
 // that we see pop up).
 // TODO(soon): Switch to structured objects and use jsg::Ref<R2Error> instead of kj::Own<R2Error>
@@ -20,7 +25,7 @@ public:
   uint getV4Code() const { return v4Code; }
   kj::StringPtr getMessage() const { return message; }
   kj::StringPtr getAction() const { return KJ_ASSERT_NONNULL(action); }
-  v8::Local<v8::Value> getStack(v8::Isolate* isolate);
+  jsg::JsValue getStack(jsg::Lock& js);
 
   JSG_RESOURCE_TYPE(R2Error) {
     JSG_INHERIT_INTRINSIC(v8::kErrorPrototype);
@@ -53,9 +58,12 @@ using R2PutValue = kj::OneOf<jsg::Ref<ReadableStream>, kj::Array<kj::byte>,
 
 struct R2Result {
   uint httpStatus;
-  kj::Maybe<kj::Own<R2Error>> toThrow;
+
   // Non-null if httpStatus >= 400.
+  kj::Maybe<kj::Own<R2Error>> toThrow;
+
   kj::Maybe<kj::Array<char>> metadataPayload;
+
   kj::Maybe<kj::Own<workerd::api::ReadableStreamSource>> stream;
 
   bool objectNotFound() {
@@ -74,10 +82,9 @@ kj::Promise<R2Result> doR2HTTPGetRequest(
     kj::Own<kj::HttpClient> client,
     kj::String metadataPayload,
     kj::ArrayPtr<kj::StringPtr> path,
-    kj::Maybe<kj::StringPtr> jwt);
+    kj::Maybe<kj::StringPtr> jwt, CompatibilityFlags::Reader flags);
 
 kj::Promise<R2Result> doR2HTTPPutRequest(
-    jsg::Lock& js,
     kj::Own<kj::HttpClient> client,
     kj::Maybe<R2PutValue> value,
     kj::Maybe<uint64_t> streamSize,

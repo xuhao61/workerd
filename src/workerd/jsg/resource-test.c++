@@ -3,13 +3,15 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "jsg-test.h"
+#include <workerd/jsg/resource-test.capnp.h>
 
 namespace workerd::jsg::test {
 namespace {
 
 V8System v8System;
+class ContextGlobalObject: public Object, public ContextGlobal {};
 
-struct BoxContext: public Object {
+struct BoxContext: public ContextGlobalObject {
   JSG_RESOURCE_TYPE(BoxContext) {
     JSG_NESTED_TYPE(NumberBox);
     JSG_NESTED_TYPE(BoxBox);
@@ -86,7 +88,7 @@ struct InheritsMixin: public Object, public Mixin {
     JSG_METHOD(getValue);
   }
 };
-struct InheritsMixinContext: public Object {
+struct InheritsMixinContext: public ContextGlobalObject {
   Ref<InheritsMixin> makeInheritsMixin(int i) {
     return jsg::alloc<InheritsMixin>(i);
   }
@@ -122,7 +124,7 @@ struct PrototypePropertyObject: public Object {
   }
 };
 
-struct PropContext: public Object {
+struct PropContext: public ContextGlobalObject {
   PropContext(): contextProperty(kj::str("default-context-property-value")) {}
 
   kj::StringPtr getContextProperty() { return contextProperty; }
@@ -190,7 +192,7 @@ KJ_TEST("context methods and properties") {
 
 // ========================================================================================
 
-struct NonConstructibleContext: public Object {
+struct NonConstructibleContext: public ContextGlobalObject {
   struct NonConstructible: public Object {
     NonConstructible(double x): x(x) {}
 
@@ -234,7 +236,7 @@ KJ_TEST("non-constructible types can't be constructed") {
 
 // ========================================================================================
 
-struct IterableContext: public Object {
+struct IterableContext: public ContextGlobalObject {
   class Iterable: public Object {
   public:
     static Ref<Iterable> constructor() { return jsg::alloc<Iterable>(); }
@@ -252,7 +254,7 @@ struct IterableContext: public Object {
 
       NextValue next() {
         if (cursor == parent->values + sizeof(parent->values) / sizeof(*parent->values)) {
-          return {.done = true, .value = nullptr};
+          return {.done = true, .value = kj::none};
         }
         return {.done = false, .value = *cursor++};
       }
@@ -324,7 +326,7 @@ KJ_TEST("Iterables can be iterated") {
 
 // ========================================================================================
 
-struct StaticContext: public Object {
+struct StaticContext: public ContextGlobalObject {
   struct StaticConstants: public Object {
     static Ref<StaticConstants> constructor() { return jsg::alloc<StaticConstants>(); }
 
@@ -354,6 +356,7 @@ struct StaticContext: public Object {
     static Unimplemented unimplementedStaticMethod() { return {}; }
 
     static void delete_() {}
+
 
     JSG_RESOURCE_TYPE(StaticMethods) {
       JSG_STATIC_METHOD(passThrough);
@@ -511,7 +514,7 @@ KJ_TEST("Static methods can be monkey-patched") {
 
 // ========================================================================================
 
-struct ReflectionContext: public Object {
+struct ReflectionContext: public ContextGlobalObject {
   struct Super: public Object {
     JSG_RESOURCE_TYPE(Super) {}
   };
@@ -521,8 +524,8 @@ struct ReflectionContext: public Object {
       auto result = jsg::alloc<Reflector>();
 
       // Check reflection returns null when wrapper isn't allocated.
-      KJ_EXPECT(result->intReflector.get(isolate, "foo") == nullptr);
-      KJ_EXPECT(result->stringReflector.get(isolate, "foo") == nullptr);
+      KJ_EXPECT(result->intReflector.get(isolate, "foo") == kj::none);
+      KJ_EXPECT(result->stringReflector.get(isolate, "foo") == kj::none);
 
       return result;
     }
@@ -574,7 +577,7 @@ KJ_TEST("PropertyReflection works") {
 
 // ========================================================================================
 
-struct InjectLockContext: public Object {
+struct InjectLockContext: public ContextGlobalObject {
   struct Thingy: public Object {
     Thingy(int val, v8::Isolate* v8Isolate): val(val), v8Isolate(v8Isolate) {}
     int val;
@@ -623,6 +626,116 @@ KJ_TEST("Methods can take Lock& as first parameter") {
   Evaluator<InjectLockContext, InjectLockIsolate> e(v8System);
   e.expectEval("let t = new Thingy(123); t.val", "number", "123");
 }
+
+// ========================================================================================
+
+struct JsBundleContext: public ContextGlobalObject {
+  JSG_RESOURCE_TYPE(JsBundleContext) {
+    JSG_CONTEXT_JS_BUNDLE(BUILTIN_BUNDLE);
+  }
+};
+JSG_DECLARE_ISOLATE_TYPE(JsBundleIsolate, JsBundleContext);
+
+KJ_TEST("expectEvalModule function works") {
+  Evaluator<JsBundleContext, JsBundleIsolate> e(v8System);
+  e.expectEvalModule("export function run() { return 123; }", "number", "123");
+}
+
+KJ_TEST("bundle installed works") {
+  Evaluator<JsBundleContext, JsBundleIsolate> e(v8System);
+  e.expectEvalModule(R"(
+    import * as b from "test:resource-test-builtin";
+    export function run() { return b.builtinFunction(); }
+  )", "string", "THIS_IS_BUILTIN_FUNCTION");
+}
+
+// ========================================================================================
+
+struct JsLazyReadonlyPropertyContext: public ContextGlobalObject {
+  JSG_RESOURCE_TYPE(JsLazyReadonlyPropertyContext) {
+    JSG_CONTEXT_JS_BUNDLE(BOOTSTRAP_BUNDLE);
+
+    JSG_LAZY_JS_INSTANCE_READONLY_PROPERTY(bootstrapFunction, "test:resource-test-bootstrap");
+    JSG_LAZY_JS_INSTANCE_READONLY_PROPERTY(BootstrapClass, "test:resource-test-bootstrap");
+  }
+};
+JSG_DECLARE_ISOLATE_TYPE(JsLazyReadonlyPropertyIsolate, JsLazyReadonlyPropertyContext);
+
+KJ_TEST("lazy js global function works") {
+  Evaluator<JsLazyReadonlyPropertyContext, JsLazyReadonlyPropertyIsolate> e(v8System);
+  // both for module
+  e.expectEvalModule(R"(
+    export function run() { return bootstrapFunction(); }
+  )", "string", "THIS_IS_BOOTSTRAP_FUNCTION");
+  // and script syntax
+  e.expectEval("bootstrapFunction()", "string", "THIS_IS_BOOTSTRAP_FUNCTION");
+}
+
+KJ_TEST("lazy js global class works") {
+  Evaluator<JsLazyReadonlyPropertyContext, JsLazyReadonlyPropertyIsolate> e(v8System);
+  // for module syntax
+  e.expectEvalModule(R"(
+    export function run() { return new BootstrapClass().run(); }
+  )", "string", "THIS_IS_BOOTSTRAP_CLASS");
+  // and for script syntax
+  e.expectEval("new BootstrapClass().run()", "string", "THIS_IS_BOOTSTRAP_CLASS");
+}
+
+KJ_TEST("lazy js readonly property can not be overriden") {
+  Evaluator<JsLazyReadonlyPropertyContext, JsLazyReadonlyPropertyIsolate> e(v8System);
+  e.expectEval("globalThis.bootstrapFunction = function(){'boo'}; bootstrapFunction()", "string", "THIS_IS_BOOTSTRAP_FUNCTION");
+  e.expectEval("bootstrapFunction = function(){'boo'}; bootstrapFunction()", "string", "THIS_IS_BOOTSTRAP_FUNCTION");
+}
+
+
+// ========================================================================================
+
+struct JsLazyPropertyContext: public ContextGlobalObject {
+  JSG_RESOURCE_TYPE(JsLazyPropertyContext) {
+    JSG_CONTEXT_JS_BUNDLE(BOOTSTRAP_BUNDLE);
+
+    JSG_LAZY_JS_INSTANCE_PROPERTY(bootstrapFunction, "test:resource-test-bootstrap");
+    JSG_LAZY_JS_INSTANCE_PROPERTY(BootstrapClass, "test:resource-test-bootstrap");
+  }
+};
+JSG_DECLARE_ISOLATE_TYPE(JsLazyPropertyIsolate, JsLazyPropertyContext);
+
+KJ_TEST("lazy js global function works") {
+  Evaluator<JsLazyPropertyContext, JsLazyPropertyIsolate> e(v8System);
+  // both for module
+  e.expectEvalModule(R"(
+    export function run() { return bootstrapFunction(); }
+  )", "string", "THIS_IS_BOOTSTRAP_FUNCTION");
+  // and script syntax
+  e.expectEval("bootstrapFunction()", "string", "THIS_IS_BOOTSTRAP_FUNCTION");
+}
+
+KJ_TEST("lazy js global class works") {
+  Evaluator<JsLazyPropertyContext, JsLazyPropertyIsolate> e(v8System);
+  // for module syntax
+  e.expectEvalModule(R"(
+    export function run() { return new BootstrapClass().run(); }
+  )", "string", "THIS_IS_BOOTSTRAP_CLASS");
+  // and for script syntax
+  e.expectEval("new BootstrapClass().run()", "string", "THIS_IS_BOOTSTRAP_CLASS");
+}
+
+KJ_TEST("lazy js property can be overriden") {
+  Evaluator<JsLazyPropertyContext, JsLazyPropertyIsolate> e(v8System);
+  // for module syntax
+  e.expectEvalModule(R"(
+    globalThis.bootstrapFunction = function(){return 'boo'}
+    export function run() { return bootstrapFunction(); }
+  )", "string", "boo");
+  e.expectEvalModule(R"(
+    bootstrapFunction = function(){return 'boo'}
+    export function run() { return bootstrapFunction(); }
+  )", "string", "boo");
+  // for script syntax
+  e.expectEval("globalThis.bootstrapFunction = function(){return 'boo';}; bootstrapFunction()", "string", "boo");
+  e.expectEval("bootstrapFunction = function(){return 'boo';}; bootstrapFunction()", "string", "boo");
+}
+
 
 }  // namespace
 }  // namespace workerd::jsg::test

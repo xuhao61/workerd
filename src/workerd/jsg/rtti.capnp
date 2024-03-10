@@ -8,6 +8,10 @@
 using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("workerd::jsg::rtti");
 $Cxx.allowCancellation;
+# TODO: I can't figure out how to make both capnpc-ts and capnpc-cpp generators to see this import
+# without code changes. capnpc-ts code is weird:
+# https://github.com/jdiaz5513/capnp-ts/blob/master/packages/capnpc-ts/src/generators.ts#L92
+# using Modules = import "/workerd/jsg/modules.capnp";
 
 struct Type {
   # A description of the C++ type.
@@ -61,6 +65,8 @@ struct Type {
 
     jsgImpl @15 :JsgImplType;
     # jsg implementation type
+
+    jsBuiltin @16: JsBuiltinType;
   }
 }
 
@@ -136,6 +142,9 @@ struct BuiltinType {
 
     v8Function @4;
     # v8::Function
+
+    v8ArrayBuffer @5;
+    # v8::ArrayBuffer
   }
 
   type @0 :Type;
@@ -171,6 +180,8 @@ struct JsgImplType {
     v8FunctionCallbackInfo @7;
 
     v8PropertyCallbackInfo @8;
+
+    jsgName @9;
   }
 
   type @0 :Type;
@@ -201,6 +212,16 @@ struct Structure {
   asyncIterator @7 :Method;
   # Method returning async iterator if the structure is async iterable
 
+  disposable @13 :Bool;
+  # true if the structure is disposable
+  dispose @14 :Method;
+  # dispose method
+
+  asyncDisposable @15 :Bool;
+  # true if the structure is async disposable
+  asyncDispose @16 :Method;
+  # asyncDispose method
+
   tsRoot @8 :Bool;
   # See `JSG_TS_ROOT`'s documentation in the `## TypeScript` section of the JSG README.md.
   # If `JSG_(STRUCT_)TS_ROOT` is declared for a type, this value will be `true`.
@@ -217,6 +238,9 @@ struct Structure {
 
   callable @11 :FunctionType;
   # If this type is callable as a function, the signature of said function. Otherwise, null.
+
+  builtinModules @12 :List(Module);
+  # List of all builtin modules provided by the context.
 }
 
 struct Member {
@@ -273,10 +297,19 @@ struct Constructor {
   args @0 :List(Type);
 }
 
+struct Module {
+  specifier @0 :Text;
+  # if anyone ever needs module type, it can be implemented by either fixing the Modules reference
+  # problem above or copying the original enum.
+  # type @1 :Modules.ModuleType;
+  union {
+    structureName @1 :Text;
+    tsDeclarations @2 :Text;
+  }
+}
+
 struct StructureGroups {
   # Collection of structure groups, consumed by TypeScript definitions generator
-
-  groups @0 :List(StructureGroup);
 
   struct StructureGroup {
     # Collection of related structures
@@ -285,4 +318,18 @@ struct StructureGroups {
 
     structures @1 :List(Structure);
   }
+
+  groups @0 :List(StructureGroup);
+
+  modules @1 :List(Module);
+}
+
+struct JsBuiltinType {
+  # special type for properties whose value is supplied by built-in javascript
+
+  module @0 :Text;
+  # module from which the property is imported
+
+  export @1 :Text;
+  # export name of the property
 }

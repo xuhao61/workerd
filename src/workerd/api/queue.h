@@ -1,6 +1,8 @@
-#pragma once
+// Copyright (c) 2023 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
 
-#include <atomic>
+#pragma once
 
 #include <kj/async.h>
 #include <kj/common.h>
@@ -12,62 +14,75 @@
 
 namespace workerd::api {
 
-using kj::uint;
-
 class ExecutionContext;
 
 // Binding types
 
+// A capability to a Worker Queue.
 class WorkerQueue: public jsg::Object {
-  // A capability to a Worker Queue.
-
 public:
-  WorkerQueue(uint subrequestChannel)
-    : subrequestChannel(subrequestChannel) {}
   // `subrequestChannel` is what to pass to IoContext::getHttpClient() to get an HttpClient
   // representing this queue.
+  WorkerQueue(uint subrequestChannel)
+    : subrequestChannel(subrequestChannel) {}
 
   struct SendOptions {
     // TODO(soon): Support metadata.
 
-    jsg::Optional<kj::String> contentType;
     // contentType determines the serialization format of the message.
+    jsg::Optional<kj::String> contentType;
 
-    JSG_STRUCT(contentType);
-    JSG_STRUCT_TS_OVERRIDE(QueueSendOptions {
-      contentType: never;
-    });
+    // The number of seconds to delay the delivery of the message being sent.
+    jsg::Optional<int> delaySeconds;
+
+    JSG_STRUCT(contentType, delaySeconds);
+    JSG_STRUCT_TS_OVERRIDE(QueueSendOptions { contentType?: QueueContentType; });
+    // NOTE: Any new fields added here should also be added to MessageSendRequest below.
+  };
+
+  struct SendBatchOptions {
+    // The number of seconds to delay the delivery of the message being sent.
+    jsg::Optional<int> delaySeconds;
+
+    JSG_STRUCT(delaySeconds);
+    JSG_STRUCT_TS_OVERRIDE(QueueSendBatchOptions { delaySeconds ?: number; });
     // NOTE: Any new fields added here should also be added to MessageSendRequest below.
   };
 
   struct MessageSendRequest {
-    jsg::Value body;
+    jsg::JsRef<jsg::JsValue> body;
 
-    jsg::Optional<kj::String> contentType;
     // contentType determines the serialization format of the message.
+    jsg::Optional<kj::String> contentType;
 
-    JSG_STRUCT(body, contentType);
+    // The number of seconds to delay the delivery of the message being sent.
+    jsg::Optional<int> delaySeconds;
+
+    JSG_STRUCT(body, contentType, delaySeconds);
     JSG_STRUCT_TS_OVERRIDE(MessageSendRequest<Body = unknown> {
       body: Body;
-      contentType: never;
+        contentType?: QueueContentType;
     });
     // NOTE: Any new fields added to SendOptions must also be added here.
   };
 
-  kj::Promise<void> send(
-      jsg::Lock& js, v8::Local<v8::Value> body, jsg::Optional<SendOptions> options);
+  kj::Promise<void> send(jsg::Lock& js, jsg::JsValue body, jsg::Optional<SendOptions> options);
 
-  kj::Promise<void> sendBatch(jsg::Lock& js, jsg::Sequence<MessageSendRequest> batch);
+  kj::Promise<void> sendBatch(jsg::Lock& js, jsg::Sequence<MessageSendRequest> batch,
+                              jsg::Optional<SendBatchOptions> options);
 
   JSG_RESOURCE_TYPE(WorkerQueue) {
     JSG_METHOD(send);
     JSG_METHOD(sendBatch);
 
     JSG_TS_ROOT();
-    JSG_TS_OVERRIDE(Queue<Body> {
-      send(message: Body): Promise<void>;
-      sendBatch(messages: Iterable<MessageSendRequest<Body>>): Promise<void>;
+    JSG_TS_OVERRIDE(Queue<Body = unknown> {
+      send(message: Body, options?: QueueSendOptions): Promise<void>;
+      sendBatch(messages
+                : Iterable<MessageSendRequest<Body>>, options ?: QueueSendBatchOptions)
+          : Promise<void>;
     });
+    JSG_TS_DEFINE(type QueueContentType = "text" | "bytes" | "json" | "v8");
   }
 
 private:
@@ -93,22 +108,46 @@ struct IncomingQueueMessage {
   };
 };
 
+struct QueueRetryBatch {
+  bool retry;
+  jsg::Optional<int> delaySeconds;
+  JSG_STRUCT(retry, delaySeconds);
+};
+
+struct QueueRetryMessage {
+  kj::String msgId;
+  jsg::Optional<int> delaySeconds;
+  JSG_STRUCT(msgId, delaySeconds);
+};
+
 struct QueueResponse {
   uint16_t outcome;
-  bool retryAll;
   bool ackAll;
-  kj::Array<kj::String> explicitRetries;
+  QueueRetryBatch retryBatch;
   kj::Array<kj::String> explicitAcks;
-  JSG_STRUCT(outcome, retryAll, ackAll, explicitRetries, explicitAcks);
+  kj::Array<QueueRetryMessage> retryMessages;
+  JSG_STRUCT(outcome, ackAll, retryBatch, explicitAcks, retryMessages);
 };
 
 // Internal-only representation used to accumulate the results of a queue event.
 
 struct QueueEventResult {
-  bool retryAll = false;
+  struct RetryOptions {
+    jsg::Optional<int> delaySeconds;
+  };
+  struct RetryBatch {
+    bool retry;
+    jsg::Optional<int> delaySeconds;
+  };
+  RetryBatch retryBatch = {.retry = false};
   bool ackAll = false;
-  kj::HashSet<kj::String> explicitRetries;
+  kj::HashMap<kj::String, RetryOptions> retries;
   kj::HashSet<kj::String> explicitAcks;
+};
+
+struct QueueRetryOptions {
+  jsg::Optional<int> delaySeconds;
+  JSG_STRUCT(delaySeconds);
 };
 
 class QueueMessage final: public jsg::Object {
@@ -118,9 +157,9 @@ public:
 
   kj::StringPtr getId() { return id; }
   kj::Date getTimestamp() { return timestamp; }
-  jsg::Value getBody(jsg::Lock& js);
+  jsg::JsValue getBody(jsg::Lock& js);
 
-  void retry();
+  void retry(jsg::Optional<QueueRetryOptions> options);
   void ack();
 
   // TODO(soon): Add metadata support.
@@ -137,10 +176,16 @@ public:
     });
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("id", id);
+    tracker.trackField("body", body);
+    tracker.trackFieldWithSize("IoPtr<QueueEventResult>", sizeof(IoPtr<QueueEventResult>));
+  }
+
 private:
   kj::String id;
   kj::Date timestamp;
-  jsg::Value body;
+  jsg::JsRef<jsg::JsValue> body;
   IoPtr<QueueEventResult> result;
 
   void visitForGc(jsg::GcVisitor& visitor) {
@@ -165,7 +210,7 @@ public:
   kj::ArrayPtr<jsg::Ref<QueueMessage>> getMessages() { return messages; }
   kj::StringPtr getQueueName() { return queueName; }
 
-  void retryAll();
+  void retryAll(jsg::Optional<QueueRetryOptions> options);
   void ackAll();
 
   JSG_RESOURCE_TYPE(QueueEvent) {
@@ -183,29 +228,53 @@ public:
     });
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    for (auto& message: messages) {
+      tracker.trackField("message", message);
+    }
+    tracker.trackField("queueName", queueName);
+    tracker.trackFieldWithSize("IoPtr<QueueEventResult>", sizeof(IoPtr<QueueEventResult>));
+  }
+
+  struct Incomplete {};
+  struct CompletedSuccessfully {};
+  struct CompletedWithError {
+    kj::Exception error;
+  };
+  typedef kj::OneOf<Incomplete, CompletedSuccessfully, CompletedWithError> CompletionStatus;
+
+  void setCompletionStatus(CompletionStatus status) {
+    completionStatus = status;
+  }
+
+  CompletionStatus getCompletionStatus() const {
+    return completionStatus;
+  }
+
 private:
   // TODO(perf): Should we store these in a v8 array directly rather than this intermediate kj
   // array to avoid one intermediate copy?
   kj::Array<jsg::Ref<QueueMessage>> messages;
   kj::String queueName;
   IoPtr<QueueEventResult> result;
+  CompletionStatus completionStatus = Incomplete{};
 
   void visitForGc(jsg::GcVisitor& visitor) {
-    for (auto i: kj::indices(messages)) {
-      visitor.visit(messages[i]);
-    }
+    visitor.visitAll(messages);
   }
 };
 
+// Type used when calling a module-exported queue event handler.
 class QueueController final: public jsg::Object {
-  // Type used when calling a module-exported queue event handler.
 public:
   QueueController(jsg::Ref<QueueEvent> event)
       : event(kj::mv(event)) {}
 
   kj::ArrayPtr<jsg::Ref<QueueMessage>> getMessages() { return event->getMessages(); }
   kj::StringPtr getQueueName() { return event->getQueueName(); }
-  void retryAll() { event->retryAll(); }
+  void retryAll(jsg::Optional<QueueRetryOptions> options) {
+    event->retryAll(options);
+  }
   void ackAll() { event->ackAll(); }
 
   JSG_RESOURCE_TYPE(QueueController) {
@@ -221,6 +290,10 @@ public:
     });
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("event", event);
+  }
+
 private:
   jsg::Ref<QueueEvent> event;
 
@@ -229,24 +302,15 @@ private:
   }
 };
 
+// Extension of ExportedHandler covering queue handlers.
 struct QueueExportedHandler {
-  // Extension of ExportedHandler covering queue handlers.
-
-  typedef kj::Promise<void> QueueHandler(
-      jsg::Ref<QueueController> controller, jsg::Value env, jsg::Optional<jsg::Ref<ExecutionContext>> ctx);
+  typedef kj::Promise<void> QueueHandler(jsg::Ref<QueueController> controller,
+                                         jsg::JsRef<jsg::JsValue> env,
+                                         jsg::Optional<jsg::Ref<ExecutionContext>> ctx);
   jsg::LenientOptional<jsg::Function<QueueHandler>> queue;
 
   JSG_STRUCT(queue);
 };
-
-jsg::Ref<QueueEvent> startQueueEvent(
-    EventTarget& globalEventTarget,
-    kj::OneOf<rpc::EventDispatcher::QueueParams::Reader, QueueEvent::Params> params,
-    IoPtr<QueueEventResult> result,
-    Worker::Lock& lock, kj::Maybe<ExportedHandler&> exportedHandler,
-    const jsg::TypeHandler<QueueExportedHandler>& handlerHandler);
-// Start a queue event (called from C++, not JS). Similar to startScheduled(), the caller must
-// wait for waitUntil()s to produce the final QueueResult.
 
 class QueueCustomEventImpl final: public WorkerInterface::CustomEvent, public kj::Refcounted {
 public:
@@ -269,9 +333,11 @@ public:
     return EVENT_TYPE;
   }
 
-  bool getRetryAll() const { return result.retryAll; }
+  QueueRetryBatch getRetryBatch() const {
+    return {.retry = result.retryBatch.retry, .delaySeconds = result.retryBatch.delaySeconds};
+  }
   bool getAckAll() const { return result.ackAll; }
-  kj::Array<kj::String> getExplicitRetries() const;
+  kj::Array<QueueRetryMessage> getRetryMessages() const;
   kj::Array<kj::String> getExplicitAcks() const;
 
 private:
@@ -282,9 +348,13 @@ private:
 #define EW_QUEUE_ISOLATE_TYPES \
   api::WorkerQueue,                     \
   api::WorkerQueue::SendOptions,        \
+  api::WorkerQueue::SendBatchOptions,   \
   api::WorkerQueue::MessageSendRequest, \
   api::IncomingQueueMessage,            \
+  api::QueueRetryBatch,                 \
+  api::QueueRetryMessage,               \
   api::QueueResponse,                   \
+  api::QueueRetryOptions,               \
   api::QueueMessage,                    \
   api::QueueEvent,                      \
   api::QueueController,                 \

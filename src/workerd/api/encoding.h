@@ -62,21 +62,21 @@ enum class Encoding {
 #undef V
 };
 
+// A Decoder provides the underlying implementation of a TextDecoder.
 class Decoder {
-  // A Decoder provides the underlying implementation of a TextDecoder.
 public:
   virtual ~Decoder() noexcept(true) {}
   virtual Encoding getEncoding() = 0;
-  virtual kj::Maybe<v8::Local<v8::String>> decode(
-      v8::Isolate* isolate,
+  virtual kj::Maybe<jsg::JsString> decode(
+      jsg::Lock& js,
       kj::ArrayPtr<const kj::byte> buffer,
       bool flush = false) = 0;
 
   virtual void reset() {}
 };
 
+// Decoder implementation that provides a fast-track for US-ASCII.
 class AsciiDecoder: public Decoder {
-  // Decoder implementation that provides a fast-track for US-ASCII.
 public:
   AsciiDecoder() = default;
   AsciiDecoder(AsciiDecoder&&) = default;
@@ -85,16 +85,16 @@ public:
 
   Encoding getEncoding() override { return Encoding::Windows_1252; }
 
-  kj::Maybe<v8::Local<v8::String>> decode(
-      v8::Isolate* isolate,
+  kj::Maybe<jsg::JsString> decode(
+      jsg::Lock& js,
       kj::ArrayPtr<const kj::byte> buffer,
       bool flush = false) override;
 };
 
+// Decoder implementation that uses ICU's built-in conversion APIs.
+// ICU's decoder is fairly comprehensive, covering the full range
+// of encodings required by the Encoding specification.
 class IcuDecoder: public Decoder {
-  // Decoder implementation that uses ICU's built-in conversion APIs.
-  // ICU's decoder is fairly comprehensive, covering the full range
-  // of encodings required by the Encoding specification.
 public:
   IcuDecoder(Encoding encoding, UConverter* converter, bool ignoreBom)
       : encoding(encoding), inner(converter), ignoreBom(ignoreBom), bomSeen(false) {}
@@ -105,8 +105,8 @@ public:
 
   Encoding getEncoding() override { return encoding; }
 
-  kj::Maybe<v8::Local<v8::String>> decode(
-      v8::Isolate* isolate,
+  kj::Maybe<jsg::JsString> decode(
+      jsg::Lock& js,
       kj::ArrayPtr<const kj::byte> buffer,
       bool flush = false) override;
 
@@ -124,9 +124,9 @@ private:
   bool bomSeen;
 };
 
+// Implements the TextDecoder interface as prescribed by:
+// https://encoding.spec.whatwg.org/#interface-textdecoder
 class TextDecoder: public jsg::Object {
-  // Implements the TextDecoder interface as prescribed by:
-  // https://encoding.spec.whatwg.org/#interface-textdecoder
 public:
   using DecoderImpl = kj::OneOf<AsciiDecoder, IcuDecoder>;
 
@@ -147,9 +147,9 @@ public:
       jsg::Optional<kj::String> label,
       jsg::Optional<ConstructorOptions> options);
 
-  v8::Local<v8::String> decode(jsg::Optional<kj::Array<const kj::byte>> input,
-                               jsg::Optional<DecodeOptions> options,
-                               v8::Isolate* isolate);
+  jsg::JsString decode(jsg::Lock& js,
+                       jsg::Optional<kj::Array<const kj::byte>> input,
+                       jsg::Optional<DecodeOptions> options);
 
   kj::StringPtr getEncoding();
 
@@ -174,10 +174,9 @@ public:
   explicit TextDecoder(DecoderImpl decoder, const ConstructorOptions& options)
       : decoder(kj::mv(decoder)), ctorOptions(options) {}
 
-  kj::Maybe<v8::Local<v8::String>> decodePtr(
-      v8::Isolate* isolate,
-      kj::ArrayPtr<const kj::byte> buffer,
-      bool flush);
+  kj::Maybe<jsg::JsString> decodePtr(jsg::Lock& js,
+                                     kj::ArrayPtr<const kj::byte> buffer,
+                                     bool flush);
 
 private:
   Decoder& getImpl();
@@ -190,10 +189,9 @@ private:
   static kj::Array<const kj::byte> EMPTY;
 };
 
+// Implements the TextEncoder interface as prescribed by:
+// https://encoding.spec.whatwg.org/#interface-textencoder
 class TextEncoder: public jsg::Object {
-  // Implements the TextEncoder interface as prescribed by:
-  // https://encoding.spec.whatwg.org/#interface-textencoder
-
 public:
   struct EncodeIntoResult {
     int read;
@@ -205,14 +203,14 @@ public:
 
   static jsg::Ref<TextEncoder> constructor();
 
-  v8::Local<v8::Uint8Array> encode(
-      jsg::Optional<v8::Local<v8::String>> input, v8::Isolate* isolate);
+  jsg::BufferSource encode(jsg::Lock& js, jsg::Optional<jsg::JsString> input);
 
-  EncodeIntoResult encodeInto(
-      v8::Local<v8::String> input, v8::Local<v8::Uint8Array> buffer, v8::Isolate* isolate);
+  EncodeIntoResult encodeInto(jsg::Lock& js,
+                              jsg::JsString input,
+                              jsg::BufferSource buffer);
 
-  kj::StringPtr getEncoding() { return "utf-8"; }
   // UTF-8 is the only encoding type supported by the WHATWG spec.
+  kj::StringPtr getEncoding() { return "utf-8"; }
 
   JSG_RESOURCE_TYPE(TextEncoder, CompatibilityFlags::Reader flags) {
     JSG_METHOD(encode);
@@ -222,6 +220,13 @@ public:
     } else {
       JSG_READONLY_INSTANCE_PROPERTY(encoding, getEncoding);
     }
+
+    // `encode()` returns `jsg::BufferSource`, which may be an `ArrayBuffer` or `ArrayBufferView`,
+    // but the implementation uses `jsg::BufferSource::tryAlloc()` which always tries to allocate a
+    // `Uint8Array`. The spec defines that this function returns a `Uint8Array` too.
+    JSG_TS_OVERRIDE({
+      encode(input?: string): Uint8Array;
+    });
   }
 };
 

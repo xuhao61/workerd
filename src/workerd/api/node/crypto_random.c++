@@ -1,3 +1,8 @@
+// Copyright (c) 2017-2022 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+// Copyright Joyent and Node contributors. All rights reserved. MIT license.
+
 #include "crypto.h"
 #include "crypto_util.h"
 #include <v8.h>
@@ -19,14 +24,14 @@ namespace workerd::api::node {
 
   BIGNUM* add = nullptr;
   auto _add = maybeOwnBignum(add_buf);
-  KJ_IF_MAYBE(a, _add) {
-      add = a->get();
+  KJ_IF_SOME(a, _add) {
+      add = a.get();
   }
 
   BIGNUM* rem = nullptr;
   auto _rem = maybeOwnBignum(rem_buf);
-  KJ_IF_MAYBE(r, _rem) {
-      rem = r->get();
+  KJ_IF_SOME(r, _rem) {
+      rem = r.get();
   }
 
   if (add != nullptr) {

@@ -5,3 +5,6 @@ WhitespaceSensitiveMacros:
   - JSG_TS_DEFINE
   - JSG_STRUCT_TS_OVERRIDE
   - JSG_STRUCT_TS_DEFINE
+PointerAlignment: Left
+ColumnLimit: 100
+AllowShortFunctionsOnASingleLine: Empty

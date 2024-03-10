@@ -4,6 +4,7 @@
 
 #include "actor.h"
 #include "util.h"
+#include <workerd/io/features.h>
 #include <kj/encoding.h>
 #include <kj/compat/http.h>
 #include <capnp/compat/byte-stream.h>
@@ -22,16 +23,15 @@ public:
   kj::Own<WorkerInterface> newSingleUseClient(kj::Maybe<kj::String> cfStr) override {
     auto& context = IoContext::current();
 
-    // Lazily initialize actorChannel
-    if (actorChannel == nullptr) {
-      auto& context = IoContext::current();
-      actorChannel = context.getColoLocalActorChannel(channelId, actorId);
-    }
-
     return context.getMetrics().wrapActorSubrequestClient(context.getSubrequest(
         [&](SpanBuilder& span, IoChannelFactory& ioChannelFactory) {
       if (span.isObserved()) {
-        span.setTag("actor_id"_kj, kj::str(actorId));
+        span.setTag("actor_id"_kjc, kj::str(actorId));
+      }
+
+      // Lazily initialize actorChannel
+      if (actorChannel == kj::none) {
+        actorChannel = context.getColoLocalActorChannel(channelId, actorId, span);
       }
 
       return KJ_REQUIRE_NONNULL(actorChannel)->startRequest({
@@ -41,7 +41,7 @@ public:
     }, {
       .inHouse = true,
       .wrapMetrics = true,
-      .operationName = "actor_subrequest"_kj
+      .operationName = kj::ConstString("actor_subrequest"_kjc)
     }));
   }
 
@@ -66,17 +66,16 @@ public:
   kj::Own<WorkerInterface> newSingleUseClient(kj::Maybe<kj::String> cfStr) override {
     auto& context = IoContext::current();
 
-    // Lazily initialize actorChannel
-    if (actorChannel == nullptr) {
-      auto& context = IoContext::current();
-      actorChannel = context.getGlobalActorChannel(channelId, id->getInner(), kj::mv(locationHint),
-          mode);
-    }
-
     return context.getMetrics().wrapActorSubrequestClient(context.getSubrequest(
         [&](SpanBuilder& span, IoChannelFactory& ioChannelFactory) {
       if (span.isObserved()) {
-        span.setTag("actor_id"_kj, id->toString());
+        span.setTag("actor_id"_kjc, id->toString());
+      }
+
+      // Lazily initialize actorChannel
+      if (actorChannel == kj::none) {
+        actorChannel = context.getGlobalActorChannel(channelId, id->getInner(), kj::mv(locationHint),
+            mode, span);
       }
 
       return KJ_REQUIRE_NONNULL(actorChannel)->startRequest({
@@ -86,7 +85,7 @@ public:
     }, {
       .inHouse = true,
       .wrapMetrics = true,
-      .operationName = "actor_subrequest"_kj
+      .operationName = kj::ConstString("actor_subrequest"_kjc)
     }));
   }
 
@@ -133,36 +132,36 @@ jsg::Ref<DurableObjectId> DurableObjectNamespace::idFromString(kj::String id) {
 }
 
 jsg::Ref<DurableObject> DurableObjectNamespace::get(
+    jsg::Lock& js,
     jsg::Ref<DurableObjectId> id,
-    jsg::Optional<GetDurableObjectOptions> options,
-    CompatibilityFlags::Reader featureFlags) {
-  return getImpl(ActorGetMode::GET_OR_CREATE, kj::mv(id), kj::mv(options), kj::mv(featureFlags));
+    jsg::Optional<GetDurableObjectOptions> options) {
+  return getImpl(js, ActorGetMode::GET_OR_CREATE, kj::mv(id), kj::mv(options));
 }
 
 jsg::Ref<DurableObject> DurableObjectNamespace::getExisting(
+    jsg::Lock& js,
     jsg::Ref<DurableObjectId> id,
-    jsg::Optional<GetDurableObjectOptions> options,
-    CompatibilityFlags::Reader featureFlags) {
-  return getImpl(ActorGetMode::GET_EXISTING, kj::mv(id), kj::mv(options), kj::mv(featureFlags));
+    jsg::Optional<GetDurableObjectOptions> options) {
+  return getImpl(js, ActorGetMode::GET_EXISTING, kj::mv(id), kj::mv(options));
 }
 
 jsg::Ref<DurableObject> DurableObjectNamespace::getImpl(
+    jsg::Lock& js,
     ActorGetMode mode,
     jsg::Ref<DurableObjectId> id,
-    jsg::Optional<GetDurableObjectOptions> options,
-    CompatibilityFlags::Reader featureFlags) {
+    jsg::Optional<GetDurableObjectOptions> options) {
   JSG_REQUIRE(idFactory->matchesJurisdiction(id->getInner()), TypeError,
       "get called on jurisdictional subnamespace with an ID from a different jurisdiction");
 
   auto& context = IoContext::current();
-  kj::Maybe<kj::String> locationHint = nullptr;
-  KJ_IF_MAYBE(o, options) {
-    locationHint = kj::mv(o->locationHint);
+  kj::Maybe<kj::String> locationHint = kj::none;
+  KJ_IF_SOME(o, options) {
+    locationHint = kj::mv(o.locationHint);
   }
 
   auto outgoingFactory = context.addObject<Fetcher::OutgoingFactory>(
       kj::heap<GlobalActorOutgoingFactory>(channel, id.addRef(), kj::mv(locationHint), mode));
-  auto requiresHost = featureFlags.getDurableObjectFetchRequiresSchemeAuthority()
+  auto requiresHost = FeatureFlags::get(js).getDurableObjectFetchRequiresSchemeAuthority()
       ? Fetcher::RequiresHostAndProtocol::YES
       : Fetcher::RequiresHostAndProtocol::NO;
   return jsg::alloc<DurableObject>(kj::mv(id), kj::mv(outgoingFactory), requiresHost);

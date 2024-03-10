@@ -22,7 +22,7 @@ public:
   using Type = T;
 
   explicit FieldWrapper(v8::Isolate* isolate)
-      : nameHandle(isolate, v8Str(isolate, exportedName, v8::NewStringType::kInternalized)) {}
+      : nameHandle(isolate, v8StrIntern(isolate, exportedName)) {}
 
   void wrap(TypeWrapper& wrapper, v8::Isolate* isolate, v8::Local<v8::Context> context,
             kj::Maybe<v8::Local<v8::Object>> creator, Struct& in, v8::Local<v8::Object> out) {
@@ -31,7 +31,7 @@ public:
     } else {
       if constexpr (webidl::isOptional<Type>) {
         // Don't even set optional fields that aren't present.
-        if (in.*field == nullptr) return;
+        if (in.*field == kj::none) return;
       }
       auto value = wrapper.wrap(context, creator, kj::mv(in.*field));
       check(out->Set(context, nameHandle.Get(isolate), value));
@@ -58,11 +58,10 @@ template <typename Self, typename T, typename FieldWrapperTuple,
           typename Indices = typename FieldWrapperTuple::Indexes>
 class StructWrapper;
 
+// TypeWrapper mixin for struct types (application-defined C++ structs declared with a
+// JSG_STRUCT block).
 template <typename Self, typename T, typename... FieldWrappers, size_t... indices>
 class StructWrapper<Self, T, TypeTuple<FieldWrappers...>, kj::_::Indexes<indices...>> {
-  // TypeWrapper mixin for struct types (application-defined C++ structs declared with a
-  // JSG_STRUCT block).
-
 public:
   static const JsgKind JSG_KIND = JsgKind::STRUCT;
 
@@ -106,7 +105,7 @@ public:
                                     "undefined or null value.");
     }
 
-    if (!handle->IsObject()) return nullptr;
+    if (!handle->IsObject()) return kj::none;
 
     v8::HandleScope handleScope(isolate);
     auto& fields = getFields(isolate);
@@ -130,8 +129,8 @@ private:
   kj::Maybe<kj::Tuple<FieldWrappers...>> lazyFields;
 
   kj::Tuple<FieldWrappers...>& getFields(v8::Isolate* isolate) {
-    KJ_IF_MAYBE(f, lazyFields) {
-      return *f;
+    KJ_IF_SOME(f, lazyFields) {
+      return f;
     } else {
       return lazyFields.emplace(kj::tuple(FieldWrappers(isolate)...));
     }

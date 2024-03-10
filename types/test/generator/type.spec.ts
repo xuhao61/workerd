@@ -1,3 +1,7 @@
+// Copyright (c) 2022-2023 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
 import assert from "assert";
 import { test } from "node:test";
 import {
@@ -185,10 +189,18 @@ test("createTypeNode: implementation types", () => {
     (member) => typeof member === "number"
   );
   for (const implType of implTypes) {
-    // VARARGS is the only type we care about which will be tested with function
-    // types, the rest should be ignored
-    if (implType === JsgImplType_Type.JSG_VARARGS) continue;
+    // VARARGS and NAME are the only types we care about which will be tested
+    // with function types, the rest should be ignored
+    if (
+      implType === JsgImplType_Type.JSG_VARARGS ||
+      implType === JsgImplType_Type.JSG_NAME
+    ) {
+      continue;
+    }
     impl.setType(implType);
     assert.strictEqual(printNode(createTypeNode(type)), "never");
   }
+
+  impl.setType(JsgImplType_Type.JSG_NAME);
+  assert.strictEqual(printNode(createTypeNode(type)), "PropertyKey");
 });

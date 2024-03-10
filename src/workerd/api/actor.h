@@ -12,14 +12,18 @@
 #include <capnp/compat/byte-stream.h>
 #include <capnp/compat/http-over-capnp.h>
 #include <workerd/api/http.h>
+#include <workerd/api/worker-rpc.h>
 #include <workerd/jsg/jsg.h>
-#include <workerd/io/io-context.h>
+#include <workerd/io/actor-id.h>
+
+namespace workerd {
+  template <typename T> class IoOwn;
+}
 
 namespace workerd::api {
 
+// A capability to an ephemeral Actor namespace.
 class ColoLocalActorNamespace: public jsg::Object {
-  // A capability to an ephemeral Actor namespace.
-
 public:
   ColoLocalActorNamespace(uint channel)
     : channel(channel) {}
@@ -36,9 +40,8 @@ private:
 
 class DurableObjectNamespace;
 
+// DurableObjectId type seen by JavaScript.
 class DurableObjectId: public jsg::Object {
-  // DurableObjectId type seen by JavaScript.
-
 public:
   DurableObjectId(kj::Own<ActorIdFactory::ActorId> id): id(kj::mv(id)) {}
 
@@ -47,18 +50,22 @@ public:
   // ---------------------------------------------------------------------------
   // JS API
 
-  kj::String toString();
   // Converts to a string which can be passed back to the constructor to reproduce the same ID.
+  kj::String toString();
 
   inline bool equals(DurableObjectId& other) { return id->equals(*other.id); }
 
-  inline jsg::Optional<kj::StringPtr> getName() { return id->getName(); }
   // Get the name, if known.
+  inline jsg::Optional<kj::StringPtr> getName() { return id->getName(); }
 
   JSG_RESOURCE_TYPE(DurableObjectId) {
     JSG_METHOD(toString);
     JSG_METHOD(equals);
     JSG_READONLY_INSTANCE_PROPERTY(name, getName);
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackFieldWithSize("id", sizeof(ActorIdFactory::ActorId));
   }
 
 private:
@@ -67,8 +74,8 @@ private:
   friend class DurableObjectNamespace;
 };
 
-class DurableObject: public Fetcher {
-  // Stub object used to send messages to a remote durable object.
+// Stub object used to send messages to a remote durable object.
+class DurableObject final: public Fetcher {
 
 public:
   DurableObject(jsg::Ref<DurableObjectId> id, IoOwn<OutgoingFactory> outgoingFactory,
@@ -76,7 +83,7 @@ public:
     : Fetcher(kj::mv(outgoingFactory), requiresHost, true /* isInHouse */),
       id(kj::mv(id)) {}
 
-  jsg::Ref<DurableObjectId> getId(v8::Isolate* isolate) { return id.addRef(); };
+  jsg::Ref<DurableObjectId> getId() { return id.addRef(); };
   jsg::Optional<kj::StringPtr> getName() { return id->getName(); }
 
   JSG_RESOURCE_TYPE(DurableObject) {
@@ -88,10 +95,17 @@ public:
     JSG_TS_DEFINE(interface DurableObject {
       fetch(request: Request): Response | Promise<Response>;
       alarm?(): void | Promise<void>;
+      webSocketMessage?(ws: WebSocket, message: string | ArrayBuffer): void | Promise<void>;
+      webSocketClose?(ws: WebSocket, code: number, reason: string, wasClean: boolean): void | Promise<void>;
+      webSocketError?(ws: WebSocket, error: unknown): void | Promise<void>;
     });
     JSG_TS_OVERRIDE(DurableObjectStub);
     // Rename this resource type to DurableObjectStub, and make DurableObject
     // the interface implemented by users' Durable Object classes.
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("id", id);
   }
 
 private:
@@ -102,16 +116,16 @@ private:
   }
 };
 
+// Global durable object class binding type.
 class DurableObjectNamespace: public jsg::Object {
-  // Global durable object class binding type.
 
 public:
   DurableObjectNamespace(uint channel, kj::Own<ActorIdFactory> idFactory)
     : channel(channel), idFactory(kj::mv(idFactory)) {}
 
   struct NewUniqueIdOptions {
+      // Restricts the new unique ID to a set of colos within a jurisdiction.
     jsg::Optional<kj::String> jurisdiction;
-    // Restricts the new unique ID to a set of colos within a jurisdiction.
 
     JSG_STRUCT(jurisdiction);
 
@@ -122,19 +136,19 @@ public:
     });
   };
 
-  jsg::Ref<DurableObjectId> newUniqueId(jsg::Optional<NewUniqueIdOptions> options);
   // Create a new unique ID for a durable object that will be allocated nearby the calling colo.
+  jsg::Ref<DurableObjectId> newUniqueId(jsg::Optional<NewUniqueIdOptions> options);
 
-  jsg::Ref<DurableObjectId> idFromName(kj::String name);
   // Create a name-derived ID. Passing in the same `name` (to the same class) will always
   // produce the same ID.
+  jsg::Ref<DurableObjectId> idFromName(kj::String name);
 
-  jsg::Ref<DurableObjectId> idFromString(kj::String id);
   // Create a DurableObjectId from the stringified form of the ID (as produced by calling
   // `toString()` on a durable object ID). Throws if the ID is not a 64-digit hex number, or if the
   // ID was not originally created for this class.
   //
   // The ID may be one that was originally created using either `newUniqueId()` or `idFromName()`.
+  jsg::Ref<DurableObjectId> idFromString(kj::String id);
 
   struct GetDurableObjectOptions {
     jsg::Optional<kj::String> locationHint;
@@ -148,21 +162,21 @@ public:
     });
   };
 
-  jsg::Ref<DurableObject> get(
-      jsg::Ref<DurableObjectId> id,
-      jsg::Optional<GetDurableObjectOptions> options,
-      CompatibilityFlags::Reader featureFlags);
   // Gets a durable object by ID or creates it if it doesn't already exist.
-
-  jsg::Ref<DurableObject> getExisting(
+  jsg::Ref<DurableObject> get(
+      jsg::Lock& js,
       jsg::Ref<DurableObjectId> id,
-      jsg::Optional<GetDurableObjectOptions> options,
-      CompatibilityFlags::Reader featureFlags);
+      jsg::Optional<GetDurableObjectOptions> options);
+
   // Experimental. Gets a durable object by ID if it already exists. Currently, gated for use
   // by cloudflare only.
+  jsg::Ref<DurableObject> getExisting(
+      jsg::Lock& js,
+      jsg::Ref<DurableObjectId> id,
+      jsg::Optional<GetDurableObjectOptions> options);
 
-  jsg::Ref<DurableObjectNamespace> jurisdiction(kj::String jurisdiction);
   // Creates a subnamespace with the jurisdiction hardcoded.
+  jsg::Ref<DurableObjectNamespace> jurisdiction(kj::String jurisdiction);
 
   JSG_RESOURCE_TYPE(DurableObjectNamespace, CompatibilityFlags::Reader flags) {
     JSG_METHOD(newUniqueId);
@@ -185,10 +199,10 @@ private:
   kj::Own<ActorIdFactory> idFactory;
 
   jsg::Ref<DurableObject> getImpl(
+      jsg::Lock& js,
       ActorGetMode mode,
       jsg::Ref<DurableObjectId> id,
-      jsg::Optional<GetDurableObjectOptions> options,
-      CompatibilityFlags::Reader featureFlags);
+      jsg::Optional<GetDurableObjectOptions> options);
 };
 
 #define EW_ACTOR_ISOLATE_TYPES                      \

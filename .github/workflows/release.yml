@@ -9,46 +9,101 @@ jobs:
   version:
     outputs:
       version: ${{ steps.echo.outputs.version }}
+    # version job uses ubuntu 22.04, this way we don't have to install the updated clang while
+    # the build job uses 20.04 for libc compatibility.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: bazelbuild/setup-bazelisk@v2
-      - name: Cache
-        id: cache
-        uses: actions/cache@v2
-        with:
-          path: ~/bazel-disk-cache
-          key: capnp-cache
-      - name: build capnp
-        run: |
-          bazel build --disk_cache=~/bazel-disk-cache --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev @capnp-cpp//src/capnp:capnp_tool
+      - uses: actions/checkout@v4
       - id: echo
         run: |
-          echo "::set-output name=version::1.$(bazel-bin/external/capnp-cpp/src/capnp/capnp_tool eval src/workerd/io/compatibility-date.capnp supportedCompatibilityDate | tr -d '-' | tr -d '"').0"
+          echo "::set-output name=version::1.$(cat src/workerd/io/supported-compatibility-date.txt | tr -d '-').0"
+  check-tag:
+    name: Check tag is new
+    outputs:
+      exists: ${{ steps.check_tag.outputs.exists }}
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: mukunku/tag-exists-action@v1.6.0
+        id: check_tag
+        with:
+          tag: v${{ needs.version.outputs.version }}
+
+  tag-and-release:
+    name: Tag & Release
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    needs: [check-tag, version]
+    runs-on: ubuntu-latest
+    if: ${{ needs.check-tag.outputs.exists != 'true' }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git tag v${{ needs.version.outputs.version }} && git push origin v${{ needs.version.outputs.version }}
+      - uses: ncipollo/release-action@v1
+        id: create_release
+        with:
+          generateReleaseNotes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ needs.version.outputs.version }}
+
   build:
     strategy:
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        os: [ubuntu-20.04, macos-13, windows-2022]
+        include:
+          - os-name: linux
+            os: ubuntu-20.04
+          - os-name: macOS
+            os: macos-13
+          - os-name: windows
+            os: windows-2022
     runs-on: ${{ matrix.os }}
+    name: build (${{ matrix.os-name }})
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
       - name: Cache
         id: cache
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/bazel-disk-cache
-          key: ${{ runner.os }}-${{ runner.arch }}-bazel-disk-cache
-
+          # Use a different cache key than for tests here, otherwise the release cache could end up
+          # being used for test builds, where it provides little benefit.
+          key: bazel-disk-cache-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE') }}
       - name: Setup Linux
         if: runner.os == 'Linux'
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get install -y build-essential git clang libc++-dev
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 15
+          sudo apt-get install -y libunwind-15 libc++abi1-15 libc++1-15 libc++-15-dev
+          echo "build:linux --action_env=CC=/usr/lib/llvm-15/bin/clang --action_env=CXX=/usr/lib/llvm-15/bin/clang++" >> .bazelrc
+          echo "build:linux --host_action_env=CC=/usr/lib/llvm-15/bin/clang --host_action_env=CXX=/usr/lib/llvm-15/bin/clang++" >> .bazelrc
+      - name: Setup macOS
+        if: runner.os == 'macOS'
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_15.1.app"
       - name: Setup Windows
         if: runner.os == 'Windows'
         run: |
+          # Set a custom output root directory to avoid long file name issues.
           [System.IO.File]::WriteAllLines((Join-Path -Path $env:USERPROFILE -ChildPath '.bazelrc'), 'startup --output_user_root=C:/tmp')
-
+      - name: Configure download mirrors
+        shell: bash
+        run: |
+          if [ ! -z "${{ secrets.WORKERS_MIRROR_URL }}" ] ; then
+            # Strip comment in front of WORKERS_MIRROR_URL, then substitute secret to use it.
+            sed -e '/WORKERS_MIRROR_URL/ { s@# *@@; s@WORKERS_MIRROR_URL@${{ secrets.WORKERS_MIRROR_URL }}@; }' -i.bak WORKSPACE
+          fi
       - name: Bazel build
         run: |
           bazelisk build --disk_cache=~/bazel-disk-cache  --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev -c opt //src/workerd/server:workerd
@@ -61,52 +116,14 @@ jobs:
           # generated for the release configuration. Regular symbols are still included.
           strip -S bazel-bin/src/workerd/server/workerd
       - name: Upload binary
-        uses: actions/upload-artifact@v3.1.0
+        uses: actions/upload-artifact@v3.1.3
         with:
           name: ${{ runner.os }}-${{ runner.arch }}-binary
           path: bazel-bin/src/workerd/server/workerd${{ runner.os == 'Windows' && '.exe' || '' }}
-  check-tag:
-    name: Check tag is new
-    outputs:
-      exists: ${{ steps.check_tag.outputs.exists }}
-    needs: [version, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - uses: mukunku/tag-exists-action@v1.1.0
-        id: check_tag
-        with:
-          tag: v${{ needs.version.outputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  tag-and-release:
-    name: Tag & Release
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    needs: [check-tag, version, build]
-    runs-on: ubuntu-latest
-    if: needs.check-tag.outputs.exists != 'true'
-    steps:
-      - run: echo ${{ needs.check-tag.outputs.exists }}
-      - name: Checkout Repo
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - run: git tag v${{ needs.version.outputs.version }} && git push origin v${{ needs.version.outputs.version }}
-      - uses: ncipollo/release-action@v1
-        id: create_release
-        with:
-          generateReleaseNotes: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: v${{ needs.version.outputs.version }}
 
   upload-artifacts:
     name: Upload Artifacts
-    needs: [tag-and-release]
+    needs: [tag-and-release, build]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -120,7 +137,7 @@ jobs:
             name: Windows-X64
     steps:
       - name: Download ${{ matrix.name }}
-        uses: actions/download-artifact@v3.0.0
+        uses: actions/download-artifact@v3.0.2
         with:
           name: ${{ matrix.name }}-binary
           path: /tmp
@@ -146,3 +163,56 @@ jobs:
           asset_path: /tmp/workerd-${{ matrix.arch }}.gz
           asset_name: workerd-${{ matrix.arch }}.gz
           asset_content_type: application/gzip
+
+  miniflare-test:
+    name: Run Miniflare tests
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workers-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: cloudflare/workers-sdk
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 8.8.0
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: "pnpm"
+      - name: Install workers-sdk dependencies
+        run: pnpm install
+
+      - name: Download workerd binary
+        uses: actions/download-artifact@v3.0.2
+        with:
+          name: Linux-X64-binary
+          path: /tmp
+      - name: Make workerd binary executable
+        run: chmod +x /tmp/workerd
+
+      - name: Build Miniflare and dependencies
+        run: pnpm turbo build --filter miniflare
+
+      - name: Run Miniflare tests
+        id: miniflare-test
+        continue-on-error: true
+        run: pnpm --filter miniflare test
+        env:
+          MINIFLARE_WORKERD_PATH: /tmp/workerd
+
+      - name: Report failure
+        if: steps.miniflare-test.outcome == 'failure'
+        run: |
+          curl $MINIFLARE_TEST_WEBHOOK -s -o /dev/null -H "Content-Type: application/json;charset=utf-8" -d "{\"text\":\"🚨 Miniflare tests failed with latest workerd binary: $RUN_URL\"}"
+        env:
+          MINIFLARE_TEST_WEBHOOK: ${{ secrets.MINIFLARE_TEST_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      
+      - name: Fail if errors detected
+        shell: bash
+        if: ${{ steps.miniflare-test.outcome == 'failure' }}
+        run: exit 1

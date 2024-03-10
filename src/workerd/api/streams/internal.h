@@ -10,8 +10,6 @@
 
 namespace workerd::api {
 
-using kj::byte;
-
 // =======================================================================================
 // The ReadableStreamInternalController and WritableStreamInternalController provide the
 // internal (original) implementation of the ReadableStream/WritableStream objects and are
@@ -75,6 +73,10 @@ public:
     return state.is<StreamStates::Closed>() || state.is<StreamStates::Errored>();
   }
 
+  bool isClosed() const override {
+    return state.is<StreamStates::Closed>();
+  }
+
   bool isDisturbed() override { return disturbed; }
 
   bool isLockedToReader() const override { return !readState.is<Unlocked>(); }
@@ -99,9 +101,17 @@ public:
 
   kj::Own<ReadableStreamController> detach(jsg::Lock& js, bool ignoreDisturbed) override;
 
+  void setPendingClosure() override {
+    isPendingClosure = true;
+  }
+
+  kj::StringPtr jsgGetMemoryName() const override;
+  size_t jsgGetMemorySelfSize() const override;
+  void jsgGetMemoryInfo(jsg::MemoryTracker& info) const override;
+
 private:
   void doCancel(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> reason);
-  void doClose();
+  void doClose(jsg::Lock& js);
   void doError(jsg::Lock& js, v8::Local<v8::Value> reason);
 
   class PipeLocked : public PipeController {
@@ -118,17 +128,21 @@ private:
 
     void cancel(jsg::Lock& js, v8::Local<v8::Value> reason) override;
 
-    void close() override;
+    void close(jsg::Lock& js) override;
 
     void error(jsg::Lock& js, v8::Local<v8::Value> reason) override;
 
-    void release(jsg::Lock& js, kj::Maybe<v8::Local<v8::Value>> maybeError = nullptr) override;
+    void release(jsg::Lock& js, kj::Maybe<v8::Local<v8::Value>> maybeError = kj::none) override;
 
     kj::Maybe<kj::Promise<void>> tryPumpTo(WritableStreamSink& sink, bool end) override;
 
     jsg::Promise<ReadResult> read(jsg::Lock& js) override;
 
     void visitForGc(jsg::GcVisitor& visitor) { visitor.visit(ref); }
+
+    kj::StringPtr jsgGetMemoryName() const;
+    size_t jsgGetMemorySelfSize() const;
+    void jsgGetMemoryInfo(jsg::MemoryTracker& info) const;
 
   private:
     ReadableStreamInternalController& inner;
@@ -140,6 +154,10 @@ private:
   kj::OneOf<Unlocked, Locked, PipeLocked, ReaderLocked> readState = Unlocked();
   bool disturbed = false;
   bool readPending = false;
+
+  // Used by Sockets code to signal to the ReadableStream that it should error when read from
+  // because the socket is currently being closed.
+  bool isPendingClosure = false;
 
   friend class ReadableStream;
   friend class WritableStreamInternalController;
@@ -155,9 +173,10 @@ public:
   explicit WritableStreamInternalController(StreamStates::Errored errored)
       : state(kj::mv(errored)) {}
   explicit WritableStreamInternalController(Writable writable,
-                                            kj::Maybe<uint64_t> maybeHighWaterMark = nullptr)
-      : state(kj::mv(writable)),
-        maybeHighWaterMark(maybeHighWaterMark) {
+      kj::Maybe<uint64_t> maybeHighWaterMark = kj::none,
+      kj::Maybe<jsg::Promise<void>> maybeClosureWaitable = kj::none) : state(kj::mv(writable)),
+          maybeHighWaterMark(maybeHighWaterMark),
+          maybeClosureWaitable(kj::mv(maybeClosureWaitable)) {
 }
 
   WritableStreamInternalController(WritableStreamInternalController&& other) = default;
@@ -197,8 +216,8 @@ public:
 
   kj::Maybe<v8::Local<v8::Value>> isErroring(jsg::Lock& js) override {
     // TODO(later): The internal controller has no concept of an "erroring"
-    // state, so for now we just return nullptr here.
-    return nullptr;
+    // state, so for now we just return kj::none here.
+    return kj::none;
   }
 
   void visitForGc(jsg::GcVisitor& visitor) override;
@@ -206,6 +225,17 @@ public:
   void setHighWaterMark(uint64_t highWaterMark);
 
   bool isClosedOrClosing() override;
+  bool isErrored() override;
+
+  inline bool isByteOriented() const override { return true; }
+
+  void setPendingClosure() override {
+    isPendingClosure = true;
+  }
+
+  kj::StringPtr jsgGetMemoryName() const override;
+  size_t jsgGetMemorySelfSize() const override;
+  void jsgGetMemoryInfo(jsg::MemoryTracker& info) const override;
 private:
 
   struct AbortOptions {
@@ -219,7 +249,7 @@ private:
                                 .reject = false,
                                 .handled = false
                               });
-  void doClose();
+  void doClose(jsg::Lock& js);
   void doError(jsg::Lock& js, v8::Local<v8::Value> reason);
   void ensureWriting(jsg::Lock& js);
   jsg::Promise<void> writeLoop(jsg::Lock& js, IoContext& ioContext);
@@ -228,6 +258,7 @@ private:
   void drain(jsg::Lock& js, v8::Local<v8::Value> reason);
   void finishClose(jsg::Lock& js);
   void finishError(jsg::Lock& js, v8::Local<v8::Value> reason);
+  jsg::Promise<void> closeImpl(jsg::Lock& js, bool markAsHandled);
 
   struct PipeLocked {
     ReadableStream& ref;
@@ -240,11 +271,21 @@ private:
   kj::Maybe<PendingAbort> maybePendingAbort;
 
   uint64_t currentWriteBufferSize = 0;
-  kj::Maybe<uint64_t> maybeHighWaterMark;
+
   // The highWaterMark is the total amount of data currently buffered in
   // the controller waiting to be flushed out to the underlying WritableStreamSink.
   // It is used to implement backpressure signaling using desiredSize and the ready
   // promise on the writer.
+  kj::Maybe<uint64_t> maybeHighWaterMark;
+
+  // Used by Sockets code to ensure the connection is established before the associated
+  // WritableStream is closed.
+  kj::Maybe<jsg::Promise<void>> maybeClosureWaitable;
+  bool waitingOnClosureWritableAlready = false;
+
+  // Used by Sockets code to signal to the WritableStream that it should error when written to
+  // because the socket is currently being closed.
+  bool isPendingClosure = false;
 
   void increaseCurrentWriteBufferSize(jsg::Lock& js, uint64_t amount);
   void decreaseCurrentWriteBufferSize(jsg::Lock& js, uint64_t amount);
@@ -254,13 +295,25 @@ private:
     kj::Maybe<jsg::Promise<void>::Resolver> promise;
     std::shared_ptr<v8::BackingStore> ownBytes;
     kj::ArrayPtr<const kj::byte> bytes;
-    kj::Maybe<jsg::Ref<WritableStream>> ref;
+
+    JSG_MEMORY_INFO(Write) {
+      tracker.trackField("resolver", promise);
+      if (ownBytes != nullptr) {
+        tracker.trackFieldWithSize("backing", ownBytes->ByteLength());
+      }
+    }
   };
   struct Close {
     kj::Maybe<jsg::Promise<void>::Resolver> promise;
+    JSG_MEMORY_INFO(Close) {
+      tracker.trackField("promise", promise);
+    }
   };
   struct Flush {
     kj::Maybe<jsg::Promise<void>::Resolver> promise;
+    JSG_MEMORY_INFO(Flush) {
+      tracker.trackField("promise", promise);
+    }
   };
   struct Pipe {
     WritableStreamInternalController& parent;
@@ -274,28 +327,45 @@ private:
     bool checkSignal(jsg::Lock& js);
     jsg::Promise<void> pipeLoop(jsg::Lock& js);
     jsg::Promise<void> write(v8::Local<v8::Value> value);
+
+    JSG_MEMORY_INFO(Pipe) {
+      tracker.trackField("resolver", promise);
+      tracker.trackField("signal", maybeSignal);
+    }
   };
   struct WriteEvent {
     kj::Maybe<IoOwn<kj::Promise<void>>> outputLock;  // must wait for this before actually writing
     kj::OneOf<Write, Pipe, Close, Flush> event;
+
+    JSG_MEMORY_INFO(WriteEvent) {
+      if (outputLock != kj::none) {
+        tracker.trackFieldWithSize("outputLock",
+            sizeof(IoOwn<kj::Promise<void>>));
+      }
+      KJ_SWITCH_ONEOF(event) {
+        KJ_CASE_ONEOF(w, Write) { tracker.trackField("inner", w); }
+        KJ_CASE_ONEOF(p, Pipe) { tracker.trackField("inner", p); }
+        KJ_CASE_ONEOF(c, Close) { tracker.trackField("inner", c); }
+        KJ_CASE_ONEOF(f, Flush) { tracker.trackField("inner", f); }
+      }
+    }
   };
 
   std::deque<WriteEvent> queue;
 };
 
+// An implementation of ReadableStreamSource and WritableStreamSink which communicates read and
+// write requests via a OneOf.
+//
+// This class is also used as the implementation of FixedLengthStream, in which case `limit` is
+// non-nullptr.
 class IdentityTransformStreamImpl: public kj::Refcounted,
                                    public ReadableStreamSource,
                                    public WritableStreamSink {
-  // An implementation of ReadableStreamSource and WritableStreamSink which communicates read and
-  // write requests via a OneOf.
-  //
-  // This class is also used as the implementation of FixedLengthStream, in which case `limit` is
-  // non-nullptr.
-  //
   // TODO(soon): Reimplement this in terms of kj::OneWayPipe, so we can optimize pumpTo().
 
 public:
-  explicit IdentityTransformStreamImpl(kj::Maybe<uint64_t> limit = nullptr)
+  explicit IdentityTransformStreamImpl(kj::Maybe<uint64_t> limit = kj::none)
       : limit(limit) {}
 
   ~IdentityTransformStreamImpl() noexcept(false) {

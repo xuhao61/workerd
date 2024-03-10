@@ -11,23 +11,38 @@
 #include <workerd/api/actor.h>
 #include <workerd/api/actor-state.h>
 #include <workerd/api/analytics-engine.h>
+#include <workerd/api/cache.h>
 #include <workerd/api/crypto-impl.h>
+#include <workerd/api/encoding.h>
 #include <workerd/api/global-scope.h>
+#include <workerd/api/html-rewriter.h>
+#include <workerd/api/hyperdrive.h>
 #include <workerd/api/kv.h>
+#include <workerd/api/modules.h>
+#include <workerd/api/pyodide.h>
 #include <workerd/api/queue.h>
+#include <workerd/api/scheduled.h>
 #include <workerd/api/sockets.h>
+#include <workerd/api/streams/standard.h>
 #include <workerd/api/sql.h>
 #include <workerd/api/r2.h>
 #include <workerd/api/r2-admin.h>
+#include <workerd/api/trace.h>
+#include <workerd/api/unsafe.h>
 #include <workerd/api/urlpattern.h>
+#include <workerd/api/memory-cache.h>
 #include <workerd/api/node/node.h>
 #include <workerd/io/promise-wrapper.h>
 #include <workerd/util/thread-scopes.h>
+#include <workerd/util/use-perfetto-categories.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
-
-#include <cloudflare/cloudflare.capnp.h>
+#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
+#include <workerd/api/gpu/gpu.h>
+#else
+#define EW_WEBGPU_ISOLATE_TYPES_LIST
+#endif
 
 namespace workerd::server {
 
@@ -43,8 +58,8 @@ JSG_DECLARE_ISOLATE_TYPE(JsgWorkerdIsolate,
   // types defined in worker.c++ or as part of jsg.
   //
   // When adding a new NNNN_ISOLATE_TYPES macro, remember to add it to
-  // src/workerd/tools/api-encoder.c++ too, so it gets included in the
-  // TypeScript types.
+  // src/workerd/api/rtti.c++ too (and tools/api-encoder.c++ for the
+  // time being), so it gets included in the TypeScript types.
   EW_GLOBAL_SCOPE_ISOLATE_TYPES,
 
   EW_ACTOR_ISOLATE_TYPES,
@@ -60,30 +75,40 @@ JSG_DECLARE_ISOLATE_TYPE(JsgWorkerdIsolate,
   EW_HTTP_ISOLATE_TYPES,
   EW_SOCKETS_ISOLATE_TYPES,
   EW_KV_ISOLATE_TYPES,
+  EW_PYODIDE_ISOLATE_TYPES,
   EW_QUEUE_ISOLATE_TYPES,
   EW_R2_PUBLIC_BETA_ADMIN_ISOLATE_TYPES,
   EW_R2_PUBLIC_BETA_ISOLATE_TYPES,
+  EW_WORKER_RPC_ISOLATE_TYPES,
   EW_SCHEDULED_ISOLATE_TYPES,
   EW_STREAMS_ISOLATE_TYPES,
   EW_TRACE_ISOLATE_TYPES,
+  EW_UNSAFE_ISOLATE_TYPES,
+  EW_MEMORY_CACHE_ISOLATE_TYPES,
   EW_URL_ISOLATE_TYPES,
   EW_URL_STANDARD_ISOLATE_TYPES,
   EW_URLPATTERN_ISOLATE_TYPES,
   EW_WEBSOCKET_ISOLATE_TYPES,
   EW_SQL_ISOLATE_TYPES,
   EW_NODE_ISOLATE_TYPES,
+  EW_RTTI_ISOLATE_TYPES,
+  EW_HYPERDRIVE_ISOLATE_TYPES,
+#ifdef WORKERD_EXPERIMENTAL_ENABLE_WEBGPU
+  EW_WEBGPU_ISOLATE_TYPES,
+#endif
 
   jsg::TypeWrapperExtension<PromiseWrapper>,
   jsg::InjectConfiguration<CompatibilityFlags::Reader>,
-  Worker::ApiIsolate::ErrorInterface,
+  Worker::Api::ErrorInterface,
   jsg::CommonJsModuleObject,
   jsg::CommonJsModuleContext,
   jsg::NodeJsModuleObject,
   jsg::NodeJsModuleContext);
 
-struct WorkerdApiIsolate::Impl {
+struct WorkerdApi::Impl {
   kj::Own<CompatibilityFlags::Reader> features;
   JsgWorkerdIsolate jsgIsolate;
+  api::MemoryCacheProvider& memoryCacheProvider;
 
   class Configuration {
   public:
@@ -102,9 +127,12 @@ struct WorkerdApiIsolate::Impl {
 
   Impl(jsg::V8System& v8System,
        CompatibilityFlags::Reader featuresParam,
-       IsolateLimitEnforcer& limitEnforcer)
+       IsolateLimitEnforcer& limitEnforcer,
+       kj::Own<jsg::IsolateObserver> observer,
+       api::MemoryCacheProvider& memoryCacheProvider)
       : features(capnp::clone(featuresParam)),
-        jsgIsolate(v8System, Configuration(*this), limitEnforcer.getCreateParams()) {}
+        jsgIsolate(v8System, Configuration(*this), kj::mv(observer), limitEnforcer.getCreateParams()),
+        memoryCacheProvider(memoryCacheProvider) {}
 
   static v8::Local<v8::String> compileTextGlobal(JsgWorkerdIsolate::Lock& lock,
       capnp::Text::Reader reader) {
@@ -140,53 +168,60 @@ struct WorkerdApiIsolate::Impl {
 
 };
 
-WorkerdApiIsolate::WorkerdApiIsolate(jsg::V8System& v8System,
+WorkerdApi::WorkerdApi(jsg::V8System& v8System,
     CompatibilityFlags::Reader features,
-    IsolateLimitEnforcer& limitEnforcer)
-    : impl(kj::heap<Impl>(v8System, features, limitEnforcer)) {}
-WorkerdApiIsolate::~WorkerdApiIsolate() noexcept(false) {}
+    IsolateLimitEnforcer& limitEnforcer,
+    kj::Own<jsg::IsolateObserver> observer,
+    api::MemoryCacheProvider& memoryCacheProvider)
+    : impl(kj::heap<Impl>(v8System, features, limitEnforcer, kj::mv(observer),
+                          memoryCacheProvider)) {}
+WorkerdApi::~WorkerdApi() noexcept(false) {}
 
-kj::Own<jsg::Lock> WorkerdApiIsolate::lock(jsg::V8StackScope& stackScope) const {
+kj::Own<jsg::Lock> WorkerdApi::lock(jsg::V8StackScope& stackScope) const {
   return kj::heap<JsgWorkerdIsolate::Lock>(impl->jsgIsolate, stackScope);
 }
-CompatibilityFlags::Reader WorkerdApiIsolate::getFeatureFlags() const {
+CompatibilityFlags::Reader WorkerdApi::getFeatureFlags() const {
   return *impl->features;
 }
 jsg::JsContext<api::ServiceWorkerGlobalScope>
-    WorkerdApiIsolate::newContext(jsg::Lock& lock) const {
+    WorkerdApi::newContext(jsg::Lock& lock) const {
   return kj::downcast<JsgWorkerdIsolate::Lock>(lock)
       .newContext<api::ServiceWorkerGlobalScope>(lock.v8Isolate);
 }
-jsg::Dict<NamedExport> WorkerdApiIsolate::unwrapExports(
+jsg::Dict<NamedExport> WorkerdApi::unwrapExports(
     jsg::Lock& lock, v8::Local<v8::Value> moduleNamespace) const {
   return kj::downcast<JsgWorkerdIsolate::Lock>(lock)
       .unwrap<jsg::Dict<NamedExport>>(lock.v8Context(), moduleNamespace);
 }
-const jsg::TypeHandler<Worker::ApiIsolate::ErrorInterface>&
-    WorkerdApiIsolate::getErrorInterfaceTypeHandler(jsg::Lock& lock) const {
+WorkerdApi::EntrypointClasses WorkerdApi::getEntrypointClasses(jsg::Lock& lock) const {
+  auto& typedLock = kj::downcast<JsgWorkerdIsolate::Lock>(lock);
+
+  return {
+    .workerEntrypoint = typedLock.getConstructor<api::WorkerEntrypoint>(lock.v8Context()),
+    .durableObject = typedLock.getConstructor<api::DurableObjectBase>(lock.v8Context()),
+  };
+}
+const jsg::TypeHandler<Worker::Api::ErrorInterface>&
+    WorkerdApi::getErrorInterfaceTypeHandler(jsg::Lock& lock) const {
   return kj::downcast<JsgWorkerdIsolate::Lock>(lock).getTypeHandler<ErrorInterface>();
 }
 
 const jsg::TypeHandler<api::QueueExportedHandler>&
-    WorkerdApiIsolate::getQueueTypeHandler(jsg::Lock& lock) const {
+    WorkerdApi::getQueueTypeHandler(jsg::Lock& lock) const {
   return kj::downcast<JsgWorkerdIsolate::Lock>(lock).getTypeHandler<api::QueueExportedHandler>();
 }
 
-struct NoopCompilationObserver final : public jsg::CompilationObserver {
-  kj::Own<void> onEsmCompilationStart(v8::Isolate* isolate,
-      kj::StringPtr name, jsg::ModuleInfoCompileOption option) const override {
-    return kj::Own<void>();
-  }
+jsg::JsObject WorkerdApi::wrapExecutionContext(
+    jsg::Lock& lock, jsg::Ref<api::ExecutionContext> ref) const {
+  return jsg::JsObject(kj::downcast<JsgWorkerdIsolate::Lock>(lock)
+      .wrap(lock.v8Context(), kj::mv(ref)));
+}
 
-  kj::Own<void> onWasmCompilationStart(v8::Isolate* isolate, size_t codeSize) const override {
-    return kj::Own<void>();
-  }
-};
-
-Worker::Script::Source WorkerdApiIsolate::extractSource(kj::StringPtr name,
+Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
     config::Worker::Reader conf,
     Worker::ValidationErrorReporter& errorReporter,
     capnp::List<config::Extension>::Reader extensions) {
+  TRACE_EVENT("workerd", "WorkerdApi::extractSource()");
   switch (conf.which()) {
     case config::Worker::MODULES: {
       auto modules = conf.getModules();
@@ -197,9 +232,8 @@ Worker::Script::Source WorkerdApiIsolate::extractSource(kj::StringPtr name,
 
       return Worker::Script::ModulesSource {
         modules[0].getName(),
-        [conf,&errorReporter, extensions](jsg::Lock& lock, const Worker::ApiIsolate& apiIsolate) {
-          return kj::downcast<const WorkerdApiIsolate>(apiIsolate)
-              .compileModules(lock, conf, errorReporter, extensions);
+        [conf,&errorReporter, extensions](jsg::Lock& lock, const Worker::Api& api) {
+          return WorkerdApi::from(api).compileModules(lock, conf, errorReporter, extensions);
         }
       };
     }
@@ -207,9 +241,8 @@ Worker::Script::Source WorkerdApiIsolate::extractSource(kj::StringPtr name,
       return Worker::Script::ScriptSource {
         conf.getServiceWorkerScript(),
         name,
-        [conf,&errorReporter](jsg::Lock& lock, const Worker::ApiIsolate& apiIsolate) {
-          return kj::downcast<const WorkerdApiIsolate>(apiIsolate)
-              .compileScriptGlobals(lock, conf, errorReporter);
+        [conf,&errorReporter](jsg::Lock& lock, const Worker::Api& api, const jsg::CompilationObserver& observer) {
+          return WorkerdApi::from(api).compileScriptGlobals(lock, conf, errorReporter, observer);
         }
       };
     case config::Worker::INHERIT:
@@ -223,16 +256,18 @@ invalid:
   return Worker::Script::ScriptSource {
     ""_kj,
     name,
-    [](jsg::Lock& lock, const Worker::ApiIsolate& apiIsolate)
+    [](jsg::Lock& lock, const Worker::Api& api, const jsg::CompilationObserver& observer)
         -> kj::Array<Worker::Script::CompiledGlobal> {
       return nullptr;
     }
   };
 }
 
-kj::Array<Worker::Script::CompiledGlobal> WorkerdApiIsolate::compileScriptGlobals(
+kj::Array<Worker::Script::CompiledGlobal> WorkerdApi::compileScriptGlobals(
       jsg::Lock& lockParam, config::Worker::Reader conf,
-      Worker::ValidationErrorReporter& errorReporter) const {
+      Worker::ValidationErrorReporter& errorReporter,
+      const jsg::CompilationObserver& observer) const {
+  TRACE_EVENT("workerd", "WorkerdApi::compileScriptGlobals()");
   // For Service Worker scripts, we support Wasm modules as globals, but they need to be loaded
   // at script load time.
 
@@ -243,12 +278,11 @@ kj::Array<Worker::Script::CompiledGlobal> WorkerdApiIsolate::compileScriptGlobal
     if (binding.isWasmModule()) ++wasmCount;
   }
 
-  auto observer = kj::refcounted<NoopCompilationObserver>();
   auto compiledGlobals = kj::heapArrayBuilder<Worker::Script::CompiledGlobal>(wasmCount);
   for (auto binding: conf.getBindings()) {
     if (binding.isWasmModule()) {
-      auto name = jsg::v8StrIntern(lock.v8Isolate, binding.getName());
-      auto value = Impl::compileWasmGlobal(lock, binding.getWasmModule(), *observer);
+      auto name = lock.str(binding.getName());
+      auto value = Impl::compileWasmGlobal(lock, binding.getWasmModule(), observer);
 
       compiledGlobals.add(Worker::Script::CompiledGlobal {
         { lock.v8Isolate, name },
@@ -260,130 +294,166 @@ kj::Array<Worker::Script::CompiledGlobal> WorkerdApiIsolate::compileScriptGlobal
   return compiledGlobals.finish();
 }
 
-kj::Own<jsg::ModuleRegistry> WorkerdApiIsolate::compileModules(
+kj::Maybe<jsg::ModuleRegistry::ModuleInfo> WorkerdApi::tryCompileModule(
+    jsg::Lock& js,
+    config::Worker::Module::Reader module,
+    jsg::CompilationObserver& observer,
+    CompatibilityFlags::Reader featureFlags) {
+  TRACE_EVENT("workerd", "WorkerdApi::tryCompileModule()", "name", module.getName());
+  auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(js);
+  switch (module.which()) {
+    case config::Worker::Module::TEXT: {
+      return jsg::ModuleRegistry::ModuleInfo(
+          lock,
+          module.getName(),
+          kj::none,
+          jsg::ModuleRegistry::TextModuleInfo(lock,
+              Impl::compileTextGlobal(lock, module.getText())));
+    }
+    case config::Worker::Module::DATA: {
+      return jsg::ModuleRegistry::ModuleInfo(
+          lock,
+          module.getName(),
+          kj::none,
+          jsg::ModuleRegistry::DataModuleInfo(
+              lock,
+              Impl::compileDataGlobal(lock, module.getData()).As<v8::ArrayBuffer>()));
+    }
+    case config::Worker::Module::WASM: {
+      return jsg::ModuleRegistry::ModuleInfo(
+          lock,
+          module.getName(),
+          kj::none,
+          jsg::ModuleRegistry::WasmModuleInfo(lock,
+              Impl::compileWasmGlobal(lock, module.getWasm(), observer)));
+    }
+    case config::Worker::Module::JSON: {
+        return jsg::ModuleRegistry::ModuleInfo(
+            lock,
+            module.getName(),
+            kj::none,
+            jsg::ModuleRegistry::JsonModuleInfo(lock,
+                Impl::compileJsonGlobal(lock, module.getJson())));
+    }
+    case config::Worker::Module::ES_MODULE: {
+      return jsg::ModuleRegistry::ModuleInfo(
+          lock,
+          module.getName(),
+          module.getEsModule(),
+          jsg::ModuleInfoCompileOption::BUNDLE,
+          observer);
+    }
+    case config::Worker::Module::COMMON_JS_MODULE: {
+      return jsg::ModuleRegistry::ModuleInfo(
+          lock,
+          module.getName(),
+          kj::none,
+          jsg::ModuleRegistry::CommonJsModuleInfo(
+              lock,
+              module.getName(),
+              module.getCommonJsModule()));
+    }
+    case config::Worker::Module::NODE_JS_COMPAT_MODULE: {
+      KJ_REQUIRE(featureFlags.getNodeJsCompat(),
+          "The nodejs_compat compatibility flag is required to use the nodeJsCompatModule type.");
+      return jsg::ModuleRegistry::ModuleInfo(
+          lock,
+          module.getName(),
+          kj::none,
+          jsg::ModuleRegistry::NodeJsModuleInfo(
+              lock,
+              module.getName(),
+              module.getNodeJsCompatModule()));
+    }
+    case config::Worker::Module::PYTHON_MODULE: {
+      // Nothing to do. Handled in compileModules.
+      return kj::none;
+    }
+    case config::Worker::Module::PYTHON_REQUIREMENT: {
+      // Nothing to do. Handled in compileModules.
+      return kj::none;
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+void WorkerdApi::compileModules(
     jsg::Lock& lockParam, config::Worker::Reader conf,
     Worker::ValidationErrorReporter& errorReporter,
     capnp::List<config::Extension>::Reader extensions) const {
-  auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
-  v8::HandleScope scope(lock.v8Isolate);
+  TRACE_EVENT("workerd", "WorkerdApi::compileModules()");
+  lockParam.withinHandleScope([&] {
+    auto modules = jsg::ModuleRegistryImpl<JsgWorkerdIsolate_TypeWrapper>::from(lockParam);
 
-  auto observer = kj::refcounted<NoopCompilationObserver>();
-  auto modules = kj::heap<jsg::ModuleRegistryImpl<JsgWorkerdIsolate_TypeWrapper>>(
-      kj::addRef(*observer));
-
-  for (auto module: conf.getModules()) {
-    auto path = kj::Path::parse(module.getName());
-
-    switch (module.which()) {
-      case config::Worker::Module::TEXT: {
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                nullptr,
-                jsg::ModuleRegistry::TextModuleInfo(lock,
-                    Impl::compileTextGlobal(lock, module.getText()))));
-        break;
+    auto confModules = conf.getModules();
+    using namespace workerd::api::pyodide;
+    auto featureFlags = getFeatureFlags();
+    if (hasPythonModules(confModules)) {
+      KJ_REQUIRE(featureFlags.getPythonWorkers(),
+          "The python_workers compatibility flag is required to use Python.");
+      // Inject pyodide bootstrap module.
+      {
+        auto mainModule = confModules.begin();
+        capnp::MallocMessageBuilder message;
+        auto module = message.getRoot<config::Worker::Module>();
+        module.setEsModule(PYTHON_ENTRYPOINT);
+        auto info = tryCompileModule(lockParam, module, modules->getObserver(), featureFlags);
+        auto path = kj::Path::parse(mainModule->getName());
+        modules->add(path, kj::mv(KJ_REQUIRE_NONNULL(info)));
       }
-      case config::Worker::Module::DATA: {
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                nullptr,
-                jsg::ModuleRegistry::DataModuleInfo(
-                    lock,
-                    Impl::compileDataGlobal(lock, module.getData()).As<v8::ArrayBuffer>())));
-        break;
+      // Inject metadata that the entrypoint module will read.
+      {
+        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
+        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
+        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
+        auto specifier = "pyodide-internal:runtime-generated/metadata";
+        auto metadataReader = makePyodideMetadataReader(conf);
+        modules->addBuiltinModule(
+            specifier,
+            [specifier = kj::str(specifier), metadataReader = kj::mv(metadataReader)](
+                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
+              auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
+              auto wrap = wrapper.wrap(js.v8Context(), kj::none, kj::mv(metadataReader));
+              return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
+            },
+            jsg::ModuleRegistry::Type::INTERNAL);
       }
-      case config::Worker::Module::WASM: {
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                nullptr,
-                jsg::ModuleRegistry::WasmModuleInfo(lock,
-                    Impl::compileWasmGlobal(lock, module.getWasm(), *observer))));
-        break;
-      }
-      case config::Worker::Module::JSON: {
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                nullptr,
-                jsg::ModuleRegistry::JsonModuleInfo(lock,
-                    Impl::compileJsonGlobal(lock, module.getJson()))));
-        break;
-      }
-      case config::Worker::Module::ES_MODULE: {
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                module.getEsModule(),
-                jsg::ModuleInfoCompileOption::BUNDLE,
-                *observer));
-        break;
-      }
-      case config::Worker::Module::COMMON_JS_MODULE: {
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                nullptr,
-                jsg::ModuleRegistry::CommonJsModuleInfo(
-                    lock,
-                    module.getName(),
-                    module.getCommonJsModule())));
-        break;
-      }
-      case config::Worker::Module::NODE_JS_COMPAT_MODULE: {
-        KJ_REQUIRE(getFeatureFlags().getNodeJsCompat(),
-            "The nodejs_compat compatibility flag is required to use the nodeJsCompatModule type.");
-        modules->add(
-            path,
-            jsg::ModuleRegistry::ModuleInfo(
-                lock,
-                module.getName(),
-                nullptr,
-                jsg::ModuleRegistry::NodeJsModuleInfo(
-                    lock,
-                    module.getName(),
-                    module.getNodeJsCompatModule())));
-        break;
-      }
-      default: {
-        KJ_UNREACHABLE;
+      // Inject artifact bundler.
+      {
+        using ModuleInfo = jsg::ModuleRegistry::ModuleInfo;
+        using ObjectModuleInfo = jsg::ModuleRegistry::ObjectModuleInfo;
+        using ResolveMethod = jsg::ModuleRegistry::ResolveMethod;
+        auto specifier = "pyodide-internal:artifacts";
+        modules->addBuiltinModule(specifier,
+            [specifier = kj::str(specifier)](
+                jsg::Lock& js, ResolveMethod, kj::Maybe<const kj::Path&>&) mutable {
+          auto& wrapper = JsgWorkerdIsolate_TypeWrapper::from(js.v8Isolate);
+          auto wrap = wrapper.wrap(js.v8Context(), kj::none, ArtifactBundler::makeDisabledBundler());
+          return kj::Maybe(ModuleInfo(js, specifier, kj::none, ObjectModuleInfo(js, wrap)));
+        },
+            jsg::ModuleRegistry::Type::INTERNAL);
       }
     }
-  }
 
-  if (getFeatureFlags().getNodeJsCompat()) {
-    api::node::registerNodeJsCompatModules(*modules, getFeatureFlags());
-  }
-
-  api::registerSocketsModule(*modules, getFeatureFlags());
-  modules->addBuiltinBundle(CLOUDFLARE_BUNDLE);
-
-  jsg::setModulesForResolveCallback<JsgWorkerdIsolate_TypeWrapper>(lock, modules);
-
-  // todo(perf): we'd like to find a way to precompile these on server startup and use isolate
-  // cloning for faster worker creation.
-  for (auto extension: extensions) {
-    for (auto module: extension.getModules()) {
-      modules->addBuiltinModule(module.getName(), module.getEsModule().asArray(),
-          module.getInternal() ? jsg::ModuleRegistry::Type::INTERNAL : jsg::ModuleRegistry::Type::BUILTIN);
+    for (auto module: confModules) {
+      auto path = kj::Path::parse(module.getName());
+      auto maybeInfo = tryCompileModule(lockParam, module, modules->getObserver(), featureFlags);
+      KJ_IF_SOME(info, maybeInfo) {
+        modules->add(path, kj::mv(info));
+      }
     }
-  }
 
-  return modules;
+    api::registerModules(*modules, featureFlags);
+
+    // todo(perf): we'd like to find a way to precompile these on server startup and use isolate
+    // cloning for faster worker creation.
+    for (auto extension: extensions) {
+      for (auto module: extension.getModules()) {
+        modules->addBuiltinModule(module.getName(), module.getEsModule().asArray(),
+            module.getInternal() ? jsg::ModuleRegistry::Type::INTERNAL : jsg::ModuleRegistry::Type::BUILTIN);
+      }
+    }
+  });
 }
 
 class ActorIdFactoryImpl final: public ActorIdFactory {
@@ -418,7 +488,7 @@ public:
   };
 
   kj::Own<ActorId> newUniqueId(kj::Maybe<kj::StringPtr> jurisdiction) override {
-    JSG_REQUIRE(jurisdiction == nullptr, Error,
+    JSG_REQUIRE(jurisdiction == kj::none, Error,
         "Jurisdiction restrictions are not implemented in workerd.");
 
     // We want to randomly-generate the first 16 bytes, then HMAC those to produce the latter
@@ -436,7 +506,7 @@ public:
     }
 
     computeMac(id);
-    return kj::heap<ActorIdImpl>(id, nullptr);
+    return kj::heap<ActorIdImpl>(id, kj::none);
   }
 
   kj::Own<ActorId> idFromName(kj::String name) override {
@@ -468,7 +538,7 @@ public:
                 decoded.size() - BASE_LENGTH) == 0,
                 TypeError, "Durable Object ID is not valid for this namespace.");
 
-    return kj::heap<ActorIdImpl>(id, nullptr);
+    return kj::heap<ActorIdImpl>(id, kj::none);
   }
 
   kj::Own<ActorIdFactory> cloneWithJurisdiction(kj::StringPtr jurisdiction) override {
@@ -500,9 +570,12 @@ private:
 
 static v8::Local<v8::Value> createBindingValue(
     JsgWorkerdIsolate::Lock& lock,
-    const WorkerdApiIsolate::Global& global,
-    CompatibilityFlags::Reader featureFlags) {
-  using Global = WorkerdApiIsolate::Global;
+    const WorkerdApi::Global& global,
+    CompatibilityFlags::Reader featureFlags,
+    uint32_t ownerId,
+    api::MemoryCacheProvider& memoryCacheProvider) {
+  TRACE_EVENT("workerd", "WorkerdApi::createBindingValue()");
+  using Global = WorkerdApi::Global;
   auto context = lock.v8Context();
 
   v8::Local<v8::Value> value;
@@ -566,6 +639,17 @@ static v8::Local<v8::Value> createBindingValue(
       value = lock.wrap(context, kj::mv(importedKey));
     }
 
+    KJ_CASE_ONEOF(cache, Global::MemoryCache) {
+      value = lock.wrap(context, jsg::alloc<api::MemoryCache>(
+          api::SharedMemoryCache::Use(
+              memoryCacheProvider.getInstance(cache.cacheId),
+              {
+                .maxKeys = cache.maxKeys,
+                .maxValueSize = cache.maxValueSize,
+                .maxTotalValueSize = cache.maxTotalValueSize,
+              })));
+    }
+
     KJ_CASE_ONEOF(ns, Global::EphemeralActorNamespace) {
       value = lock.wrap(context, jsg::alloc<api::ColoLocalActorNamespace>(ns.actorChannel));
     }
@@ -573,6 +657,12 @@ static v8::Local<v8::Value> createBindingValue(
     KJ_CASE_ONEOF(ns, Global::DurableActorNamespace) {
       value = lock.wrap(context, jsg::alloc<api::DurableObjectNamespace>(ns.actorChannel,
           kj::heap<ActorIdFactoryImpl>(ns.uniqueKey)));
+    }
+
+    KJ_CASE_ONEOF(ae, Global::AnalyticsEngine) {
+        // Use subrequestChannel as logfwdrChannel
+        value = lock.wrap(context, jsg::alloc<api::AnalyticsEngine>(ae.subrequestChannel,
+                    kj::str(ae.dataset), ae.version, ownerId));
     }
 
     KJ_CASE_ONEOF(text, kj::String) {
@@ -588,23 +678,23 @@ static v8::Local<v8::Value> createBindingValue(
       auto moduleName = kj::Path::parse(wrapped.moduleName);
 
       // wrapped bindings can be produced by internal modules only
-      KJ_IF_MAYBE(moduleInfo, moduleRegistry->resolve(lock, moduleName,
+      KJ_IF_SOME(moduleInfo, moduleRegistry->resolve(lock, moduleName, kj::none,
            jsg::ModuleRegistry::ResolveOption::INTERNAL_ONLY)) {
         // obtain the module
-        auto module = moduleInfo->module.getHandle(lock);
+        auto module = moduleInfo.module.getHandle(lock);
         jsg::instantiateModule(lock, module);
 
         // build env object with inner bindings
         auto env = v8::Object::New(lock.v8Isolate);
         for (const auto& innerBinding: wrapped.innerBindings) {
-          jsg::check(env->Set(context,
-              lock.wrapString(innerBinding.name),
-              createBindingValue(lock, innerBinding, featureFlags)));
+          lock.v8Set(env, innerBinding.name,
+                     createBindingValue(lock, innerBinding, featureFlags, ownerId,
+                                         memoryCacheProvider));
         }
 
         // obtain exported function to call
         auto moduleNs = jsg::check(module->GetModuleNamespace()->ToObject(context));
-        auto fn = jsg::check(moduleNs->Get(context, jsg::v8Str(lock.v8Isolate, wrapped.entrypoint)));
+        auto fn = lock.v8Get(moduleNs, wrapped.entrypoint);
         KJ_ASSERT(fn->IsFunction(), "Entrypoint is not a function", wrapped.entrypoint);
 
         // invoke the function, its result will be binding value
@@ -615,40 +705,50 @@ static v8::Local<v8::Value> createBindingValue(
         KJ_LOG(ERROR, "wrapped binding module can't be resolved (internal modules only)", moduleName);
       }
     }
+    KJ_CASE_ONEOF(hyperdrive, Global::Hyperdrive) {
+      value = lock.wrap(context, jsg::alloc<api::Hyperdrive>(
+                                     hyperdrive.subrequestChannel, kj::str(hyperdrive.database),
+                                     kj::str(hyperdrive.user), kj::str(hyperdrive.password),
+                                     kj::str(hyperdrive.scheme)));
+    }
+    KJ_CASE_ONEOF(unsafe, Global::UnsafeEval) {
+      value = lock.wrap(context, jsg::alloc<api::UnsafeEval>());
+    }
   }
 
   return value;
 }
 
-void WorkerdApiIsolate::compileGlobals(
+void WorkerdApi::compileGlobals(
     jsg::Lock& lockParam, kj::ArrayPtr<const Global> globals,
     v8::Local<v8::Object> target,
     uint32_t ownerId) const {
+  TRACE_EVENT("workerd", "WorkerdApi::compileGlobals()");
   auto& lock = kj::downcast<JsgWorkerdIsolate::Lock>(lockParam);
-  v8::HandleScope scope(lock.v8Isolate);
-  auto context = lock.v8Context();
-  auto& featureFlags = *impl->features;
+  lockParam.withinHandleScope([&] {
+    auto& featureFlags = *impl->features;
 
-  for (auto& global: globals) {
-    v8::HandleScope scope(lock.v8Isolate);
-
-    // Don't use String's usual TypeHandler here because we want to intern the string.
-    auto name = jsg::v8StrIntern(lock.v8Isolate, global.name);
-    auto value = createBindingValue(lock, global, featureFlags);
-
-    KJ_ASSERT(!value.IsEmpty(), "global did not produce v8::Value");
-    bool setResult = jsg::check(target->Set(context, name, value));
-
-    if (!setResult) {
-      // Can this actually happen? What does it mean?
-      KJ_LOG(ERROR, "Set() returned false?", global.name);
+    for (auto& global: globals) {
+      lockParam.withinHandleScope([&] {
+        // Don't use String's usual TypeHandler here because we want to intern the string.
+        auto value = createBindingValue(lock, global, featureFlags, ownerId,
+                                        impl->memoryCacheProvider);
+        KJ_ASSERT(!value.IsEmpty(), "global did not produce v8::Value");
+        lockParam.v8Set(target, global.name, value);
+      });
     }
-  }
+  });
+}
+
+void WorkerdApi::setModuleFallbackCallback(
+    kj::Function<ModuleFallbackCallback>&& callback) const {
+  auto& isolateBase = const_cast<JsgWorkerdIsolate&>(impl->jsgIsolate);
+  isolateBase.setModuleFallbackCallback(kj::mv(callback));
 }
 
 // =======================================================================================
 
-WorkerdApiIsolate::Global WorkerdApiIsolate::Global::clone() const {
+WorkerdApi::Global WorkerdApi::Global::clone() const {
   Global result;
   result.name = kj::str(name);
 
@@ -674,11 +774,17 @@ WorkerdApiIsolate::Global WorkerdApiIsolate::Global::clone() const {
     KJ_CASE_ONEOF(key, Global::CryptoKey) {
       result.value = key.clone();
     }
+    KJ_CASE_ONEOF(cache, Global::MemoryCache) {
+      result.value = cache.clone();
+    }
     KJ_CASE_ONEOF(ns, Global::EphemeralActorNamespace) {
       result.value = ns.clone();
     }
     KJ_CASE_ONEOF(ns, Global::DurableActorNamespace) {
       result.value = ns.clone();
+    }
+    KJ_CASE_ONEOF(ae, Global::AnalyticsEngine) {
+      result.value = ae.clone();
     }
     KJ_CASE_ONEOF(text, kj::String) {
       result.value = kj::str(text);
@@ -689,9 +795,19 @@ WorkerdApiIsolate::Global WorkerdApiIsolate::Global::clone() const {
     KJ_CASE_ONEOF(wrapped, Global::Wrapped) {
       result.value = wrapped.clone();
     }
+    KJ_CASE_ONEOF(hyperdrive, Global::Hyperdrive) {
+      result.value = hyperdrive.clone();
+    }
+    KJ_CASE_ONEOF(unsafe, Global::UnsafeEval) {
+      result.value = Global::UnsafeEval {};
+    }
   }
 
   return result;
+}
+
+const WorkerdApi& WorkerdApi::from(const Worker::Api& api) {
+  return kj::downcast<const WorkerdApi>(api);
 }
 
 }  // namespace workerd::server

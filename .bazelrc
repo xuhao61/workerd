@@ -1,52 +1,130 @@
 common --enable_platform_specific_config
+build --verbose_failures
+build --build_tag_filters=-off-by-default
+test --test_tag_filters=-off-by-default
 
-# Our dependencies (ICU, zlib, etc.) produce a lot of these warnings, so we disable them.
+# Not using bzlmod for dependencies yet
+common --noenable_bzlmod
+
+# TODO(soon): bazel7 enables Build without the Bytes (BwoB) by default. This could significantly
+# speed up builds using the remote cache since less data needs to be fetched. Unfortunately, it
+# appears to cause build failures due to https://github.com/bazelbuild/bazel/issues/20559 at this
+# time. Use --remote_download_all to disable BwoB for now.
+# When that issue and https://github.com/bazelbuild/bazel/issues/20576 have been addressed, we can
+# also explore --remote_download_minimal.
+build --remote_download_all
+
+# Enable webgpu
+build --//src/workerd/io:enable_experimental_webgpu=True
+
+# Dawn tint build flags
+build --@dawn//src/tint:tint_build_glsl_writer=False
+build --@dawn//src/tint:tint_build_glsl_validator=False
+build --@dawn//src/tint:tint_build_hlsl_writer=True
+build --@dawn//src/tint:tint_build_ir=False
+build --@dawn//src/tint:tint_build_msl_writer=True
+build --@dawn//src/tint:tint_build_spv_reader=False
+build --@dawn//src/tint:tint_build_spv_writer=True
+build --@dawn//src/tint:tint_build_wgsl_reader=True
+build --@dawn//src/tint:tint_build_wgsl_writer=True
+
+# Our dependencies (ICU, zlib, etc.) produce a lot of these warnings, so we disable them. Depending
+# on the clang version, zlib either produces warnings for -Wdeprecated-non-prototype or does not
+# have that option, so disable -Wunknown-warning-option there too.
 build --per_file_copt='external/com_googlesource_chromium_icu@-Wno-ambiguous-reversed-operator,-Wno-deprecated-declarations'
 build --host_per_file_copt='external/com_googlesource_chromium_icu@-Wno-ambiguous-reversed-operator,-Wno-deprecated-declarations'
+build --per_file_copt='external/dawn@-Wno-shorten-64-to-32,-Wno-unneeded-internal-declaration'
+build --host_per_file_copt='external/dawn@-Wno-shorten-64-to-32,-Wno-unneeded-internal-declaration'
+build --per_file_copt='external/zlib@-Wno-unknown-warning-option,-Wno-deprecated-non-prototype'
+build --host_per_file_copt='external/zlib@-Wno-unknown-warning-option,-Wnodeprecated-non-prototype'
 
-# Speed up sandboxed compilation, particularly on I/O-constrained and non-Linux systems
-# https://bazel.build/reference/command-line-reference#flag--reuse_sandbox_directories
-build --reuse_sandbox_directories
+# Enable C++20 to support std::unordered_map::contains(). Not sure why this is needed here, V8
+# is supposed to work with C++14.
+build:unix --per_file_copt='external/v8/src/compiler/graph-visualizer.cc@-std=c++20'
+build:windows --per_file_copt='external/v8/src/compiler/graph-visualizer.cc@/std:c++20'
+
+# Need to redefine _WIN32_WINNT to build dawn on Windows
+build:windows --per_file_copt='external/dawn@-Wno-macro-redefined'
+build:windows --host_per_file_copt='external/dawn@-Wno-macro-redefined'
+
+# typescript configuration
+# do more correct type checking
+common --@aspect_rules_ts//ts:skipLibCheck=honor_tsconfig
+# Use "tsc" as the transpiler when ts_project has no `transpiler` set.
+common --@aspect_rules_ts//ts:default_to_tsc_transpiler
 
 # optimized LTO build. you'll need a fairly recent clang for this to work
 build:thin-lto -c opt
 build:thin-lto --cxxopt='-flto=thin'
 build:thin-lto --linkopt='-flto=thin'
 
+# configuration used for performance profiling
+build:profile --config=thin-lto
+build:profile --copt="-fno-omit-frame-pointer" --copt="-mno-omit-leaf-frame-pointer"
+build:profile --copt='-g1' --linkopt='-g1' --strip=never
+
+# configuration used for performance benchmarking is the same as profiling for consistency
+build:benchmark --config=profile
+
+# Define a debug config which is primarily intended for local development.
+build:debug -c dbg
+
+# Using simple template names saves around 5% of binary size of workerd.
+build:unix --cxxopt='-gsimple-template-names' --host_cxxopt='-gsimple-template-names'
+
 # Define a config mode which is fastbuild but with basic debug info.
-#
-# Switching to full debug mode for debugging doesn't really work because debug mode produces
-# insanely large binaries.
 build:fastdbg -c fastbuild
-build:fastdbg --cxxopt='-gline-tables-only' --host_cxxopt='-gline-tables-only'
-build:fastdbg --linkopt='-gline-tables-only' --host_linkopt='-gline-tables-only'
+build:fastdbg --cxxopt='-g1' --host_cxxopt='-g1'
+build:fastdbg --linkopt='-g1' --host_linkopt='-g1'
 build:fastdbg --strip=never
 build:fastdbg --//:dead_strip=False
 
-# Additional Rust flags (see https://doc.rust-lang.org/rustc/codegen-options/index.html)
-# Need to disable debug-assertions for fastbuild, should be off automatically for opt
-build --@rules_rust//:extra_rustc_flags=-C,panic=abort,-C,debug-assertions=n
+# Miscellaneous platform-independent options
+build --@capnp-cpp//src/kj:openssl=True --@capnp-cpp//src/kj:zlib=True --@capnp-cpp//src/kj:brotli=True
+build --cxxopt="-fbracket-depth=512" --host_cxxopt="-fbracket-depth=512"
 
-build:fastdbg --@rules_rust//:extra_rustc_flags=-C,panic=unwind,-C,debug-assertions=y,-C,debuginfo=1
+# Additional Rust flags (see https://doc.rust-lang.org/rustc/codegen-options/index.html)
+# Need to disable debug-assertions for fastbuild, should be off automatically for opt. As long as
+# rust-level LTO is not enabled, LLVM bitcode is not needed so -C embed-bitcode=n provides a free
+# improvement to build speed and rust-deps code size.
+build --@rules_rust//:extra_rustc_flags=-C,panic=abort,-C,debug-assertions=n,-C,embed-bitcode=n
+build --@rules_rust//:extra_exec_rustc_flags=-C,panic=abort,-C,debug-assertions=n,-C,embed-bitcode=n
+
+build:fastdbg --@rules_rust//:extra_rustc_flags=-C,panic=unwind,-C,debug-assertions=y,-C,debuginfo=1,-C,embed-bitcode=n
+build:fastdbg --@rules_rust//:extra_exec_rustc_flags=-C,panic=unwind,-C,debug-assertions=y,-C,debuginfo=1,-C,embed-bitcode=n
 
 # TODO(later): -C codegen-units=1 improves code size and quality, should be enabled in a future
 # release configuration even if lto is off. Similarly, adding -C lto=thin would improve binary size
-# a lot (~2.2MB on Linux) – disable it for now due to compile errors and wrong code generation when
-# bazel and Rust use different LLVM versions. -C opt-level=s provides a comparatively small size
-# improvement, ~35k or ~75k with LTO.
-build:thin-lto --@rules_rust//:extra_rustc_flags=-C,panic=abort,-C,codegen-units=1
+# significantly – disable it for now due to compile errors and wrong code generation when bazel and
+# rust use different LLVM versions.
+build:thin-lto --@rules_rust//:extra_rustc_flags=-C,panic=abort,-C,codegen-units=1,-C,embed-bitcode=n
+
+# common sanitizers options
+build:sanitizer-common --@workerd//src/workerd/server:use_tcmalloc=False
+build:sanitizer-common --copt="-fsanitize-link-c++-runtime" --linkopt="-fsanitize-link-c++-runtime"
+build:sanitizer-common --copt="-Og"
+build:sanitizer-common --copt="-g" --strip=never
+build:sanitizer-common --copt="-fno-optimize-sibling-calls"
+build:sanitizer-common --copt="-fno-omit-frame-pointer" --copt="-mno-omit-leaf-frame-pointer"
+
+# address sanitizer (https://github.com/google/sanitizers/wiki/AddressSanitizer)
+build:asan --config=sanitizer-common
+build:asan --copt="-fsanitize=address" --linkopt="-fsanitize=address"
+build:asan --test_env=ASAN_OPTIONS=abort_on_error=true
 
 #
 # Linux and macOS
 #
-build:unix --cxxopt='-std=c++20' --host_cxxopt='-std=c++20' --force_pic --verbose_failures
-build:unix --cxxopt='-fcoroutines-ts' --host_cxxopt='-fcoroutines-ts'
-build:unix --cxxopt='-stdlib=libc++' --host_cxxopt='-stdlib=libc++'
-build:unix --linkopt='-stdlib=libc++' --host_linkopt='-stdlib=libc++'
+build:unix --workspace_status_command=./tools/unix/workspace-status.sh
+
+build:unix --cxxopt='-std=c++20' --host_cxxopt='-std=c++20'
+build:unix --@capnp-cpp//src/kj:libdl=True
 
 build:unix --action_env=BAZEL_COMPILER=clang
 build:unix --action_env=CC=clang
 build:unix --action_env=CXX=clang++
+
+build:unix --test_env=LLVM_SYMBOLIZER=llvm-symbolizer
 
 # Warning options.
 build:unix --cxxopt='-Wall' --host_cxxopt='-Wall'
@@ -60,14 +138,44 @@ build:unix --cxxopt='-Wno-unused-parameter' --host_cxxopt='-Wno-unused-parameter
 build:unix --cxxopt='-Wno-missing-field-initializers' --host_cxxopt='-Wno-missing-field-initializers'
 build:unix --cxxopt='-Wno-ignored-qualifiers' --host_cxxopt='-Wno-ignored-qualifiers'
 
-# Temporary workaround for zlib warnings and mac compilation, should no longer be needed with next
-# zlib release (https://github.com/madler/zlib/issues/633)
-build:unix --per_file_copt='external/zlib[~/].*\.c@-std=c90' --host_per_file_copt='external/zlib[~/].*\.c@-std=c90'
-
-build:unix --@capnp-cpp//src/kj:openssl=True --@capnp-cpp//src/kj:zlib=True --@capnp-cpp//src/kj:libdl=True
-
 build:linux --config=unix
 build:macos --config=unix
+
+# Support macOS 11 as the minimum version. There should be at least a warning when backward
+# compatibility is broken as -Wunguarded-availability-new is enabled by default.
+# TODO (cleanup): macOS 11.X is now EOL, bump this to macOS 12.5 soon.
+build:macos --macos_minimum_os=11.5 --host_macos_minimum_os=11.5
+
+# Avoid emitting duplicate unwind info where compact unwind info can be used. This reduces the
+# object size by ~5% on average, improving disk space usage and link times. The final binary size
+# is not affected. Note that this is on-by-default on arm64, but turning it on for all mac builds
+# is easier than adding the flag only on x86. See https://reviews.llvm.org/D122258 for detailed
+# information on the flag.
+build:macos --copt='-femit-dwarf-unwind=no-compact-unwind'
+
+# On Linux, always link libc++ statically to avoid compatibility issues with different OS versions.
+# macOS links with dynamic libc++ by default, which has good backwards compatibility.
+build:linux --cxxopt='-stdlib=libc++' --host_cxxopt='-stdlib=libc++'
+build:linux --linkopt='-stdlib=libc++' --host_linkopt='-stdlib=libc++'
+build:linux --action_env=BAZEL_LINKLIBS='-l%:libc++.a -lm -static-libgcc'
+
+# On Linux, enable PIC. In macos pic is the default, and the objc_library rule does not work
+# correctly if we use this flag since it will not find the object files to include
+# https://github.com/bazelbuild/bazel/issues/12439#issuecomment-914449079
+build:linux --force_pic
+
+# On Linux, garbage collection sections and optimize binary size. These do not apply to the macOS
+# toolchain.
+build:linux --linkopt="-Wl,--gc-sections" --linkopt="-Wl,-O2"
+build:linux --cxxopt="-ffunction-sections" --host_cxxopt="-ffunction-sections"
+build:linux --cxxopt="-fdata-sections" --host_cxxopt="-fdata-sections"
+
+# TODO(later): rustc's -C,codegen-units=1 and ld/lld's -Wl,-O2 on Linux/possibly Windows should
+# bring an additional binary size improvement. These should only be enabled in opt mode which won't
+# be possible in bazelrc without establishing a release configuration, but it can be done using the
+# extra_rustc_flags parameter in rust_register_toolchains() and by modifying linkopts in kj_test()
+# and wd_cc_binary() similar to how the use_dead_strip flag is used. The binary size improvement is
+# modest (~ 300kb), but if we encounter size concerns again this would be a good place to start.
 
 #
 # Windows
@@ -75,6 +183,7 @@ build:macos --config=unix
 
 # See https://bazel.build/configure/windows#symlink
 startup --windows_enable_symlinks
+build:windows --workspace_status_command=./tools/windows/workspace-status.cmd
 build:windows --enable_runfiles
 # We use LLVM's MSVC-compatible compiler driver to compile our code on Windows,
 # as opposed to using MSVC directly. This enables us to use the "same" compiler
@@ -83,20 +192,42 @@ build:windows --enable_runfiles
 # `#pragma once` when using symlinked virtual includes, `__atomic_*` functions,
 # a standards-compliant preprocessor, support for GNU statement expressions
 # used by some KJ macros, and understands the `.c++` extension by default.
-build:windows --compiler=clang-cl
+# As of bazel 7, incompatible_enable_cc_toolchain_resolution is enabled by default, so we need to
+# define a platform for the clang-cl build.
+build:windows --extra_toolchains=@local_config_cc//:cc-toolchain-x64_windows-clang-cl
+build:windows --extra_execution_platforms=//:x64_windows-clang-cl
 
-build:windows --cxxopt='/std:c++20' --host_cxxopt='/std:c++20' --verbose_failures
+# The Windows fastbuild bazel configuration is broken in that it necessarily generates PDB debug
+# information while the Linux and macOS toolchains only compile with debug information in the dbg
+# configuration or when requested with the -g flag. This causes huge increases in compile time and
+# disk/cache space usage – a single test may come with a 490MB PDB file.
+# In an optional configuration, use the opt configuration and manually disable optimizations as a
+# workaround.
+
+build:windows_no_dbg -c opt
+build:windows_no_dbg --copt='-O0' --host_copt='-O0'
+build:windows_no_dbg --copt='/Od' --host_copt='/Od'
+build:windows_no_dbg --copt='/INCREMENTAL:NO' --host_copt='/INCREMENTAL:NO'
+build:windows_no_dbg --features=-smaller_binary --features=-disable_assertions_feature
+
+# Mitigate the large size impact of Windows debug binaries somewhat by applying string merging and
+# linker garbage collection.
+build:windows_dbg --config=debug
+build:windows_dbg --copt='/Gy' --copt='/Gw' --copt='/GF'
+build:windows_dbg --linkopt='/OPT:REF'
+
+build:windows --cxxopt='/std:c++20' --host_cxxopt='/std:c++20'
 build:windows --cxxopt='/await' --host_cxxopt='/await'
-build:windows --cxxopt='/wo4503' --host_cxxopt='/wo4503'
-build:windows --cxxopt='/DWINDOWS_LEAN_AND_MEAN' --host_cxxopt='/DWINDOWS_LEAN_AND_MEAN'
-# The `/std:c++14` argument is unused during boringssl compilation and we don't
+build:windows --copt='/D_CRT_USE_BUILTIN_OFFSETOF' --host_copt='/D_CRT_USE_BUILTIN_OFFSETOF'
+build:windows --copt='/DWINDOWS_LEAN_AND_MEAN' --host_copt='/DWINDOWS_LEAN_AND_MEAN'
+# The `/std:c++20` argument is unused during boringssl compilation and we don't
 # want a warning when compiling each file.
-build:windows --cxxopt='-Wno-unused-command-line-argument' --host_cxxopt='-Wno-unused-command-line-argument'
-# This warning is triggered on much of V8's code base, causing the build output to be much bigger
-# than it should be.
-# V8's bazel does disable it for clang-based toolchains, but unfortunately the Windows setup is not
-# being detected as clang...
-# TODO(soon): Integrate this into V8 instead
-build:windows --cxxopt='-Wno-invalid-offsetof' --host_cxxopt='-Wno-invalid-offsetof'
+build:windows --copt='-Wno-unused-command-line-argument' --host_copt='-Wno-unused-command-line-argument'
 
-build:windows --@capnp-cpp//src/kj:openssl=True --@capnp-cpp//src/kj:zlib=True
+# MSVC disappointingly sets __cplusplus to 199711L by default. Defining /Zc:__cplusplus makes it
+# set the correct value. We currently don't check __cplusplus, but some dependencies do.
+build:windows --cxxopt='/Zc:__cplusplus' --host_cxxopt='/Zc:__cplusplus'
+
+# enable clang coverage: https://clang.llvm.org/docs/SourceBasedCodeCoverage.html
+build:clang-coverage --copt="-fprofile-instr-generate" --linkopt="-fprofile-instr-generate"
+build:clang-coverage --copt="-fcoverage-mapping" --linkopt="-fcoverage-mapping"

@@ -5,17 +5,18 @@
 #include "sockets.h"
 #include "system-streams.h"
 #include <workerd/io/worker-interface.h>
-#include "url-standard.h"
+#include <workerd/util/autogate.h>
 
+#include <workerd/jsg/url.h>
 
 namespace workerd::api {
 
 namespace {
 
+// This function performs some basic length and characters checks, it does not guarantee that
+// the specified host is a valid domain. It should only be used to reject malicious
+// hosts.
 bool isValidHost(kj::StringPtr host) {
-  // This function performs some basic length and characters checks, it does not guarantee that
-  // the specified host is a valid domain. It should only be used to reject malicious
-  // hosts.
   if (host.size() > 255 || host.size() == 0) {
     // RFC1035 states that maximum domain name length is 255 octets.
     //
@@ -42,8 +43,8 @@ bool isValidHost(kj::StringPtr host) {
   return true;
 }
 
-SecureTransportKind parseSecureTransport(SocketOptions* opts) {
-  auto value = KJ_UNWRAP_OR_RETURN(opts->secureTransport, SecureTransportKind::OFF).begin();
+SecureTransportKind parseSecureTransport(SocketOptions& opts) {
+  auto value = KJ_UNWRAP_OR_RETURN(opts.secureTransport, SecureTransportKind::OFF).begin();
   if (value == "off"_kj) {
     return SecureTransportKind::OFF;
   } else if (value == "starttls"_kj) {
@@ -57,20 +58,82 @@ SecureTransportKind parseSecureTransport(SocketOptions* opts) {
 }
 
 bool getAllowHalfOpen(jsg::Optional<SocketOptions>& opts) {
-  KJ_IF_MAYBE(o, opts) {
-    return o->allowHalfOpen;
+  KJ_IF_SOME(o, opts) {
+    return o.allowHalfOpen;
   }
 
   // The allowHalfOpen flag is false by default.
   return false;
 }
 
+} // namespace
+
 jsg::Ref<Socket> setupSocket(
     jsg::Lock& js, kj::Own<kj::AsyncIoStream> connection,
     jsg::Optional<SocketOptions> options, kj::Own<kj::TlsStarterCallback> tlsStarter,
-    bool isSecureSocket, kj::String domain) {
+    bool isSecureSocket, kj::String domain, bool isDefaultFetchPort) {
   auto& ioContext = IoContext::current();
-  auto connDisconnPromise = connection->whenWriteDisconnected();
+
+  // Disconnection handling is annoyingly complicated:
+  //
+  // We can't just context.awaitIo(connection->whenWriteDisconnected()) directly, because the
+  // Socket could be GC'd before `whenWriteDisconnected()` completes, causing the underlying
+  // `connection` to be destroyed. By KJ rules, we are required to cancel the promise returned by
+  // `whenWriteDisconnected()` before destroying `connection`. But there's no way to cancel a
+  // promise passed to `context.awaitIo()`. We have to hold the promise directly in `Socket`, so
+  // that we can cancel it on destruction. But we *do* want to create a JS promise that resolves
+  // on disconnect, which is what awaitIo() would give us.
+  //
+  // So, we have to chain through a promise/fulfiller pair. The `Socket` holds
+  // `watchForDisconnectTask`, which is a `kj::Promise<void>` representing a task that waits for
+  // `whenWriteDisconnected()` and then fulfills the fulfiller end of `disconnectedPaf` with
+  // `false`. If the task is canceled, we instead fulfill `disconnectedPaf` with `true`.
+  //
+  // We then use `context.awaitIo()` to await the promise end of `disconnectedPaf`, and this gives
+  // us our `closed` promise. Well, almost...
+  //
+  // There's another wrinkle: There are some circumstances where we want to resolve the `closed`
+  // promise directly from an API call. We'd rather this did not have to drop out of the isolate
+  // and enter it a gain. So, our `awaitIo()` actually awaits a task that listens for the
+  // disconnected promise and then resolves some other JS resolver, `closedResolver`.
+  auto disconnectedPaf = kj::newPromiseAndFulfiller<bool>();
+  auto& disconnectedFulfiller = *disconnectedPaf.fulfiller;
+  auto deferredCancelDisconnected = kj::defer(
+      [fulfiller=kj::mv(disconnectedPaf.fulfiller)]() mutable {
+    // In case the `whenWriteDisconected()` listener task is canceled without fulfilling the
+    // fulfiller, we want to silently fulfill it. This will happen when the Socket is GC'd.
+    fulfiller->fulfill(true);
+  });
+
+  static auto constexpr handleDisconnected =
+      [](kj::AsyncIoStream& connection, kj::PromiseFulfiller<bool>& fulfiller)
+          -> kj::Promise<void> {
+    try {
+      co_await connection.whenWriteDisconnected();
+      fulfiller.fulfill(false);
+    } catch (...) {
+      auto exception = kj::getCaughtExceptionAsKj();
+      fulfiller.reject(kj::mv(exception));
+    }
+  };
+
+  auto watchForDisconnectTask = handleDisconnected(*connection, disconnectedFulfiller)
+      .attach(kj::mv(deferredCancelDisconnected));
+
+  auto closedPrPair = js.newPromiseAndResolver<void>();
+  closedPrPair.promise.markAsHandled(js);
+
+  ioContext.awaitIo(js, kj::mv(disconnectedPaf.promise)).then(js,
+      [resolver = closedPrPair.resolver.addRef(js)](jsg::Lock& js, bool canceled) mutable {
+    // We want to silently ignore the canceled case, without ever resolving anything. Note that
+    // if the application actually fetches the `closed` promise, then the JSG glue will prevent
+    // the socket from being GC'd until that promise resolves, so it won't be canceled.
+    if (!canceled) {
+      resolver.resolve(js);
+    }
+  }, [resolver = closedPrPair.resolver.addRef(js)](jsg::Lock& js, jsg::Value exception) mutable {
+    resolver.reject(js, exception.getHandle(js));
+  });
 
   auto refcountedConnection = kj::refcountedWrapper(kj::mv(connection));
   // Initialise the readable/writable streams with the readable/writable sides of an AsyncIoStream.
@@ -81,48 +144,59 @@ jsg::Ref<Socket> setupSocket(
   if (!allowHalfOpen) {
     eofPromise = readable->onEof(js);
   }
-  auto writable = jsg::alloc<WritableStream>(ioContext, kj::mv(sysStreams.writable));
-
-  auto closeFulfiller = jsg::newPromiseAndResolver<void>(ioContext.getCurrentLock().getIsolate());
-  closeFulfiller.promise.markAsHandled();
+  auto openedPrPair = js.newPromiseAndResolver<SocketInfo>();
+  openedPrPair.promise.markAsHandled(js);
+  auto writable = jsg::alloc<WritableStream>(
+      ioContext, kj::mv(sysStreams.writable), kj::none, openedPrPair.promise.whenResolved(js));
 
   auto result = jsg::alloc<Socket>(
-      js,
+      js, ioContext,
       kj::mv(refcountedConnection),
       kj::mv(readable),
       kj::mv(writable),
-      kj::mv(closeFulfiller),
-      kj::mv(connDisconnPromise),
+      kj::mv(closedPrPair),
+      kj::mv(watchForDisconnectTask),
       kj::mv(options),
       kj::mv(tlsStarter),
       isSecureSocket,
-      kj::mv(domain));
-  KJ_IF_MAYBE(p, eofPromise) {
-    result->handleReadableEof(js, kj::mv(*p));
+      kj::mv(domain),
+      isDefaultFetchPort,
+      kj::mv(openedPrPair));
+
+  KJ_IF_SOME(p, eofPromise) {
+    result->handleReadableEof(js, kj::mv(p));
   }
   return result;
 }
 
-} // namespace
-
 jsg::Ref<Socket> connectImplNoOutputLock(
-    jsg::Lock& js, jsg::Ref<Fetcher> fetcher, AnySocketAddress address,
+    jsg::Lock& js, kj::Maybe<jsg::Ref<Fetcher>> fetcher, AnySocketAddress address,
     jsg::Optional<SocketOptions> options) {
+
+  auto& ioContext = IoContext::current();
+  JSG_REQUIRE(!ioContext.isFiddle(), TypeError, "Socket API not supported in web preview mode.");
 
   // Extract the domain/ip we are connecting to from the address.
   kj::String domain;
+  bool isDefaultFetchPort = false;
+
   KJ_SWITCH_ONEOF(address) {
     KJ_CASE_ONEOF(str, kj::String) {
       // We need just the hostname part of the address, i.e. we want to strip out the port.
       // We do this using the standard URL parser since it will handle IPv6 for us as well.
-      auto record = JSG_REQUIRE_NONNULL(url::URL::parse(jsg::usv(kj::str("https://", str))),
+      auto input = kj::str("fake://", str);
+      auto url = JSG_REQUIRE_NONNULL(jsg::Url::tryParse(input.asPtr()),
           TypeError, "Specified address could not be parsed.");
-      auto& host = JSG_REQUIRE_NONNULL(record.host, TypeError,
-          "Specified address is missing hostname.");
-      domain = host.toStr();
+      auto host = url.getHostname();
+      auto port = url.getPort();
+      JSG_REQUIRE(host != ""_kj, TypeError, "Specified address is missing hostname.");
+      JSG_REQUIRE(port != ""_kj, TypeError, "Specified address is missing port.");
+      isDefaultFetchPort = port == "443"_kj || port == "80"_kj;
+      domain = kj::str(host);
     }
     KJ_CASE_ONEOF(record, SocketAddress) {
       domain = kj::heapString(record.hostname);
+      isDefaultFetchPort = record.port == 443 || record.port == 80;
     }
   }
 
@@ -140,19 +214,29 @@ jsg::Ref<Socket> connectImplNoOutputLock(
   JSG_REQUIRE(isValidHost(addressStr), TypeError,
       "Specified address is empty string, contains unsupported characters or is too long.");
 
-  auto& ioContext = IoContext::current();
+  jsg::Ref<Fetcher> actualFetcher = nullptr;
+  KJ_IF_SOME(f, fetcher) {
+    actualFetcher = kj::mv(f);
+  } else {
+    // Support calling into arbitrary callbacks for any registered "magic" addresses for which
+    // custom connect() logic is needed. Note that these overrides should only apply to calls of the
+    // global connect() method, not for fetcher->connect(), hence why we check for them here.
+    KJ_IF_SOME(fn, ioContext.getCurrentLock().getWorker().getConnectOverride(addressStr)) {
+      return fn(js);
+    }
+    actualFetcher = jsg::alloc<Fetcher>(
+        IoContext::NULL_CLIENT_CHANNEL, Fetcher::RequiresHostAndProtocol::YES);
+  }
 
-  JSG_REQUIRE(!ioContext.isFiddle(), TypeError, "Socket API not supported in web preview mode.");
-
-  auto jsRequest = Request::constructor(js, kj::str(addressStr), nullptr);
-  kj::Own<WorkerInterface> client = fetcher->getClient(
-      ioContext, jsRequest->serializeCfBlobJson(js), "connect"_kj);
+  auto jsRequest = Request::constructor(js, kj::str(addressStr), kj::none);
+  kj::Own<WorkerInterface> client = actualFetcher->getClient(
+      ioContext, jsRequest->serializeCfBlobJson(js), "connect"_kjc);
 
   // Set up the connection.
   auto headers = kj::heap<kj::HttpHeaders>(ioContext.getHeaderTable());
   auto httpClient = asHttpClient(kj::mv(client));
   kj::HttpConnectSettings httpConnectSettings = { .useTls = false };
-  KJ_IF_MAYBE(opts, options) {
+  KJ_IF_SOME(opts, options) {
     httpConnectSettings.useTls =
         parseSecureTransport(opts) == SecureTransportKind::ON;
   }
@@ -163,7 +247,7 @@ jsg::Ref<Socket> connectImplNoOutputLock(
 
   auto result = setupSocket(
       js, kj::mv(request.connection), kj::mv(options), kj::mv(tlsStarter),
-      httpConnectSettings.useTls, kj::mv(domain));
+      httpConnectSettings.useTls, kj::mv(domain), isDefaultFetchPort);
   // `handleProxyStatus` needs an initialised refcount to use `JSG_THIS`, hence it cannot be
   // called in Socket's constructor. Also it's only necessary when creating a Socket as a result of
   // a `connect`.
@@ -173,29 +257,43 @@ jsg::Ref<Socket> connectImplNoOutputLock(
 
 jsg::Ref<Socket> connectImpl(
     jsg::Lock& js, kj::Maybe<jsg::Ref<Fetcher>> fetcher, AnySocketAddress address,
-    jsg::Optional<SocketOptions> options,
-    CompatibilityFlags::Reader featureFlags) {
-  jsg::Ref<Fetcher> actualFetcher = nullptr;
-  KJ_IF_MAYBE(f, fetcher) {
-    actualFetcher = kj::mv(*f);
-  } else {
-    actualFetcher = jsg::alloc<Fetcher>(
-        IoContext::NULL_CLIENT_CHANNEL, Fetcher::RequiresHostAndProtocol::YES);
-  }
-  return connectImplNoOutputLock(js, kj::mv(actualFetcher), kj::mv(address), kj::mv(options));
+    jsg::Optional<SocketOptions> options) {
+  // TODO(soon): Doesn't this need to check for the presence of an output lock, and if it finds one
+  // then wait on it, before calling into connectImplNoOutputLock?
+  return connectImplNoOutputLock(js, kj::mv(fetcher), kj::mv(address), kj::mv(options));
 }
 
 jsg::Promise<void> Socket::close(jsg::Lock& js) {
-  // Forcibly close the readable/writable streams.
-  auto cancelPromise = readable->getController().cancel(js, nullptr);
-  auto abortPromise = writable->getController().abort(js, nullptr);
-  // The below is effectively `Promise.all(cancelPromise, abortPromise)`
-  return cancelPromise.then(js, [abortPromise = kj::mv(abortPromise), this](jsg::Lock& js) mutable {
-    return abortPromise.then(js, [this](jsg::Lock& js) {
-      resolveFulfiller(js, nullptr);
+  if (isClosing) {
+    return closedPromiseCopy.whenResolved(js);
+  }
+
+  isClosing = true;
+  writable->getController().setPendingClosure();
+  readable->getController().setPendingClosure();
+
+  // Wait until the socket connects (successfully or otherwise)
+  return openedPromiseCopy.whenResolved(js).then(js, [this](jsg::Lock& js) {
+    if (!writable->getController().isClosedOrClosing()) {
+      return writable->getController().flush(js);
+    } else {
       return js.resolvedPromise();
+    }
+  }).then(js, [this](jsg::Lock& js) {
+    // Forcibly abort the readable/writable streams.
+    auto cancelPromise = readable->getController().cancel(js, kj::none);
+    auto abortPromise = writable->getController().abort(js, kj::none);
+    // The below is effectively `Promise.all(cancelPromise, abortPromise)`
+    return cancelPromise.then(js,
+        [abortPromise = kj::mv(abortPromise)](jsg::Lock& js) mutable {
+      return kj::mv(abortPromise);
     });
-  }, [this](jsg::Lock& js, jsg::Value err) { return errorHandler(js, kj::mv(err)); });
+  }).then(js, [this](jsg::Lock& js) {
+    resolveFulfiller(js, kj::none);
+    return js.resolvedPromise();
+  }).catch_(js, [this](jsg::Lock& js, jsg::Value err) {
+    errorHandler(js, kj::mv(err));
+  });
 }
 
 jsg::Ref<Socket> Socket::startTls(jsg::Lock& js, jsg::Optional<TlsOptions> tlsOptions) {
@@ -204,7 +302,7 @@ jsg::Ref<Socket> Socket::startTls(jsg::Lock& js, jsg::Optional<TlsOptions> tlsOp
   JSG_REQUIRE(domain != nullptr, TypeError, "startTls can only be called once.");
   auto invalidOptKindMsg =
       "The `secureTransport` socket option must be set to 'starttls' for startTls to be used.";
-  KJ_IF_MAYBE(opts, options) {
+  KJ_IF_SOME(opts, options) {
     JSG_REQUIRE(parseSecureTransport(opts) == SecureTransportKind::STARTTLS,
         TypeError, invalidOptKindMsg);
   } else {
@@ -218,17 +316,17 @@ jsg::Ref<Socket> Socket::startTls(jsg::Lock& js, jsg::Optional<TlsOptions> tlsOp
   //
   // Detach the AsyncIoStream from the Writable/Readable streams and make them unusable.
   auto& context = IoContext::current();
-  auto secureStreamPromise = context.awaitJs(writable->flush(js).then(js,
+  auto secureStreamPromise = context.awaitJs(js, writable->flush(js).then(js,
       [this, domain = kj::heapString(domain), tlsOptions = kj::mv(tlsOptions),
       tlsStarter = kj::mv(tlsStarter)](jsg::Lock& js) mutable {
     writable->removeSink(js);
     readable = readable->detach(js, true);
-    closeFulfiller.resolver.resolve();
+    closedResolver.resolve(js);
 
     auto acceptedHostname = domain.asPtr();
-    KJ_IF_MAYBE(s, tlsOptions) {
-      KJ_IF_MAYBE(expectedHost, s->expectedServerHostname) {
-        acceptedHostname = *expectedHost;
+    KJ_IF_SOME(s, tlsOptions) {
+      KJ_IF_SOME(expectedHost, s.expectedServerHostname) {
+        acceptedHostname = expectedHost;
       }
     }
 
@@ -244,25 +342,63 @@ jsg::Ref<Socket> Socket::startTls(jsg::Lock& js, jsg::Optional<TlsOptions> tlsOp
   // to `setupSocket`.
   auto newTlsStarter = kj::heap<kj::TlsStarterCallback>();
   return setupSocket(js, kj::newPromisedStream(kj::mv(secureStreamPromise)), kj::mv(options),
-      kj::mv(newTlsStarter), true, kj::mv(domain));
+      kj::mv(newTlsStarter), true, kj::mv(domain), isDefaultFetchPort);
 }
 
 void Socket::handleProxyStatus(
     jsg::Lock& js, kj::Promise<kj::HttpClient::ConnectRequest::Status> status) {
   auto& context = IoContext::current();
-  auto result = context.awaitIo(js, kj::mv(status),
+  auto result = context.awaitIo(js,
+      status.catch_([](kj::Exception&& e) {
+        LOG_ERROR_PERIODICALLY("Socket proxy disconnected abruptly", e);
+        return kj::HttpClient::ConnectRequest::Status(500, nullptr, kj::Own<kj::HttpHeaders>());
+      }),
       [this, self = JSG_THIS](jsg::Lock& js, kj::HttpClient::ConnectRequest::Status&& status) -> void {
     if (status.statusCode < 200 || status.statusCode >= 300) {
       // If the status indicates an unsucessful connection we need to reject the `closeFulfiller`
       // with an exception. This will reject the socket's `closed` promise.
-      auto exc = kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
-        kj::str(JSG_EXCEPTION(Error) ": proxy request failed"));
-      resolveFulfiller(js, exc);
-      readable->getController().cancel(js, nullptr).markAsHandled();
-      writable->getController().abort(js, nullptr).markAsHandled();
+      auto msg = kj::str("proxy request failed, cannot connect to the specified address");
+      if (isDefaultFetchPort) {
+        msg = kj::str(msg, ". It looks like you might be trying to connect to a HTTP-based service",
+            " — consider using fetch instead");
+      }
+      handleProxyError(js, JSG_KJ_EXCEPTION(FAILED, Error, msg));
+    } else {
+      // TODO(later): implement local and remote address in proxy and read it here
+      openedResolver.resolve(js, SocketInfo{ kj::none, kj::none });
     }
   });
-  result.markAsHandled();
+  result.markAsHandled(js);
+}
+
+void Socket::handleProxyStatus(jsg::Lock& js, kj::Promise<kj::Maybe<kj::Exception>> connectResult) {
+  // It's kind of weird to take a promise that resolves to a Maybe<Exception> but we can't just use
+  // a Promise<void> and put our logic in the error handler because awaitIo doesn't provide the
+  // jsg::Lock for void promises or to errorFunc implementations, only non-void success callbacks,
+  // but we need the lock in our callback here.
+  // TODO(cleanup): Extend awaitIo to provide the jsg::Lock in more cases.
+  auto& context = IoContext::current();
+  auto result = context.awaitIo(js,
+      connectResult.catch_([](kj::Exception&& e) -> kj::Maybe<kj::Exception> {
+        LOG_ERROR_PERIODICALLY("Socket proxy disconnected abruptly", e);
+        return KJ_EXCEPTION(FAILED, "connectResult raised an error");
+      }),
+      [this, self = JSG_THIS](jsg::Lock& js, kj::Maybe<kj::Exception> result) -> void {
+    if (result != kj::none) {
+      handleProxyError(js, JSG_KJ_EXCEPTION(FAILED, Error, "connection attempt failed"));
+    } else {
+      // TODO(later): implement local and remote address in proxy and read it here
+      openedResolver.resolve(js, SocketInfo{ kj::none, kj::none });
+    }
+  });
+  result.markAsHandled(js);
+}
+
+void Socket::handleProxyError(jsg::Lock& js, kj::Exception e) {
+  resolveFulfiller(js, kj::cp(e));
+  openedResolver.reject(js, kj::mv(e));
+  readable->getController().cancel(js, kj::none).markAsHandled(js);
+  writable->getController().abort(js, js.error(e.getDescription())).markAsHandled(js);
 }
 
 void Socket::handleReadableEof(jsg::Lock& js, jsg::Promise<void> onEof) {
@@ -271,7 +407,7 @@ void Socket::handleReadableEof(jsg::Lock& js, jsg::Promise<void> onEof) {
   onEof.then(js,
       JSG_VISITABLE_LAMBDA((ref=JSG_THIS), (ref), (jsg::Lock& js) {
     return ref->maybeCloseWriteSide(js);
-  })).markAsHandled();
+  })).markAsHandled(js);
 }
 
 jsg::Promise<void> Socket::maybeCloseWriteSide(jsg::Lock& js) {
@@ -292,9 +428,9 @@ jsg::Promise<void> Socket::maybeCloseWriteSide(jsg::Lock& js) {
   // been flushed.
   return writable->getController().close(js).catch_(js,
       JSG_VISITABLE_LAMBDA((ref=JSG_THIS), (ref), (jsg::Lock& js, jsg::Value&& exc) {
-    ref->closeFulfiller.resolver.reject(js, exc.getHandle(js.v8Isolate));
+    ref->closedResolver.reject(js, exc.getHandle(js));
   })).then(js, JSG_VISITABLE_LAMBDA((ref=JSG_THIS), (ref), (jsg::Lock& js) {
-    ref->closeFulfiller.resolver.resolve();
+    ref->closedResolver.resolve(js);
   }));
 }
 

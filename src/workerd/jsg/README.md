@@ -45,7 +45,7 @@ public:
     // ...
   }
 
-  CFJS_RESOURCE_TYPE(Foo) {
+  JSG_RESOURCE_TYPE(Foo) {
     JSG_METHOD(foo);
   }
 };
@@ -76,20 +76,17 @@ At the time of writing this, the primitive value types currently supported by th
 | uint64_t             |  v8::BigInt    |     bigint      |                         |
 | kj::String(Ptr)      |  v8::String    |     string      |                         |
 | jsg::ByteString      |  v8::String    |     string      | See [ByteString][] spec |
-| jsg::UsvString(Ptr)  |  v8::String    |     string      | See [USVString][] spec  |
 | kj::Date             |  v8::Date      |     Date        |                         |
 | nullptr              |  v8::Null      |     null        | See kj::Maybe&lt;T>     |
 | nullptr              |  v8::Undefined |     undefined   | See jsg::Optional&lt;T> |
 
 Specifically, for example, when mapping from JavaScript into C++, when JSG encounters a
-string value, it can convert that into either a `kj::String`, `jsg::ByteString`,
-or a `jsg::UsvString`, depending on what is needed by the C++ layer. Likewise, when
-translating from C++ to JavaScript, JSG will generate a JavaScript `string` whenever it
-encounters a `kj::String`, `kj::StringPtr`, `jsg::ByteString`, `jsg::UsvString`, or
-`jsg::UsvStringPtr`.
+string value, it can convert that into either a `kj::String`, or `jsg::ByteString`,
+depending on what is needed by the C++ layer. Likewise, when translating from C++ to
+JavaScript, JSG will generate a JavaScript `string` whenever it encounters a `kj::String`,
+`kj::StringPtr`, or `jsg::ByteString`.
 
-JSG will *not* translate JavaScript `string` to `kj::StringPtr` or `jsg::UsvStringPtr`
-types.
+JSG will *not* translate JavaScript `string` to `kj::StringPtr`.
 
 In addition to these primitives, JSG provides a range of additional structured value
 types that serve a number of different purposes. We'll explain each individually.
@@ -120,8 +117,8 @@ Take careful note of the differences there: `kj::Maybe<kj::String>` allows `null
 `undefined`, `jsg::Optional<kj::String>` only allows `undefined`.
 
 At the C++ layer, `kj::Maybe<T>` and `jsg::Optional<T>` are semantically equivalent.
-Their value is one of either `nullptr` or type `T`. When a null `kj::Maybe<T>` is
-passed out to JavaScript, it is mapped to `null`. When a null `jsg::Optional<T>` is
+Their value is one of either `kj::none` or type `T`. When an empty `kj::Maybe<T>` is
+passed out to JavaScript, it is mapped to `null`. When an empty `jsg::Optional<T>` is
 passed out to JavaScript, it is mapped to `undefined`.
 
 This mapping, for instance, means that JavaScript `undefined` can be translated to
@@ -133,11 +130,11 @@ translating from a JavaScript value of `undefined` or `null`.
 
 | Type                                 | JavaScript Value | C++ value   |
 | ------------------------------------ | ---------------- | ----------- |
-| `kj::Maybe<kj::String>`              | `undefined`      | `nullptr`   |
-| `kj::Maybe<kj::String>`              | `null`           | `nullptr`   |
-| `jsg::Optional<kj::String>`          | `undefined`      | `nullptr`   |
+| `kj::Maybe<kj::String>`              | `undefined`      | `kj::none`  |
+| `kj::Maybe<kj::String>`              | `null`           | `kj::none`  |
+| `jsg::Optional<kj::String>`          | `undefined`      | `kj::none`  |
 | `jsg::Optional<kj::String>`          | `null`           | `{throws}`  |
-| `jsg::LenientOptional<kj::String>`*  | `null`           | `nullptr`   |
+| `jsg::LenientOptional<kj::String>`*  | `null`           | `kj::none`  |
 
 `*` `jsg::LenientOptional` is discussed a bit later.
 
@@ -153,16 +150,16 @@ TODO(soon): Open Question: What happens if you try `kj::OneOf<kj::Maybe<kj::Stri
 kj::Maybe<bool>>` and pass a `null`?
 
 TODO(soon): Open Question: What happens if you have a catch-all coercible like kj::String
-in the the list?
+in the list?
 
-### Array types ('kj::Array<T>` and `kj::ArrayPtr<T>`)
+### Array types (`kj::Array<T>` and `kj::ArrayPtr<T>`)
 
 The `kj::Array<T>` and `kj::ArrayPtr<T>` types map to JavaScript arrays. Here, `T` can
-be any value or resource type.
+be any value or resource type. The types `kj::Array<kj::byte>` and `kj::ArrayPtr<kj::byte>`
+are handled differently.
 
 ```cpp
-// jsg::Sequence is introduced below...
-void doSomething(jsg::Sequence<kj::String> strings) {
+void doSomething(kj::Array<kj::String> strings) {
   KJ_DBG(strings[0]);  // a
   KJ_DBG(strings[1]);  // b
   KJ_DBG(strings[2]);  // c
@@ -345,7 +342,7 @@ mappings for these structures.
 One choice is to map to and from a `kj::Array<kj::byte>`.
 
 When receiving a `kj::Array<kj::byte>` in C++ *from* a JavaScript `TypedArray` or `ArrayBuffer`,
-it is important to understand that the underlying data is not copied. Instead, the
+it is important to understand that the underlying data is not copied or transfered. Instead, the
 `kj::Array<kj::byte>` provides a *view* over the same underlying `v8::BackingStore` as the
 `TypedArray` or `ArrayBuffer`.
 
@@ -366,21 +363,46 @@ uses multi-byte values (e.g. a `Uint32Array` would still be mapped to `kj::Array
 the fact that each member entry is 4-bytes.)
 
 When a `kj::Array<kj::byte>` is passed back *out* to JavaScript, it is always mapped into a *new*
-`ArrayBuffer` instance over the same memory (no copy of the data is made but ownershop of the
+`ArrayBuffer` instance over the same memory (no copy of the data is made but ownership of the
 memory is transferred to the `std::shared_ptr<v8::BackingStore>` instance that underlies the
 `ArrayBuffer`).
+
+Note that this mapping behavior can get a bit hairy if a single backing store is passed back and
+forth across the JS/C++ boundary multiple times. Specifically, if we pass an `ArrayBuffer` from
+JS to C++, the `std::shared_ptr<v8::BackingStore>` holding the underlying data will be extracted
+and will be attached to a `kj::Array<kj::byte>` in C++. If that `kj::Array<kj::byte>` is passed
+back out to JavaScript, a *new* `std::shared_ptr<v8::BackingStore>` will be created that has a
+disposer that wraps and owns the `kj::Array<kj::byte>`. That `v8::BackingStore` will be attached
+to a *new* `ArrayBuffer` passed out to JavaScript. If that `ArrayBuffer` is passed *back* into
+C++, then the wrapping process will repeat.
+
+```
+  std::shared_ptr<v8::BackingStore>
+                |
+        kj::Array<kj::byte>
+                |
+  std::shared_ptr<v8::BackingStore>
+                |
+        kj::Array<kj::byte>
+                |
+               ...
+```
+
+While the structures all point at the same underlying memory allocation, we end up with multiple
+nested levels of `v8::BackingStore` and `kj::Array<kj::byte>` instances.
 
 For many cases, this mapping behavior is just fine, but some APIs (such as Streams) require a
 more nuanced type of mapping. For those cases, we provide `jsg::BufferSource`.
 
 A `jsg::BufferSource` wraps the v8 handle of a given `TypedArray` or `ArrayBuffer` and remembers
-it's type. When the `jsg::BufferSource` is passed back out to JavaScript, it will map to exactly
+its type. When the `jsg::BufferSource` is passed back out to JavaScript, it will map to exactly
 the same kind of object that was passed in (e.g. `Uint16Array` passed to `jsg::BufferSource` will
-produce a `Uint16Array` when passed back out to JavaScript.)
+produce a `Uint16Array` when passed back out to JavaScript.) The same
+`std::shared_ptr<v8::BackingStore>` will be maintained across the JS/C++ boundary.
 
 The `jsg::BufferSource` also supports the ability to "detach" the backing store. What this does
 is separate the `v8::BackingStore` from the original `TypedArray`/`BufferSource` such that the
-original can no longer be used to read or mutate the data. This is important is cases where ownership
+original can no longer be used to read or mutate the data. This is important in cases where ownership
 of the data storage must transfer and cannot be shared.
 
 ### Functions (`jsg::Function<Ret(Args...)>`)
@@ -396,13 +418,13 @@ There are generally three ways of using `jsg::Function`:
 
 For the first item, imagine the following case:
 
-We have a C++ function that takes a callback argument. The callback argument takes a single `int`
+We have a C++ function that takes a callback argument. The callback argument takes an `int`
 as an argument (Ignore the `jsg::Lock& js` part for now, we'll explain that in a bit). As soon
 as we get the callback, we invoke it as a function.
 
 ```cpp
 void doSomething(jsg::Lock& js, jsg::Function<void(int)> callback) {
-  callback(1);
+  callback(js, 1);
 }
 ```
 
@@ -426,12 +448,6 @@ jsg::Function<void(int)> getFunction() {
 const func = getFunction();
 func(1);  // prints 1
 ```
-
-For the third case, because it is possible to create a `jsg::Function` from either a JS function
-or a C++ lambda, the `jsg::Function` can be used in APIs that might be called from either or
-both JS or C++.
-
-TODO(soon): Add an example here?
 
 ### Promises (`jsg::Promise<T>`)
 
@@ -467,7 +483,7 @@ jsg::Name doSomething(jsg::Name name) {
 
 ### Reference types (`jsg::V8Ref<T>`, `jsg::Value`, `jsg::Ref<T>`)
 
-#### `jsg::V8Ref<T>` (and `jsg::Value`, and `cjfs::HashableV8Ref<T>`)
+#### `jsg::V8Ref<T>` (and `jsg::Value`, and `jsg::HashableV8Ref<T>`)
 
 The `jsg::V8Ref<T>` type holds a persistent reference to a JavaScript type. The `T` must
 be one of the `v8` types (e.g. `v8::Object`, `v8::Function`, etc). A `jsg::V8Ref<T>` is used
@@ -493,9 +509,9 @@ jsg::V8Ref<v8::Boolean> boolRef2 = boolRef1.addRef(js);
 
 KJ_DBG(boolRef1 == boolRef2);  // prints "true"
 
-// Getting the v8::Local<T> from the V8Ref requires a v8::HandleScope.
-v8::HandleScope scope(js.v8Isolate);
-v8::Local<v8::Boolean> boolLocal = boolRef1.getHandle(js);
+// Getting the v8::Local<T> from the V8Ref requires a v8::HandleScope to be
+// on the stack. We provide a convenience method on jsg::Lock to ensure that:
+v8::Local<v8::Boolean> boolLocal = js.withinHandleScope([&] { return boolRef1.getHandle(js); });
 ```
 
 The `jsg::HashableV8Ref<T>` type is a subclass of `jsg::V8Ref<T>` that also implements
@@ -524,10 +540,11 @@ jsg::Ref<Foo> foo = jsg::alloc<Foo>();
 
 jsg::Ref<Foo> foo2 = foo.addRef();
 
-v8::HandleScope scope(js.v8Isolate);
-KJ_IF_MAYBE(handle, foo.tryGetHandle(js.v8Isolate)) {
-  // If handle is non-null, it is the Foo instance's JavaScript wrapper.
-}
+js.withinHandleScope([&] {
+  KJ_IF_SOME(handle, foo.tryGetHandle(js.v8Isolate)) {
+    // handle is the Foo instance's JavaScript wrapper.
+  }
+});
 ```
 
 ### Memoized and Identified types
@@ -626,8 +643,8 @@ included in the JavaScript object.)
 ```cpp
 Foo someFunction(Foo foo) {
   KJ_DBG(foo.abc);  // a
-  KJ_IF_MAYBE(xyz, foo.xyz) {
-    KJ_DBG(*xyz);  // true
+  KJ_IF_SOME(xyz, foo.xyz) {
+    KJ_DBG(xyz);  // true
   }
   KJ_DBG(val); // [object Object]
   KJ_DBG(onlyInternal); 1
@@ -721,12 +738,40 @@ everything to work. The `jsg::Object` class must be publicly inherited but it do
 any additional methods or properties that need to be directly used (it does add some but those
 are intended to be used via other JSG APIs).
 
+```cpp
+class Foo: public jsg::Object {
+public:
+  Foo(int value): value(value) {}
+
+  JSG_RESOURCE_TYPE(Foo) {}
+
+private:
+  int value;
+};
+```
+
 ### Constructors
 
 For a Resource Type to be constructible from JavaScript, it must have a static method named
 `constructor()` that returns a `jsg::Ref<T>` where `T` is the Resource Type. If this static
 method is not provided, attempts to create new instances using `new ...` will fail with an
 error.
+
+```cpp
+class Foo: public jsg::Object {
+public:
+  Foo(int value): value(value) {}
+
+  static jsg::Ref<Foo> constructor(jsg::Lock& js, int value) {
+    return jsg::alloc<Foo>(value);
+  }
+
+  JSG_RESOURCE_TYPE(Foo) {}
+
+private:
+  int value;
+};
+```
 
 ### `JSG_RESOURCE_TYPE(T)`
 
@@ -1166,7 +1211,7 @@ For all of the JSG type system to function, we need to declare the types that we
 Without diving into all of the internal details that make it happen, for now we'll focus on just
 the top level requirements.
 
-Somewhere in your application (e.g. see sserve/sserve-api.c++) you must include an instance of
+Somewhere in your application (e.g. see server/workerd-api.c++) you must include an instance of
 the `JSG_DECLARE_ISOLATE_TYPE` macro. This macro sets up the base isolate types and helpers that
 implement the entire type system.
 
@@ -1249,7 +1294,7 @@ object A referencing object B which references object A...).
 
 Because ref types are strong references, any ref type that is not explicitly visited will not be
 eligible for garbage collection, so failure to implement proper visitation may lead to memory leaks.
-As as best practice, it is recommended that you implement `visitForGc()` on all types that contain
+As a best practice, it is recommended that you implement `visitForGc()` on all types that contain
 refs, regardless of whether or not you are concerned about reference cycles.
 
 For `jsg::Ref<T>`, garbage collection only applies to the JavaScript wrapper around the C++ object.
@@ -1309,7 +1354,6 @@ TODO(soon): TBD
 [ByteString]: https://webidl.spec.whatwg.org/#idl-ByteString
 [Record]: https://webidl.spec.whatwg.org/#idl-record
 [Sequence]: https://webidl.spec.whatwg.org/#idl-sequence
-[USVString]: https://webidl.spec.whatwg.org/#idl-USVString
 
 ## TypeScript
 
@@ -1550,3 +1594,99 @@ KJ_DEFER(key->reset());
 // with the scope exits.
 ```
 
+## `jsg::MemoryTracker` and heap snapshot detail collection
+
+The `jsg::MemoryTracker` is used to integrate with v8's `BuildEmbedderGraph` API.
+It constructs the graph of embedder objects to be included in a generated
+heap snapshot.
+
+The API is implemented using a visitor pattern. V8 calls the `BuilderEmbedderGraph`
+callback (set in `setup.h`) which in turn begins walking through the known embedder
+objects collecting the necessary information include in the heap snapshot.
+Generally this information consists only of the names of fields, and the sizes of
+any memory-retaining values represented by the fields (e.g. heap allocations).
+
+To instrument a struct or class so that it can be included in the graph, the
+type must implement *at least* the following three methods:
+
+ * `kj::StringPtr jsgGetMemoryName() const;`
+ * `size_t jsgGetMemorySelfSize() const;`
+ * `void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const;`
+
+The `jsgGetMemoryName()` method returns the name that will be used to identify
+the type in the graph. This will be prefixed with `workerd / ` in the actual
+generated snapshot. For instance, if this method returns `"Foo"_kjc`, the heap
+snapshot will contain `"workerd / Foo"`.
+
+The `jsgGetMemorySelfSize()` method returns the *shallow* size of the type.
+This would typically be implemented using `sizeof(Type)`, and in the vast
+majority of cases that's all it does. It is provided as a method, however,
+in order to allow a type the ability to customize the size calculation.
+
+The `jsgGetMemoryInfo(...)` method is the method that is actually called to
+collect details for the graph. Note that this method is NOT expected to be called
+within the scope of an `IoContext`. It *will* be called while within the isolate
+lock, however.
+
+Types may also implement the following additional methods to further customize
+how they are represented in the graph:
+
+ * `v8::Local<v8::Object> jsgGetMemoryInfoWrapperObject();`
+ * `MemoryInfoDetachedState jsgGetMemoryInfoDetachedState() const;`
+ * `bool jsgGetMemoryInfoIsRootNode() const;`
+
+Note that the `jsgGetMemoryInfoWrapperObject()` method is called from within
+a `v8::HandleScope`.
+
+For extremely simple cases, the `JSG_MEMORY_INFO` macro can be used to simplify
+implementing these methods. It is a shortcut that provides basic implementations
+of the `jsgGetMemoryName()` and `jsgGetMemorySelfSize()` methods:
+
+```cpp
+JSG_MEMORY_INFO(Foo) {
+  tracker.trackField("bar", bar);
+}
+```
+
+... is equivalent to:
+
+```cpp
+  kj::StringPtr jsgGetMemoryName() const { return "Foo"_kjc; }
+
+  size_t jsgGetMemorySelfSize() const { return sizeof(Foo); }
+
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("bar", bar);
+  }
+```
+
+All `jsg::Object` instances provide a basic implementation of these methods.
+Within a `jsg::Object`, your only responsibility would be to implement the
+helper `visitForMemoryInfo(jsg::MemoryTracker& tracker) const` method only
+if the type has additional fields that need to be tracked. This works a
+lot like the `visitForGc(...)` method used for gc tracing:
+
+```cpp
+class Foo : public jsg::Object {
+public:
+  JSG_RESOURCE_TYPE(Foo) {}
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("bar", bar);
+  }
+  // ...
+};
+```
+
+The constructed graph should include any fields that materially contribute
+the retained memory of the type. This graph is primarily used for analysis
+and investigation of memory issues in an application (e.g. hunting down
+memory leaks, detecting bugs, optimizing memory usage, etc) so the information
+should include details that are most useful for those purposes.
+This code is only ever called when a heap snapshot is being generated so
+typically it should have very little cost. Heap snapshots are generally
+fairly expensive to create, however, so care should be taken not to make
+things too complicated. Ideally, none of the implementation methods in a
+type should allocate. There is some allocation occuring internally while
+building the graph, of course, but the methods for visitation (in particular
+the `jsgGetMemoryInfo(...)` method) should not perform any allocations if it
+can be avoided.

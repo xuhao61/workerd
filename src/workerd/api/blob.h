@@ -5,11 +5,13 @@
 #pragma once
 
 #include <workerd/jsg/jsg.h>
-#include "streams.h"
-#include "util.h"
+#include <workerd/io/compatibility-date.capnp.h>
 
 namespace workerd::api {
 
+class ReadableStream;
+
+// An implementation of the Web Platform Standard Blob API
 class Blob: public jsg::Object {
 public:
   Blob(kj::Array<byte> data, kj::String type)
@@ -33,15 +35,15 @@ public:
 
   static jsg::Ref<Blob> constructor(jsg::Optional<Bits> bits, jsg::Optional<Options> options);
 
-  int getSize() { return data.size(); }
-  kj::StringPtr getType() { return type; }
+  int getSize() const { return data.size(); }
+  kj::StringPtr getType() const { return type; }
 
   jsg::Ref<Blob> slice(jsg::Optional<int> start, jsg::Optional<int> end,
                         jsg::Optional<kj::String> type);
 
-  jsg::Promise<kj::Array<kj::byte>> arrayBuffer(v8::Isolate* isolate);
-  jsg::Promise<kj::String> text(v8::Isolate* isolate);
-  jsg::Ref<ReadableStream> stream(v8::Isolate* isolate);
+  jsg::Promise<kj::Array<kj::byte>> arrayBuffer(jsg::Lock& js);
+  jsg::Promise<kj::String> text(jsg::Lock& js);
+  jsg::Ref<ReadableStream> stream();
 
   JSG_RESOURCE_TYPE(Blob, CompatibilityFlags::Reader flags) {
     if (flags.getJsgPropertyOnPrototypeTemplate()) {
@@ -58,20 +60,33 @@ public:
     JSG_METHOD(stream);
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    KJ_SWITCH_ONEOF(ownData) {
+      KJ_CASE_ONEOF(data, kj::Array<byte>) {
+        tracker.trackField("ownData", data);
+      }
+      KJ_CASE_ONEOF(data, jsg::Ref<Blob>) {
+        tracker.trackField("ownData", data);
+      }
+    }
+    tracker.trackField("type", type);
+  }
+
 private:
   kj::OneOf<kj::Array<byte>, jsg::Ref<Blob>> ownData;
   kj::ArrayPtr<const byte> data;
   kj::String type;
 
   void visitForGc(jsg::GcVisitor& visitor) {
-    KJ_IF_MAYBE(b, ownData.tryGet<jsg::Ref<Blob>>()) {
-      visitor.visit(*b);
+    KJ_IF_SOME(b, ownData.tryGet<jsg::Ref<Blob>>()) {
+      visitor.visit(b);
     }
   }
 
   class BlobInputStream;
 };
 
+// An implementation of the Web Platform Standard File API
 class File: public Blob {
 public:
   File(kj::Array<byte> data, kj::String name, kj::String type, double lastModified)
@@ -101,6 +116,10 @@ public:
       JSG_READONLY_INSTANCE_PROPERTY(name, getName);
       JSG_READONLY_INSTANCE_PROPERTY(lastModified, getLastModified);
     }
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("name", name);
   }
 
 private:

@@ -95,7 +95,7 @@ void UnhandledRejectionHandler::rejectedWithNoHandler(
     jsg::Lock& js,
     jsg::V8Ref<v8::Promise> promise,
     jsg::V8Ref<v8::Value> value) {
-  auto message = v8::Exception::CreateMessage(js.v8Isolate, value.getHandle(js.v8Isolate));
+  auto message = v8::Exception::CreateMessage(js.v8Isolate, value.getHandle(js));
 
   // It's not yet clear under what conditions it happens, but this can be called
   // twice with the same promise. It really shouldn't happen in the regular cases
@@ -126,14 +126,14 @@ void UnhandledRejectionHandler::handledAfterRejection(
   // emit another warning indicating that it's been handled.
   KJ_DEFER(ensureProcessingWarnings(js));
 
-  uint hash = promise.getHandle(js)->GetIdentityHash();
+  HashedPromise key(promise.getHandle(js));
 
-  if (unhandledRejections.eraseMatch(hash)) {
+  if (unhandledRejections.eraseMatch(key)) {
     return;
   }
 
-  KJ_IF_MAYBE(item, warnedRejections.find(hash)) {
-    auto promise = getLocal(js.v8Isolate, item->promise);
+  KJ_IF_SOME(item, warnedRejections.find(key)) {
+    auto promise = getLocal(js.v8Isolate, item.promise);
     if (!promise.IsEmpty()) {
       // TODO(later): Chromium handles this differently... essentially when the
       // inspector log is created, chromium will revoke the log entry here instead
@@ -144,16 +144,16 @@ void UnhandledRejectionHandler::handledAfterRejection(
         js.logWarning(
             kj::str("A promise rejection was handled asynchronously. This warning "
                     "occurs when attaching a catch handler to a promise after it "
-                    "rejected. (rejection #", item->rejectionNumber, ")"));
+                    "rejected. (rejection #", item.rejectionNumber, ")"));
       }
 
-      AsyncContextFrame::Scope scope(js, tryGetFrame(item->asyncContextFrame));
+      AsyncContextFrame::Scope scope(js, tryGetFrame(item.asyncContextFrame));
 
       handler(js, v8::kPromiseHandlerAddedAfterReject,
               jsg::HashableV8Ref(js.v8Isolate, promise),
               js.v8Ref(js.v8Undefined()));
     }
-    warnedRejections.release(*item);
+    warnedRejections.release(item);
   }
 }
 
@@ -201,6 +201,11 @@ void UnhandledRejectionHandler::ensureProcessingWarnings(jsg::Lock& js) {
       });
     }
   });
+}
+
+void UnhandledRejectionHandler::UnhandledRejection::visitForMemoryInfo(
+    MemoryTracker& tracker) const {
+  tracker.trackField("asyncContextFrame", asyncContextFrame);
 }
 
 }  // namespace workerd::jsg

@@ -7,6 +7,7 @@
 #include "common.h"
 #include "queue.h"
 #include <workerd/jsg/function.h>
+#include <workerd/util/weak-refs.h>
 
 namespace workerd::api {
 
@@ -123,25 +124,11 @@ namespace workerd::api {
 class ReadableStreamJsController;
 class WritableStreamJsController;
 
-template <typename T>
-class WeakRef: public kj::Refcounted {
-  // Used to allow holding safe weak pointers to type T
-public:
-  WeakRef(T& ref) : ref(ref) {}
-  KJ_DISALLOW_COPY_AND_MOVE(WeakRef);
-  kj::Maybe<T&> tryGet() { return ref; }
-  kj::Own<WeakRef> addRef() { return kj::addRef(*this); }
-private:
-  void reset() { ref = nullptr; }
-  kj::Maybe<T&> ref;
-  friend T;
-};
-
 // =======================================================================================
+// The ReadableImpl provides implementation that is common to both the
+// ReadableStreamDefaultController and the ReadableByteStreamController.
 template <class Self>
 class ReadableImpl {
-  // The ReadableImpl provides implementation that is common to both the
-  // ReadableStreamDefaultController and the ReadableByteStreamController.
 public:
   using Consumer = typename Self::QueueType::Consumer;
   using Entry = typename Self::QueueType::Entry;
@@ -150,58 +137,57 @@ public:
   ReadableImpl(UnderlyingSource underlyingSource,
                StreamQueuingStrategy queuingStrategy);
 
-  void start(jsg::Lock& js, jsg::Ref<Self> self);
   // Invokes the start algorithm to initialize the underlying source.
+  void start(jsg::Lock& js, jsg::Ref<Self> self);
 
+  // If the readable is not already closed or errored, initiates a cancellation.
   jsg::Promise<void> cancel(jsg::Lock& js,
                              jsg::Ref<Self> self,
                              v8::Local<v8::Value> maybeReason);
-  // If the readable is not already closed or errored, initiates a cancelation.
 
-  bool canCloseOrEnqueue();
   // True if the readable is not closed, not errored, and close has not already been requested.
+  bool canCloseOrEnqueue();
 
-  void doCancel(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> reason);
   // Invokes the cancel algorithm to let the underlying source know that the
   // readable has been canceled.
+  void doCancel(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> reason);
 
-  void close(jsg::Lock& js);
   // Close the queue if we are in a state where we can be closed.
+  void close(jsg::Lock& js);
 
-  void enqueue(jsg::Lock& js, kj::Own<Entry> entry, jsg::Ref<Self> self);
   // Push a chunk of data into the queue.
+  void enqueue(jsg::Lock& js, kj::Own<Entry> entry, jsg::Ref<Self> self);
 
   void doClose(jsg::Lock& js);
 
-  void doError(jsg::Lock& js, jsg::Value reason);
   // If it isn't already errored or closed, errors the queue, causing all consumers to be errored
   // and detached.
+  void doError(jsg::Lock& js, jsg::Value reason);
 
-  kj::Maybe<int> getDesiredSize();
   // When a negative number is returned, indicates that we are above the highwatermark
   // and backpressure should be signaled.
+  kj::Maybe<int> getDesiredSize();
 
-  void pullIfNeeded(jsg::Lock& js, jsg::Ref<Self> self);
   // Invokes the pull algorithm only if we're in a state where the queue the
   // queue is below the watermark and we actually need data right now.
+  void pullIfNeeded(jsg::Lock& js, jsg::Ref<Self> self);
 
-  bool hasPendingReadRequests();
-  // True if any of the known consumers have pending reads waiting to be
-  // fulfilled. This is the case if a read is received that cannot be
-  // completely fulfilled by the current contents of the queue.
-
-  bool shouldCallPull();
   // True if the queue is current below the highwatermark.
+  bool shouldCallPull();
 
-  kj::Own<Consumer> getConsumer(kj::Maybe<StateListener&> listener);
   // The consumer can be used to read from this readables queue so long as the queue
   // is open. The consumer instance may outlive the readable but will be put into
   // a closed state or errored state when the readable is destroyed.
+  kj::Own<Consumer> getConsumer(kj::Maybe<StateListener&> listener);
 
-  size_t consumerCount();
   // The number of consumers that exist for this readable.
+  size_t consumerCount();
 
   void visitForGc(jsg::GcVisitor& visitor);
+
+  kj::StringPtr jsgGetMemoryName() const;
+  size_t jsgGetMemorySelfSize() const;
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const;
 
 private:
   struct Algorithms {
@@ -220,10 +206,10 @@ private:
     Algorithms& operator=(Algorithms&& other) = default;
 
     void clear() {
-      start = nullptr;
-      pull = nullptr;
-      cancel = nullptr;
-      size = nullptr;
+      start = kj::none;
+      pull = kj::none;
+      cancel = kj::none;
+      size = kj::none;
     }
 
     void visitForGc(jsg::GcVisitor& visitor) {
@@ -246,18 +232,22 @@ private:
   struct PendingCancel {
     kj::Maybe<jsg::Promise<void>::Resolver> fulfiller;
     jsg::Promise<void> promise;
+    JSG_MEMORY_INFO(PendingCancel) {
+      tracker.trackField("fulfiller", fulfiller);
+      tracker.trackField("promise", promise);
+    }
   };
   kj::Maybe<PendingCancel> maybePendingCancel;
 
   friend Self;
 };
 
+// Utility that provides the core implementation of WritableStreamJsController,
+// separated out for consistency with ReadableStreamJsController/ReadableImpl and
+// to enable it to be more easily reused should new kinds of WritableStream
+// controllers be introduced.
 template <class Self>
 class WritableImpl {
-  // Utility that provides the core implementation of WritableStreamJsController,
-  // separated out for consistency with ReadableStreamJsController/ReadableImpl and
-  // to enable it to be more easily reused should new kinds of WritableStream
-  // controllers be introduced.
 public:
   using PendingAbort = WritableStreamController::PendingAbort;
 
@@ -268,6 +258,11 @@ public:
 
     void visitForGc(jsg::GcVisitor& visitor) {
       visitor.visit(resolver, value);
+    }
+
+    JSG_MEMORY_INFO(WriteRequest) {
+      tracker.trackField("resolver", resolver);
+      tracker.trackField("value", value);
     }
   };
 
@@ -285,7 +280,7 @@ public:
 
   WriteRequest dequeueWriteRequest();
 
-  void doClose();
+  void doClose(jsg::Lock& js);
 
   void doError(jsg::Lock& js, v8::Local<v8::Value> reason);
 
@@ -296,12 +291,12 @@ public:
   void finishInFlightClose(
       jsg::Lock& js,
       jsg::Ref<Self> self,
-      kj::Maybe<v8::Local<v8::Value>> reason = nullptr);
+      kj::Maybe<v8::Local<v8::Value>> reason = kj::none);
 
   void finishInFlightWrite(
       jsg::Lock& js,
       jsg::Ref<Self> self,
-      kj::Maybe<v8::Local<v8::Value>> reason = nullptr);
+      kj::Maybe<v8::Local<v8::Value>> reason = kj::none);
 
   ssize_t getDesiredSize();
 
@@ -317,22 +312,28 @@ public:
       UnderlyingSink underlyingSink,
       StreamQueuingStrategy queuingStrategy);
 
-  void startErroring(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> reason);
   // Puts the writable into an erroring state. This allows any in flight write or
   // close to complete before actually transitioning the writable.
+  void startErroring(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> reason);
 
-  void updateBackpressure(jsg::Lock& js);
   // Notifies the Writer of the current backpressure state. If the amount of data queued
   // is equal to or above the highwatermark, then backpressure is applied.
+  void updateBackpressure(jsg::Lock& js);
 
-  jsg::Promise<void> write(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> value);
-  // Writes a chunk to the Writable, possibly queing the chunk in the internal buffer
+  // Writes a chunk to the Writable, possibly queueing the chunk in the internal buffer
   // if there are already other writes pending.
+  jsg::Promise<void> write(jsg::Lock& js, jsg::Ref<Self> self, v8::Local<v8::Value> value);
 
-  bool isWritable() const;
   // True if the writable is in a state where new chunks can be written
+  bool isWritable() const;
+
+  void cancelPendingWrites(jsg::Lock& js, jsg::JsValue reason);
 
   void visitForGc(jsg::GcVisitor& visitor);
+
+  kj::StringPtr jsgGetMemoryName() const;
+  size_t jsgGetMemorySelfSize() const;
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const;
 
 private:
 
@@ -347,10 +348,10 @@ private:
     Algorithms& operator=(Algorithms&& other) = default;
 
     void clear() {
-      abort = nullptr;
-      close = nullptr;
-      size = nullptr;
-      write = nullptr;
+      abort = kj::none;
+      close = kj::none;
+      size = kj::none;
+      write = kj::none;
     }
 
     void visitForGc(jsg::GcVisitor& visitor) {
@@ -385,10 +386,10 @@ private:
 
 // =======================================================================================
 
+// ReadableStreamDefaultController is a JavaScript object defined by the streams specification.
+// It is capable of streaming any JavaScript value through it, including typed arrays and
+// array buffers, but treats all values as opaque. BYOB reads are not supported.
 class ReadableStreamDefaultController: public jsg::Object {
-  // ReadableStreamDefaultController is a JavaScript object defined by the streams specification.
-  // It is capable of streaming any JavaScript value through it, including typed arrays and
-  // array buffers, but treats all values as opaque. BYOB reads are not supported.
 public:
   using QueueType = ValueQueue;
   using ReadableImpl = ReadableImpl<ReadableStreamDefaultController>;
@@ -407,7 +408,6 @@ public:
   bool canCloseOrEnqueue();
   bool hasBackpressure();
   kj::Maybe<int> getDesiredSize();
-  bool hasPendingReadRequests();
 
   void enqueue(jsg::Lock& js, jsg::Optional<v8::Local<v8::Value>> chunk);
 
@@ -431,6 +431,10 @@ public:
 
   kj::Own<WeakRef<ReadableStreamDefaultController>> getWeakRef();
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("impl", impl);
+  }
+
 private:
   kj::Maybe<IoContext&> ioContext;
   ReadableImpl impl;
@@ -439,20 +443,20 @@ private:
   void visitForGc(jsg::GcVisitor& visitor);
 };
 
+// The ReadableStreamBYOBRequest is provided by the ReadableByteStreamController
+// and is used by user code to fill a view provided by a BYOB read request.
+// Because we always support autoAllocateChunkSize in the ReadableByteStreamController,
+// there will always be a ReadableStreamBYOBRequest available when there is a pending
+// read.
+//
+// The ReadableStreamBYOBRequest is either in an attached or detached state.
+// The request is detached when invalidate() is called. Attempts to use the request
+// after it has been detached will fail.
+//
+// Note that the casing of the name (e.g. "BYOB" instead of the kj style "Byob") is
+// dictated by the streams specification since the class name is used as the exported
+// object name.
 class ReadableStreamBYOBRequest: public jsg::Object {
-  // The ReadableStreamBYOBRequest is provided by the ReadableByteStreamController
-  // and is used by user code to fill a view provided by a BYOB read request.
-  // Because we always support autoAllocateChunkSize in the ReadableByteStreamController,
-  // there will always be a ReadableStreamBYOBRequest available when there is a pending
-  // read.
-  //
-  // The ReadableStreamBYOBRequest is either in an attached or detached state.
-  // The request is detached when invalidate() is called. Attempts to use the request
-  // after it has been detached will fail.
-  //
-  // Note that the casing of the name (e.g. "BYOB" instead of the kj style "Byob") is
-  // dictated by the streams specification since the class name is used as the exported
-  // object name.
 public:
   ReadableStreamBYOBRequest(
       jsg::Lock& js,
@@ -461,10 +465,10 @@ public:
 
   KJ_DISALLOW_COPY_AND_MOVE(ReadableStreamBYOBRequest);
 
-  kj::Maybe<int> getAtLeast();
   // getAtLeast is a non-standard Workers-specific extension that specifies
   // the minimum number of bytes the stream should fill into the view. It is
   // added to support the readAtLeast extension on the ReadableStreamBYOBReader.
+  kj::Maybe<int> getAtLeast();
 
   kj::Maybe<jsg::V8Ref<v8::Uint8Array>> getView(jsg::Lock& js);
 
@@ -479,12 +483,14 @@ public:
     JSG_METHOD(respond);
     JSG_METHOD(respondWithNewView);
 
-    JSG_READONLY_INSTANCE_PROPERTY(atLeast, getAtLeast);
     // atLeast is an Workers-specific extension used to support the
     // readAtLeast API.
+    JSG_READONLY_INSTANCE_PROPERTY(atLeast, getAtLeast);
   }
 
   bool isPartiallyFulfilled();
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
 private:
   struct Impl {
@@ -505,10 +511,10 @@ private:
   void visitForGc(jsg::GcVisitor& visitor);
 };
 
+// ReadableByteStreamController is a JavaScript object defined by the streams specification.
+// It is capable of only streaming byte data through it in the form of typed arrays.
+// BYOB reads are supported.
 class ReadableByteStreamController: public jsg::Object {
-  // ReadableByteStreamController is a JavaScript object defined by the streams specification.
-  // It is capable of only streaming byte data through it in the form of typed arrays.
-  // BYOB reads are supported.
 public:
   using QueueType = ByteQueue;
   using ReadableImpl = ReadableImpl<ReadableByteStreamController>;
@@ -530,7 +536,6 @@ public:
   bool canCloseOrEnqueue();
   bool hasBackpressure();
   kj::Maybe<int> getDesiredSize();
-  bool hasPendingReadRequests();
 
   kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> getByobRequest(jsg::Lock& js);
 
@@ -547,6 +552,11 @@ public:
     JSG_METHOD(error);
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("impl", impl);
+    tracker.trackField("maybeByobRequest", maybeByobRequest);
+  }
+
 private:
   kj::Maybe<IoContext&> ioContext;
   ReadableImpl impl;
@@ -560,11 +570,11 @@ private:
 
 // =======================================================================================
 
+// The WritableStreamDefaultController is an object defined by the stream specification.
+// Writable streams are always value oriented. It is up the underlying sink implementation
+// to determine whether it is capable of handling whatever type of JavaScript object it
+// is given.
 class WritableStreamDefaultController: public jsg::Object {
-  // The WritableStreamDefaultController is an object defined by the stream specification.
-  // Writable streams are always value oriented. It is up the underlying sink implementation
-  // to determine whether it is capable of handling whatever type of JavaScript object it
-  // is given.
 public:
   using WritableImpl = WritableImpl<WritableStreamDefaultController>;
 
@@ -596,6 +606,10 @@ public:
     JSG_METHOD(error);
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
+
+  void cancelPendingWrites(jsg::Lock& js, jsg::JsValue reason);
+
 private:
   kj::Maybe<IoContext&> ioContext;
   WritableImpl impl;
@@ -605,23 +619,23 @@ private:
 
 // =======================================================================================
 
+// The relationship between the TransformStreamDefaultController and the
+// readable/writable streams associated with it can be complicated.
+// Strong references to the TransformStreamDefaultController are held by
+// the *algorithms* passed into the readable and writable streams using
+// JSG_VISITABLE_LAMBDAs. When those algorithms are cleared, the strong
+// references holding the TransformStreamDefaultController are freed.
+// However, user code can do silly things like hold the Transform controller
+// long after both the readable and writable sides have been gc'd.
+//
+// We do not want to create a strong reference cycle between the various
+// controllers so we use weak refs within the transform controller to
+// safely reference the readable and writable sides. If either side goes
+// away cleanly (using the algorithms) the weak references are cleared.
+// If either side goes away due to garbage collection while the transform
+// controller is still alive, the weak references are cleared. The transform
+// controller then safely handles the disappearance of either side.
 class TransformStreamDefaultController: public jsg::Object {
-  // The relationship between the TransformStreamDefaultController and the
-  // readable/writable streams associated with it can be complicated.
-  // Strong references to the TransformStreamDefaultController are held by
-  // the *algorithms* passed into the readable and writable streams using
-  // JSG_VISITABLE_LAMBDAs. When those algorithms are cleared, the strong
-  // references holding the TransformStreamDefaultController are freed.
-  // However, user code can do silly things like hold the Transform controller
-  // long after both the readable and writable sides have been gc'd.
-  //
-  // We do not want to create a strong reference cycle between the various
-  // controllers so we use weak refs within the transform controller to
-  // safely reference the readable and writable sides. If either side goes
-  // away cleanly (using the algorithms) the weak references are cleared.
-  // If either side goes away due to garbage collection while the transform
-  // controller is still alive, the weak references are cleared. The transform
-  // controller then safely handles the disappearance of either side.
 public:
   TransformStreamDefaultController(jsg::Lock& js);
 
@@ -630,11 +644,11 @@ public:
             jsg::Ref<WritableStream>& writable,
             jsg::Optional<Transformer> maybeTransformer);
 
-  inline jsg::Promise<void> getStartPromise() {
-    // The startPromise is used by both the readable and writable sides in their respective
-    // start algorithms. The promise itself is resolved within the init function when the
-    // transformers own start algorithm completes.
-    return startPromise.promise.whenResolved();
+  // The startPromise is used by both the readable and writable sides in their respective
+  // start algorithms. The promise itself is resolved within the init function when the
+  // transformers own start algorithm completes.
+  inline jsg::Promise<void> getStartPromise(jsg::Lock& js) {
+    return startPromise.promise.whenResolved(js);
   }
 
   kj::Maybe<int> getDesiredSize();
@@ -662,6 +676,8 @@ public:
   jsg::Promise<void> pull(jsg::Lock& js);
   jsg::Promise<void> cancel(jsg::Lock& js, v8::Local<v8::Value> reason);
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
+
 private:
   struct Algorithms {
     kj::Maybe<jsg::Function<Transformer::TransformAlgorithm>> transform;
@@ -672,8 +688,8 @@ private:
     Algorithms& operator=(Algorithms&& other) = default;
 
     inline void clear() {
-      transform = nullptr;
-      flush = nullptr;
+      transform = kj::none;
+      flush = kj::none;
     }
 
     inline void visitForGc(jsg::GcVisitor& visitor) {

@@ -13,16 +13,16 @@ namespace {
 
 KJ_TEST("compatibility date parsing") {
   auto expectParseTo = [](kj::StringPtr input, kj::StringPtr expected) {
-    KJ_IF_MAYBE(actual, normalizeCompatDate(input)) {
-      KJ_EXPECT(*actual == expected);
+    KJ_IF_SOME(actual, normalizeCompatDate(input)) {
+      KJ_EXPECT(actual == expected);
     } else {
       KJ_FAIL_EXPECT("couldn't parse", input);
     }
   };
 
   auto expectNoParse = [](kj::StringPtr input) {
-    KJ_IF_MAYBE(actual, normalizeCompatDate(input)) {
-      KJ_FAIL_EXPECT("expected couldn't parse", input, *actual);
+    KJ_IF_SOME(actual, normalizeCompatDate(input)) {
+      KJ_FAIL_EXPECT("expected couldn't parse", input, actual);
     }
   };
 
@@ -79,17 +79,7 @@ KJ_TEST("compatibility flag parsing") {
     auto outputOrphan = orphanage.newOrphan<CompatibilityFlags>();
     auto output = outputOrphan.get();
 
-    struct ErrorReporterImpl: public Worker::ValidationErrorReporter {
-      void addError(kj::String error) override {
-        errors.add(kj::mv(error));
-      }
-      void addHandler(kj::Maybe<kj::StringPtr> exportName, kj::StringPtr type) override {
-        KJ_UNREACHABLE;
-      }
-
-      kj::Vector<kj::String> errors;
-    };
-    ErrorReporterImpl errorReporter;
+    SimpleWorkerErrorReporter errorReporter;
     compileCompatibilityFlags(compatDate, flagList.asReader(), output, errorReporter, experimental,
                               dateValidation);
 
@@ -117,7 +107,7 @@ KJ_TEST("compatibility flag parsing") {
   expectCompileCompatibilityFlags("2021-11-03", {"formdata_parser_converts_files_to_strings"},
       "(formDataParserSupportsFiles = false)");
 
-  // Test feature flag overrides.
+  // Test compatibility flag overrides.
   expectCompileCompatibilityFlags("2021-05-17", {"formdata_parser_supports_files"_kj},
       "(formDataParserSupportsFiles = true)");
   expectCompileCompatibilityFlags("2021-05-17", {"fetch_refuses_unknown_protocols"_kj},
@@ -135,7 +125,7 @@ KJ_TEST("compatibility flag parsing") {
   expectCompileCompatibilityFlags("2021-05-17",
       {"formdata_parser_supports_files"_kj, "formdata_parser_supports_files"_kj},
       "(formDataParserSupportsFiles = true)",
-      {"Feature flag specified multiple times: formdata_parser_supports_files"});
+      {"Compatibility flag specified multiple times: formdata_parser_supports_files"});
   expectCompileCompatibilityFlags("2021-05-17",
       {"formdata_parser_supports_files"_kj, "formdata_parser_converts_files_to_strings"_kj},
       "(formDataParserSupportsFiles = true)",
@@ -147,7 +137,7 @@ KJ_TEST("compatibility flag parsing") {
       {"The compatibility flag formdata_parser_supports_files became the default as of "
        "2021-11-03 so does not need to be specified anymore."});
   expectCompileCompatibilityFlags("2021-05-17", {"unknown_feature"_kj}, "()",
-      {"No such feature flag: unknown_feature"});
+      {"No such compatibility flag: unknown_feature"});
 
   expectCompileCompatibilityFlags("2252-04-01", {}, "()",
       {"Can't set compatibility date in the future: 2252-04-01"},
@@ -182,10 +172,10 @@ KJ_TEST("compatibility flag parsing") {
        "another_feature"_kj, "formdata_parser_supports_files"_kj},
       "(formDataParserSupportsFiles = true, fetchRefusesUnknownProtocols = true)",
       {"Invalid compatibility date: abcd",
-       "Feature flag specified multiple times: fetch_refuses_unknown_protocols",
-       "Feature flag specified multiple times: formdata_parser_supports_files",
-       "No such feature flag: another_feature",
-       "No such feature flag: unknown_feature"});
+       "Compatibility flag specified multiple times: fetch_refuses_unknown_protocols",
+       "Compatibility flag specified multiple times: formdata_parser_supports_files",
+       "No such compatibility flag: another_feature",
+       "No such compatibility flag: unknown_feature"});
 
   // Can explicitly disable flag that's enabled for all dates.s
   expectCompileCompatibilityFlags("2021-05-17", {"r2_internal_beta_bindings"}, "()", {},
@@ -210,17 +200,7 @@ KJ_TEST("encode to flag list for FL") {
     auto outputOrphan = orphanage.newOrphan<CompatibilityFlags>();
     auto output = outputOrphan.get();
 
-    struct ErrorReporterImpl: public Worker::ValidationErrorReporter {
-      void addError(kj::String error) override {
-        errors.add(kj::mv(error));
-      }
-      void addHandler(kj::Maybe<kj::StringPtr> exportName, kj::StringPtr type) override {
-        KJ_UNREACHABLE;
-      }
-
-      kj::Vector<kj::String> errors;
-    };
-    ErrorReporterImpl errorReporter;
+    SimpleWorkerErrorReporter errorReporter;
 
     compileCompatibilityFlags(compatDate, flagList.asReader(), output, errorReporter, experimental,
                               dateValidation);

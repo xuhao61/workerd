@@ -6,26 +6,26 @@
 // WebCrypto API
 
 #include <bit>
+#include <workerd/io/features.h>
+#include <workerd/jsg/buffersource.h>
 #include <workerd/jsg/jsg.h>
-#include <kj/async.h>
+#include <workerd/jsg/buffersource.h>
 #include <openssl/err.h>
 #include "streams.h"
-#include "util.h"
 
 namespace workerd::api {
 namespace node {
 class CryptoImpl;
 }
 namespace {
-class EdDsaKeyBase;
+class EdDsaKey;
 class EllipticKey;
 }
 
+// Subset of recognized key usage values.
+//
+// https://w3c.github.io/webcrypto/#dfn-RecognizedKeyUsage
 class CryptoKeyUsageSet {
-  // Subset of recognized key usage values.
-  //
-  // https://w3c.github.io/webcrypto/#dfn-RecognizedKeyUsage
-
 public:
   static constexpr CryptoKeyUsageSet encrypt()    { return 1 << 0; }
   static constexpr CryptoKeyUsageSet decrypt()    { return 1 << 1; }
@@ -63,25 +63,28 @@ public:
     return *this;
   }
 
-  inline bool operator<=(CryptoKeyUsageSet superset) const { return (superset & *this) == *this; }
   // True if and only if this is a subset of the given set.
+  inline bool operator<=(CryptoKeyUsageSet superset) const { return (superset & *this) == *this; }
 
   inline bool operator==(CryptoKeyUsageSet other) const { return set == other.set; }
 
   unsigned int size() const { return std::popcount(set); }
   bool isSingleton() const { return size() == 1; }
 
-  kj::StringPtr name() const;
   // The recognized name. This must be a singleton.
-  static CryptoKeyUsageSet byName(kj::StringPtr name);
+  kj::StringPtr name() const;
+
   // A singleton with the given name.
-  static kj::ArrayPtr<const CryptoKeyUsageSet> singletons();
+  static CryptoKeyUsageSet byName(kj::StringPtr name);
+
   // All singletons, in the order defined by the spec (encrypt, decrypt, sign, verify, ...).
+  static kj::ArrayPtr<const CryptoKeyUsageSet> singletons();
 
   enum class Context { generate, importSecret, importPublic, importPrivate };
+
+  // Parses a list of key usage strings. Throws if any are not recognized or not in mask.
   static CryptoKeyUsageSet validate(kj::StringPtr normalizedName, Context ctx,
       kj::ArrayPtr<const kj::String> actual, CryptoKeyUsageSet mask);
-  // Parses a list of key usage strings. Throws if any are not recognized or not in mask.
 
   template <typename Func>
   auto map(Func f) const -> kj::Array<decltype(f(*this))> {
@@ -100,11 +103,10 @@ private:
 // =======================================================================================
 // SubtleCrypto and CryptoKey
 
+// Represents keying material. Users get an object of this type by calling SubtleCrypto's
+// `importKey()`, `generateKey()`, or `deriveKey()` methods. The user can then use the object by
+// passing it as a parameter to other SubtleCrypto methods.
 class CryptoKey: public jsg::Object {
-  // Represents keying material. Users get an object of this type by calling SubtleCrypto's
-  // `importKey()`, `generateKey()`, or `deriveKey()` methods. The user can then use the object by
-  // passing it as a parameter to other SubtleCrypto methods.
-
 public:
   // KeyAlgorithm dictionaries
   //
@@ -123,71 +125,97 @@ public:
   struct KeyAlgorithm {
     kj::StringPtr name;
     JSG_STRUCT(name);
+    JSG_MEMORY_INFO(KeyAlgorithm) {}
   };
 
   struct AesKeyAlgorithm {
-    kj::StringPtr name;
     // "AES-CTR", "AES-GCM", "AES-CBC", "AES-KW"
+    kj::StringPtr name;
 
-    uint16_t length;
     // Length in bits of the key.
+    uint16_t length;
 
     JSG_STRUCT(name, length);
+
+    JSG_MEMORY_INFO(AesKeyAlgorithm) {}
   };
 
   struct HmacKeyAlgorithm {
-    kj::StringPtr name;
     // "HMAC"
+    kj::StringPtr name;
 
-    KeyAlgorithm hash;
     // The inner hash function to use.
+    KeyAlgorithm hash;
 
-    uint16_t length;
     // Length in bits of the key. The spec wants this to be an unsigned long, but whatever.
     // TODO(someday): Reexamine use of uint16_t in these algorithm structures.
     // We picked uint16_t to work around ambiguous bindings for uint32_t in
     // jsg::PrimitiveWrapper::wrap().  HMAC, at least, allows very long keys.
+    uint16_t length;
 
     JSG_STRUCT(name, hash, length);
+    JSG_MEMORY_INFO(HmacKeyAlgorithm) {}
   };
 
   using BigInteger = kj::Array<kj::byte>;
 
   struct RsaKeyAlgorithm {
-    kj::StringPtr name;
     // "RSASSA-PKCS1-v1_5", "RSA-PSS", "RSA-OAEP"
+    kj::StringPtr name;
 
-    uint16_t modulusLength;
     // The length, in bits, of the RSA modulus. The spec would have this be an unsigned long.
+    uint16_t modulusLength;
 
-    BigInteger publicExponent;
-    // The RSA public exponent (in unsigned big-endian form)
+     // The RSA public exponent (in unsigned big-endian form)
+    kj::OneOf<BigInteger, jsg::BufferSource> publicExponent;
 
-    jsg::Optional<KeyAlgorithm> hash;
     // The hash algorithm that is used with this key.
+    jsg::Optional<KeyAlgorithm> hash;
 
-    RsaKeyAlgorithm clone() const {
-      return { name, modulusLength, kj::heapArray(publicExponent.asPtr()), hash };
+    RsaKeyAlgorithm clone(jsg::Lock& js) const {
+      auto fixPublicExp = FeatureFlags::get(js).getCryptoPreservePublicExponent();
+      KJ_SWITCH_ONEOF(publicExponent) {
+        KJ_CASE_ONEOF(array, BigInteger) {
+          if (fixPublicExp) {
+            auto expCopy = kj::heapArray<kj::byte>(array.asPtr());
+            jsg::BackingStore expBack = jsg::BackingStore::from(kj::mv(expCopy));
+            return { name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash };
+          } else {
+            return { name, modulusLength, kj::heapArray(array.asPtr()), hash };
+          }
+        }
+        KJ_CASE_ONEOF(source, jsg::BufferSource) {
+          // Should only happen if the flag is enabled and an algorithm field is cloned twice.
+          KJ_ASSERT(fixPublicExp == true);
+          auto expCopy = kj::heapArray<kj::byte>(source.asArrayPtr());
+          jsg::BackingStore expBack = jsg::BackingStore::from(kj::mv(expCopy));
+          return { name, modulusLength, jsg::BufferSource(js, kj::mv(expBack)), hash };
+        }
+      }
+      KJ_UNREACHABLE;
     }
 
     JSG_STRUCT(name, modulusLength, publicExponent, hash);
+
+    JSG_MEMORY_INFO(RsaKeyAlgorithm) {}
   };
 
   struct EllipticKeyAlgorithm {
-    kj::StringPtr name;
     // "ECDSA" or "ECDH"
+    kj::StringPtr name;
 
-    kj::StringPtr namedCurve;
     // "P-256", "P-384", or "P-521"
+    kj::StringPtr namedCurve;
 
     JSG_STRUCT(name, namedCurve);
+
+    JSG_MEMORY_INFO(EllipticKeyAlgorithm) {}
   };
 
+  // Catch-all that can be used for extension algorithms. Combines fields of several known types.
   struct ArbitraryKeyAlgorithm {
-    // Catch-all that can be used for extension algorithms. Combines fields of several known types.
-    //
     // TODO(cleanup): Should we just replace AlgorithmVariant with this? Note we'd have to add
-    //   `pulicExponent` which is currently a problem because it makes the type non-copyable...
+    //   `publicExponent` which is currently a problem because it makes the type non-copyable...
     //   Alternatively, should we create some better way to abstract this?
 
     kj::StringPtr name;
@@ -198,15 +226,15 @@ public:
     JSG_STRUCT(name, hash, namedCurve, length);
   };
 
+  // Used as part of the Node.js crypto implementation of KeyObject.
+  // Defined here instead of api/node/crypto.h because it it is needed
+  // by CryptoKey::Impl to provide the actual implementation.
   struct AsymmetricKeyDetails {
-    // Used as part of the Node.js crypto implementation of KeyObject.
-    // Defined here instead of api/node/crypto.h because it it is needed
-    // by CryptoKey::Impl to provide the actual implementation.
     jsg::Optional<uint32_t> modulusLength;
     jsg::Optional<kj::Array<kj::byte>> publicExponent;
     jsg::Optional<kj::String> hashAlgorithm;
     jsg::Optional<kj::String> mgf1HashAlgorithm;
-    jsg::Optional<double> saltLength;
+    jsg::Optional<uint32_t> saltLength;
     jsg::Optional<uint32_t> divisorLength;
     jsg::Optional<kj::String> namedCurve;
     JSG_STRUCT(modulusLength,
@@ -221,8 +249,8 @@ public:
 
   ~CryptoKey() noexcept(false);
 
-  kj::StringPtr getAlgorithmName() const;
   // Returns the name of this CryptoKey's algorithm in a normalized, statically-allocated string.
+  kj::StringPtr getAlgorithmName() const;
 
   // JS API
 
@@ -230,7 +258,7 @@ public:
       KeyAlgorithm, AesKeyAlgorithm, HmacKeyAlgorithm, RsaKeyAlgorithm,
       EllipticKeyAlgorithm, ArbitraryKeyAlgorithm>;
 
-  AlgorithmVariant getAlgorithm() const;
+  AlgorithmVariant getAlgorithm(jsg::Lock& js) const;
   kj::StringPtr getType() const;
   bool getExtractable() const;
   kj::Array<kj::StringPtr> getUsages() const;
@@ -243,25 +271,27 @@ public:
     JSG_READONLY_INSTANCE_PROPERTY(usages, getUsages);
   }
 
-  class Impl;
   // HACK: Needs to be public so derived classes can inherit from it.
+  class Impl;
 
-  explicit CryptoKey(kj::Own<Impl> impl);
   // Treat as private -- needs to be public for jsg::alloc<T>()...
+  explicit CryptoKey(kj::Own<Impl> impl);
 
-  bool operator==(const CryptoKey& other) const;
   // Compare the contents of this key with the other. Will return false if
   // either key is not extractable or if the keys are a different type.
   // For secret keys, we will compare only the actual key material and not
   // the algorithm parameters or the algorithm name. We will also ensure
   // that a timing-safe comparison is used for the key material.
+  bool operator==(const CryptoKey& other) const;
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
 private:
   kj::Own<Impl> impl;
 
   friend class SubtleCrypto;
   friend class EllipticKey;
-  friend class EdDsaKeyBase;
+  friend class EdDsaKey;
   friend class node::CryptoImpl;
 };
 
@@ -282,125 +312,119 @@ public:
   // function is being called. We achieve polymorphism here by making all the fields except `name`
   // be `jsg::Optional`... ugly, but it works.
 
+  // Type of the `algorithm` parameter passed to `digest()`. Also used as the type of the `hash`
+  // parameter of many other algorithm structs.
   struct HashAlgorithm {
-    // Type of the `algorithm` parameter passed to `digest()`. Also used as the type of the `hash`
-    // parameter of many other algorithm structs.
-
     kj::String name;
 
     JSG_STRUCT(name);
   };
 
+  // Type of the `algorithm` parameter passed to `encrypt()` and `decrypt()`. Different
+  // algorithms call for different fields.
   struct EncryptAlgorithm {
-    // Type of the `algorithm` parameter passed to `encrypt()` and `decrypt()`. Different
-    // algorithms call for different fields.
-
-    kj::String name;
     // E.g. "AES-GCM"
+    kj::String name;
 
-    jsg::Optional<kj::Array<kj::byte>> iv;
     // For AES: The initialization vector use. May be up to 2^64-1 bytes long.
+    jsg::Optional<kj::Array<kj::byte>> iv;
 
-    jsg::Optional<kj::Array<kj::byte>> additionalData;
     // The additional authentication data to include.
+    jsg::Optional<kj::Array<kj::byte>> additionalData;
 
-    jsg::Optional<int> tagLength;
     // The desired length of the authentication tag. May be 0 - 128.
     // Note: the spec specifies this as a Web IDL byte (== signed char in C++), not an int, but JS
     //   has no such 8-bit integer animal.
+    jsg::Optional<int> tagLength;
 
-    jsg::Optional<kj::Array<kj::byte>> counter;
     // The initial value of the counter block for AES-CTR.
     // https://www.w3.org/TR/WebCryptoAPI/#aes-ctr-params
+    jsg::Optional<kj::Array<kj::byte>> counter;
 
-    jsg::Optional<int> length;
     // The length, in bits, of the rightmost part of the counter block that is incremented.
     // See above why we use int instead of int8_t.
     // https://www.w3.org/TR/WebCryptoAPI/#aes-ctr-params
+    jsg::Optional<int> length;
 
-    jsg::Optional<kj::Array<kj::byte>> label;
     // The optional label/application data to associate with the message (for RSA-OAEP)
+    jsg::Optional<kj::Array<kj::byte>> label;
 
     JSG_STRUCT(name, iv, additionalData, tagLength, counter, length, label);
   };
 
+  // Type of the `algorithm` parameter passed to `sign()` and `verify()`. Different
+  // algorithms call for diferent fields.
   struct SignAlgorithm {
-    // Type of the `algorithm` parameter passed to `sign()` and `verify()`. Different
-    // algorithms call for different fields.
-
-    kj::String name;
     // E.g. "RSASSA-PKCS1-v1_5", "ECDSA"
+    kj::String name;
 
-    jsg::Optional<kj::OneOf<kj::String, HashAlgorithm>> hash;
     // ECDSA wants the hash to be specified at call time rather than import
     // time.
+    jsg::Optional<kj::OneOf<kj::String, HashAlgorithm>> hash;
 
-    jsg::Optional<int> dataLength;
     // Not part of the WebCrypto spec. Used by an extension.
+    jsg::Optional<int> dataLength;
 
-     jsg::Optional<int> saltLength;
     // Used for RSA-PSS
+    jsg::Optional<int> saltLength;
 
     JSG_STRUCT(name, hash, dataLength, saltLength);
   };
 
+  // Type of the `algorithm` parameter passed to `generateKey()`. Different algorithms call for
+  // different fields.
   struct GenerateKeyAlgorithm {
-    // Type of the `algorithm` parameter passed to `generateKey()`. Different algorithms call for different
-    // fields.
-
-    kj::String name;
     // E.g. "HMAC", "RSASSA-PKCS1-v1_5", "ECDSA", ...
+    kj::String name;
 
-    jsg::Optional<kj::OneOf<kj::String, HashAlgorithm>> hash;
     // For signing algorithms where the hash is specified at import time, identifies the hash
     // function to use, e.g. "SHA-256".
+    jsg::Optional<kj::OneOf<kj::String, HashAlgorithm>> hash;
 
-    jsg::Optional<int> modulusLength;
     // For RSA algorithms: The length in bits of the RSA modulus.
+    jsg::Optional<int> modulusLength;
 
-    jsg::Optional<kj::Array<kj::byte>> publicExponent;
     // For RSA algorithms
+    jsg::Optional<kj::Array<kj::byte>> publicExponent;
 
-    jsg::Optional<int> length;
     // For AES algorithms or when name == "HMAC": The length in bits of the key.
+    jsg::Optional<int> length;
 
-    jsg::Optional<kj::String> namedCurve;
     // When name == "ECDSA": "P-256", "P-384", or "P-521"
+    jsg::Optional<kj::String> namedCurve;
 
     JSG_STRUCT(name, hash, modulusLength, publicExponent, length, namedCurve);
   };
 
+  // Type of the `algorithm` parameter passed to `importKey()`, as well as the
+  // `derivedKeyAlgorithm` parameter to `deriveKey()`. Different algorithms call for different
+  // fields.
   struct ImportKeyAlgorithm {
-    // Type of the `algorithm` parameter passed to `importKey()`, as well as the
-    // `derivedKeyAlgorithm` parameter to `deriveKey()`. Different algorithms call for different
-    // fields.
-
-    kj::String name;
     // E.g. "HMAC", "RSASSA-PKCS1-v1_5", "ECDSA", ...
+    kj::String name;
 
-    jsg::Optional<kj::OneOf<kj::String, HashAlgorithm>> hash;
     // For signing algorithms where the hash is specified at import time, identifies the hash
     // function to use, e.g. "SHA-256".
+    jsg::Optional<kj::OneOf<kj::String, HashAlgorithm>> hash;
 
-    jsg::Optional<int> length;
     // When name == "HMAC": The length in bits of the key.
+    jsg::Optional<int> length;
 
-    jsg::Optional<kj::String> namedCurve;
     // When name == "ECDSA": "P-256", "P-384", or "P-521"
+    jsg::Optional<kj::String> namedCurve;
 
-    jsg::Optional<bool> compressed;
     // Not part of the WebCrypto spec. Used by an extension to indicate that curve points are in
     // compressed format. (The standard algorithms do not recognize this option.)
+    jsg::Optional<bool> compressed;
 
     JSG_STRUCT(name, hash, length, namedCurve, compressed);
   };
 
+  // Type of the `algorithm` parameter passed to `deriveKey()`. Different algorithms call for
+  // different fields.
   struct DeriveKeyAlgorithm {
-    // Type of the `algorithm` parameter passed to `deriveKey()`. Different algorithms call for
-    // different fields.
-
-    kj::String name;
     // e.g. "PBKDF2", "ECDH", etc
+    kj::String name;
 
     // PBKDF2 parameters
     jsg::Optional<kj::Array<kj::byte>> salt;
@@ -411,15 +435,16 @@ public:
     jsg::Optional<jsg::Ref<CryptoKey>> $public;
 
     // HKDF parameters (some shared with PBKDF2)
-    jsg::Optional<kj::Array<kj::byte>> info;
+
     // Bit string that corresponds to the context and application specific context for the derived
     // keying material
+    jsg::Optional<kj::Array<kj::byte>> info;
 
     JSG_STRUCT(name, salt, iterations, hash, $public, info);
   };
 
-  struct JsonWebKey {
   // https://www.w3.org/TR/WebCryptoAPI/#JsonWebKey-dictionary
+  struct JsonWebKey {
 
     struct RsaOtherPrimesInfo {
       // The following fields are defined in Section 6.3.2.7 of JSON Web Algorithms
@@ -522,6 +547,7 @@ public:
       bool extractable,
       kj::Array<kj::String> keyUsages);
 
+  // NOT VISIBLE TO JS: like importKey() but return the key, not a promise.
   jsg::Ref<CryptoKey> importKeySync(
       jsg::Lock& js,
       kj::StringPtr format,
@@ -529,7 +555,6 @@ public:
       ImportKeyAlgorithm algorithm,
       bool extractable,
       kj::ArrayPtr<const kj::String> keyUsages);
-  // NOT VISIBLE TO JS: like importKey() but return the key, not a promise.
 
   jsg::Promise<ExportKeyData> exportKey(
       jsg::Lock& js,
@@ -554,8 +579,8 @@ public:
       kj::Array<kj::String> keyUsages,
       const jsg::TypeHandler<JsonWebKey>& jwkHandler);
 
-  bool timingSafeEqual(kj::Array<kj::byte> a, kj::Array<kj::byte> b);
   // This is a non-standard extension based off Node.js' implementation of crypto.timingSafeEqual.
+  bool timingSafeEqual(kj::Array<kj::byte> a, kj::Array<kj::byte> b);
 
   JSG_RESOURCE_TYPE(SubtleCrypto) {
     JSG_METHOD(encrypt);
@@ -603,10 +628,10 @@ private:
   kj::Own<kj::PromiseFulfiller<kj::Array<kj::byte>>> fulfiller;
 };
 
+// DigestStream is a non-standard extension that provides a way of generating
+// a hash digest from streaming data. It combines Web Crypto concepts into a
+// WritableStream and is compatible with both APIs.
 class DigestStream: public WritableStream {
-  // DigestStream is a non-standard extension that provides a way of generating
-  // a hash digest from streaming data. It combines Web Crypto concepts into a
-  // WritableStream and is compatible with both APIs.
 public:
   using HashAlgorithm = DigestStreamSink::HashAlgorithm;
   using Algorithm = kj::OneOf<kj::String, HashAlgorithm>;
@@ -616,7 +641,7 @@ public:
       kj::Own<kj::PromiseFulfiller<kj::Array<kj::byte>>> fulfiller,
       jsg::Promise<kj::Array<kj::byte>> promise);
 
-  static jsg::Ref<DigestStream> constructor(Algorithm algorithm);
+  static jsg::Ref<DigestStream> constructor(jsg::Lock& js, Algorithm algorithm);
 
   jsg::MemoizedIdentity<jsg::Promise<kj::Array<kj::byte>>>& getDigest() { return promise; }
 
@@ -635,6 +660,10 @@ public:
     JSG_TS_OVERRIDE(extends WritableStream<ArrayBuffer | ArrayBufferView>);
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("promise", promise);
+  }
+
 private:
   jsg::MemoizedIdentity<jsg::Promise<kj::Array<kj::byte>>> promise;
 
@@ -646,12 +675,11 @@ private:
 // =======================================================================================
 // Crypto
 
+// Implements the Crypto interface as prescribed by:
+// https://www.w3.org/TR/WebCryptoAPI/#crypto-interface
 class Crypto: public jsg::Object {
-  // Implements the Crypto interface as prescribed by:
-  // https://www.w3.org/TR/WebCryptoAPI/#crypto-interface
-
 public:
-  v8::Local<v8::ArrayBufferView> getRandomValues(v8::Local<v8::ArrayBufferView> buffer);
+  jsg::BufferSource getRandomValues(jsg::BufferSource buffer);
 
   kj::String randomUUID();
 
@@ -683,6 +711,14 @@ public:
           | BigUint64Array
       >(buffer: T): T;
     });
+  }
+
+  void visitForGc(jsg::GcVisitor& visitor) {
+    visitor.visit(subtle);
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("subtle", subtle);
   }
 
 private:

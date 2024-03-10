@@ -1,8 +1,7 @@
-// https://developers.cloudflare.com/pub-sub/
-
 // PubSubMessage represents an incoming PubSub message.
 // The message includes metadata about the broker, the client, and the payload
 // itself.
+// https://developers.cloudflare.com/pub-sub/
 interface PubSubMessage {
     // Message ID
     readonly mid: number;

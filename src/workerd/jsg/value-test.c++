@@ -3,13 +3,14 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "jsg-test.h"
-#include "string.h"
+
 namespace workerd::jsg::test {
 namespace {
 
 V8System v8System;
+class ContextGlobalObject: public Object, public ContextGlobal {};
 
-struct BoolContext: public Object {
+struct BoolContext: public ContextGlobalObject {
   kj::String takeBool(bool b) {
     return kj::str(b);
   }
@@ -36,7 +37,7 @@ KJ_TEST("bool") {
 
 // ========================================================================================
 
-struct OptionalContext: public Object {
+struct OptionalContext: public ContextGlobalObject {
   struct TestOptionalFields {
     Optional<kj::String> optional;
     LenientOptional<kj::String> lenient;
@@ -65,10 +66,10 @@ struct OptionalContext: public Object {
     return kj::mv(arg).orDefault(kj::str("(absent)")).orDefault(kj::str("(null)"));
   }
   Optional<Ref<NumberBox>> returnOptional(double value) {
-    if (value == 321) return nullptr; else return jsg::alloc<NumberBox>(value);
+    if (value == 321) return kj::none; else return jsg::alloc<NumberBox>(value);
   }
   kj::Maybe<Ref<NumberBox>> returnMaybe(double value) {
-    if (value == 321) return nullptr; else return jsg::alloc<NumberBox>(value);
+    if (value == 321) return kj::none; else return jsg::alloc<NumberBox>(value);
   }
 
   kj::String readTestOptionalFields(TestOptionalFields s) {
@@ -175,7 +176,7 @@ KJ_TEST("optionals and maybes") {
 }
 
 // ========================================================================================
-struct MaybeContext: public Object {
+struct MaybeContext: public ContextGlobalObject {
 
   void test(kj::Maybe<kj::OneOf<NonCoercible<kj::String>>> arg) {}
 
@@ -208,7 +209,7 @@ KJ_TEST("maybes - don't substitute null") {
 
 // ========================================================================================
 
-struct OneOfContext: public Object {
+struct OneOfContext: public ContextGlobalObject {
   kj::String takeOneOf(kj::OneOf<double, kj::String, Ref<NumberBox>> value) {
     if (value.is<double>()) {
       return kj::str("double: ", value.get<double>());
@@ -223,12 +224,12 @@ struct OneOfContext: public Object {
   kj::OneOf<double, kj::String, Ref<NumberBox>> returnOneOf(
       kj::Maybe<double> num, kj::Maybe<kj::String> str, kj::Maybe<Ref<NumberBox>> box) {
     kj::OneOf<double, kj::String, Ref<NumberBox>> result;
-    KJ_IF_MAYBE(n, num) {
-      result.init<double>(*n);
-    } else KJ_IF_MAYBE(s, str) {
-      result.init<kj::String>(kj::mv(*s));
-    } else KJ_IF_MAYBE(b, box) {
-      result.init<Ref<NumberBox>>(b->addRef());
+    KJ_IF_SOME(n, num) {
+      result.init<double>(n);
+    } else KJ_IF_SOME(s, str) {
+      result.init<kj::String>(kj::mv(s));
+    } else KJ_IF_SOME(b, box) {
+      result.init<Ref<NumberBox>>(b.addRef());
     }
     return result;
   }
@@ -338,7 +339,7 @@ KJ_TEST("OneOf") {
 
 // ========================================================================================
 
-struct DictContext: public Object {
+struct DictContext: public ContextGlobalObject {
   kj::String takeDict(Dict<Ref<NumberBox>> dict) {
     return kj::strArray(
         KJ_MAP(f, dict.fields) { return kj::str(f.name, ": ", f.value->value); }, ", ");
@@ -390,7 +391,7 @@ KJ_TEST("dicts") {
 
 // ========================================================================================
 
-struct IntContext: public Object {
+struct IntContext: public ContextGlobalObject {
   kj::String takeInt(int i) {
     return kj::str("int: ", i);
   }
@@ -437,7 +438,7 @@ KJ_TEST("integers") {
 }
 
 // ========================================================================================
-struct Uint32Context: public Object {
+struct Uint32Context: public ContextGlobalObject {
   kj::String takeUint32(uint32_t i) {
     return kj::str("uint32_t: ", i);
   }
@@ -503,7 +504,7 @@ KJ_TEST("unsigned integers") {
 }
 
 // ========================================================================================
-struct Uint64Context: public Object {
+struct Uint64Context: public ContextGlobalObject {
   kj::String takeUint64(uint64_t i) {
     return kj::str("uint64_t: ", i);
   }
@@ -639,7 +640,7 @@ KJ_TEST("bigints") {
 
 // ========================================================================================
 
-struct Int8Context: public Object {
+struct Int8Context: public ContextGlobalObject {
   kj::String takeInt8(int8_t i) {
     return kj::str("int8_t: ", i);
   }
@@ -695,7 +696,7 @@ KJ_TEST("int8 integers") {
 
 // ========================================================================================
 
-struct Int16Context: public Object {
+struct Int16Context: public ContextGlobalObject {
   kj::String takeInt16(int16_t i) {
     return kj::str("int16_t: ", i);
   }
@@ -751,7 +752,7 @@ KJ_TEST("int16 integers") {
 
 // ========================================================================================
 
-struct DoubleContext: public Object {
+struct DoubleContext: public ContextGlobalObject {
   kj::String takeDouble(double d) {
     return kj::str("double: ", d);
   }
@@ -794,7 +795,7 @@ KJ_TEST("floating points") {
 
 // ========================================================================================
 
-struct StringContext: public Object {
+struct StringContext: public ContextGlobalObject {
   kj::String takeString(kj::String s) {
     return kj::mv(s);
   }
@@ -820,7 +821,7 @@ KJ_TEST("kj::Strings") {
 
 // ========================================================================================
 
-struct ByteStringContext: public Object {
+struct ByteStringContext: public ContextGlobalObject {
   ByteString takeByteString(ByteString s) {
     return kj::mv(s);
   }
@@ -841,7 +842,7 @@ KJ_TEST("ByteStrings") {
 
 // ========================================================================================
 
-struct RawContext: public Object {
+struct RawContext: public ContextGlobalObject {
   struct TwoValues {
     Value $foo;
     Value $bar;
@@ -867,7 +868,7 @@ KJ_TEST("Raw Values") {
 
 // ========================================================================================
 
-struct DateContext: public Object {
+struct DateContext: public ContextGlobalObject {
   kj::Date takeDate(kj::Date date) {
     return date;
   }
@@ -908,7 +909,7 @@ KJ_TEST("Date Values") {
 
 // ========================================================================================
 
-struct ArrayContext: public Object {
+struct ArrayContext: public ContextGlobalObject {
   kj::Array<int> takeArray(kj::Array<int> array) {
     // The ArrayWrapper uses a stack array with a max size of 64. This is just a
     // quick test to ensure that arrays larger than that are properly supported.
@@ -936,30 +937,12 @@ KJ_TEST("Array Values") {
 
 // ========================================================================================
 
-struct SequenceContext: public Object {
+struct SequenceContext: public ContextGlobalObject {
   Sequence<kj::String> testSequence(Sequence<kj::String> sequence) {
     KJ_ASSERT(sequence.size() == 2);
     KJ_ASSERT(sequence[0] == "a");
     KJ_ASSERT(sequence[1] == "b");
     return kj::mv(sequence);
-  }
-
-  Sequence<UsvString> testUsv(Sequence<UsvString> sequence) {
-    KJ_ASSERT(sequence.size() == 2);
-    KJ_ASSERT(sequence[0] == usv("a"));
-    KJ_ASSERT(sequence[1] == usv("b"));
-    return kj::mv(sequence);
-  }
-
-  Sequence<UsvString> testUsv2(Sequence<Sequence<UsvString>> sequence) {
-    KJ_ASSERT(sequence.size() == 2);
-    kj::Vector<UsvString> flat;
-    for (auto& s : sequence) {
-      for (auto& p : s) {
-        flat.add(kj::mv(p));
-      }
-    }
-    return Sequence<UsvString>(flat.releaseAsArray());
   }
 
   Sequence<int> testInt(Sequence<int> sequence) {
@@ -980,7 +963,7 @@ struct SequenceContext: public Object {
   // Because the kj::OneOf lists kj::String separately, and because JavaScript
   // strings are technically iterable, we want to make sure that the Sequence
   // ignores strings.
-  bool oneof1(kj::OneOf<kj::String, Sequence<kj::String>> input) {
+  bool oneof(kj::OneOf<kj::String, Sequence<kj::String>> input) {
     KJ_SWITCH_ONEOF(input) {
       KJ_CASE_ONEOF(str, kj::String) {
         KJ_ASSERT(str == "aa");
@@ -995,29 +978,11 @@ struct SequenceContext: public Object {
     KJ_UNREACHABLE;
   }
 
-  bool oneof2(kj::OneOf<UsvString, Sequence<UsvString>> input) {
-    KJ_SWITCH_ONEOF(input) {
-      KJ_CASE_ONEOF(str, UsvString) {
-        KJ_ASSERT(str == usv("aa"));
-        return true;
-      }
-      KJ_CASE_ONEOF(seq, Sequence<UsvString>) {
-        KJ_ASSERT(seq[0] == usv("b"));
-        KJ_ASSERT(seq[1] == usv("b"));
-        return true;
-      }
-    }
-    KJ_UNREACHABLE;
-  }
-
   JSG_RESOURCE_TYPE(SequenceContext) {
     JSG_METHOD(testSequence);
-    JSG_METHOD(testUsv);
-    JSG_METHOD(testUsv2);
     JSG_METHOD(testInt);
     JSG_METHOD(testFoo);
-    JSG_METHOD(oneof1);
-    JSG_METHOD(oneof2);
+    JSG_METHOD(oneof);
   }
 };
 JSG_DECLARE_ISOLATE_TYPE(SequenceIsolate, SequenceContext, SequenceContext::Foo);
@@ -1028,28 +993,20 @@ KJ_TEST("Sequence Values") {
   e.expectEval(
     "const val = {*[Symbol.iterator]() { yield 'a'; yield 'b'; }};"
     "testSequence(val).join('')", "string", "ab");
-  e.expectEval("testUsv(['a', 'b']).join('')", "string", "ab");
-  e.expectEval(
-    "const val = {*[Symbol.iterator]() { yield 'a'; yield 'b'; }};"
-    "testUsv(val).join('')", "string", "ab");
-  e.expectEval(
-    "const val = {*[Symbol.iterator]() { yield 'c', yield 'd'; }};"
-    "testUsv2([['a','b'],val]).join('')", "string", "abcd");
   e.expectEval("testInt([1,2]).join('')", "string", "12");
   e.expectEval("testInt([1,'2']).join('')", "string", "12");
   e.expectEval("testInt([1,'a']).join('')", "string", "10");
   e.expectEval("testInt([1,null]).join('')", "string", "10");
   e.expectEval("testInt([1,NaN]).join('')", "string", "10");
   e.expectEval("testFoo([{a:'a'}])[0].a", "string", "a");
-  e.expectEval("oneof1('aa')", "boolean", "true");
-  e.expectEval("oneof1(['b', 'b'])", "boolean", "true");
-  e.expectEval("oneof2('aa')", "boolean", "true");
+  e.expectEval("oneof('aa')", "boolean", "true");
+  e.expectEval("oneof(['b', 'b'])", "boolean", "true");
   e.expectEval("testFoo({a:'a'})", "throws", "TypeError: Failed to execute 'testFoo' on 'SequenceContext': parameter 1 is not of type 'Sequence'.");
 }
 
 // ========================================================================================
 
-struct NonCoercibleContext: public Object {
+struct NonCoercibleContext: public ContextGlobalObject {
   template <CoercibleType T>
   bool test(NonCoercible<T>) {
     return true;
@@ -1061,8 +1018,8 @@ struct NonCoercibleContext: public Object {
   }
 
   bool testMaybeString(Optional<NonCoercible<kj::String>> value) {
-    KJ_IF_MAYBE(v, value) {
-      KJ_ASSERT(v->value != "null"_kj);
+    KJ_IF_SOME(v, value) {
+      KJ_ASSERT(v.value != "null"_kj);
     }
     return true;
   }
@@ -1143,7 +1100,7 @@ KJ_TEST("NonCoercible Values") {
 
 // ========================================================================================
 
-struct MemoizedIdentityContext: public Object {
+struct MemoizedIdentityContext: public ContextGlobalObject {
   static constexpr kj::Date DATE = kj::UNIX_EPOCH + 123 * kj::MILLISECONDS;
   MemoizedIdentity<kj::Date> date = DATE;
 
@@ -1170,7 +1127,7 @@ KJ_TEST("MemoizedIdentity Values") {
 
 // ========================================================================================
 
-struct IdentifiedContext: public Object {
+struct IdentifiedContext: public ContextGlobalObject {
   kj::String compare(Identified<kj::Date> a, Identified<kj::Date> b, v8::Isolate* isolate) {
     bool result = a.identity == b.identity;
     KJ_EXPECT(a.identity.hashCode() != 0);
@@ -1200,7 +1157,7 @@ KJ_TEST("Identified values") {
 
 // ========================================================================================
 
-struct ExceptionContext: public Object {
+struct ExceptionContext: public ContextGlobalObject {
 
   kj::String testToException(kj::Exception exception) {
     return kj::str(exception.getDescription());
@@ -1241,7 +1198,7 @@ KJ_TEST("kj::Exception wrapper works") {
 }
 
 // ========================================================================================
-struct NameContext: public Object {
+struct NameContext: public ContextGlobalObject {
   Name name(Name value) {
     return kj::mv(value);
   }

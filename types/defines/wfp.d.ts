@@ -1,6 +1,3 @@
-// https://developers.cloudflare.com/cloudflare-for-platforms/workers-for-platforms/
-
-
 interface DynamicDispatchLimits {
   /**
    * Limit CPU time in milliseconds.

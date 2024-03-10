@@ -1,9 +1,9 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("//:build/kj_test.bzl", "kj_test")
-load("//:build/wd_cc_library.bzl", "wd_cc_library")
 load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
 load("//:build/wd_cc_capnp_library.bzl", "wd_cc_capnp_library")
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("@bazel_skylib//lib:selects.bzl", "selects")
+load("//:build/wd_cc_library.bzl", "wd_cc_library")
 
 config_setting(
     name = "is_linux",
@@ -16,28 +16,46 @@ bool_flag(
     name = "use_tcmalloc",
     build_setting_default = True,
 )
+
 config_setting(
     name = "set_use_tcmalloc",
     flag_values = {"use_tcmalloc": "True"},
 )
+
 selects.config_setting_group(
     name = "really_use_tcmalloc",
-    match_all = [":set_use_tcmalloc", ":is_linux"],
+    match_all = [
+        ":set_use_tcmalloc",
+        ":is_linux",
+    ],
+)
+
+# current malloc in use
+wd_cc_library(
+    name = "malloc",
+    deps = select({
+        ":really_use_tcmalloc": ["@com_google_tcmalloc//tcmalloc"],
+        "//conditions:default": ["@bazel_tools//tools/cpp:malloc"],
+    }),
+    visibility = ["//visibility:public"],
 )
 
 wd_cc_binary(
     name = "workerd",
     srcs = ["workerd.c++"],
+    malloc = ":malloc",
     tags = ["no-arm64"],
     visibility = ["//visibility:public"],
     deps = [
+        "//src/workerd/util:autogate",
         ":server",
-        ":workerd_capnp",
         ":workerd-meta_capnp",
-    ],
-    malloc = select({
-        ":really_use_tcmalloc": "@com_google_tcmalloc//tcmalloc",
-        "//conditions:default": "@bazel_tools//tools/cpp:malloc",
+        ":workerd_capnp",
+        "//src/workerd/util:perfetto",
+        "@capnp-cpp//src/capnp:capnpc",
+    ] + select({
+        "@platforms//os:windows": [],
+        "//conditions:default": ["@workerd//src/workerd/util:symbolizer"],
     }),
 )
 
@@ -51,8 +69,8 @@ wd_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//src/workerd/io",
         "//src/workerd/util:sqlite",
-        "//src/workerd/io:io",
         "@capnp-cpp//src/kj:kj",
         "@capnp-cpp//src/kj:kj-async",
     ],
@@ -62,22 +80,28 @@ wd_cc_library(
     name = "server",
     srcs = [
         "server.c++",
-        "workerd-api.c++",
         "v8-platform-impl.c++",
+        "workerd-api.c++",
     ],
     hdrs = [
         "server.h",
-        "workerd-api.h",
         "v8-platform-impl.h",
+        "workerd-api.h",
     ],
+    defines = select({
+        "//src/workerd/io:set_enable_experimental_webgpu": ["WORKERD_EXPERIMENTAL_ENABLE_WEBGPU"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
-        ":workerd_capnp",
-        "//src/cloudflare",
         ":alarm-scheduler",
-        "@capnp-cpp//src/capnp:capnpc",
+        ":workerd_capnp",
+        "//src/workerd/api:html-rewriter",
+        "//src/workerd/api:rtti",
+        "//src/workerd/api:pyodide",
         "//src/workerd/io",
         "//src/workerd/jsg",
+        "//src/workerd/util:perfetto",
     ],
 )
 
@@ -85,8 +109,7 @@ wd_cc_capnp_library(
     name = "workerd_capnp",
     srcs = ["workerd.capnp"],
     visibility = ["//visibility:public"],
-    deps = [
-    ],
+    deps = [],
 )
 
 wd_cc_capnp_library(

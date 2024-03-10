@@ -1,6 +1,19 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("//:build/capnp_embed.bzl", "capnp_embed")
 load("//:build/kj_test.bzl", "kj_test")
-load("//:build/wd_cc_library.bzl", "wd_cc_library")
 load("//:build/wd_cc_capnp_library.bzl", "wd_cc_capnp_library")
+load("//:build/wd_cc_library.bzl", "wd_cc_library")
+
+# Flag to enable WebGPU support via the Dawn library
+bool_flag(
+    name = "enable_experimental_webgpu",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "set_enable_experimental_webgpu",
+    flag_values = {"enable_experimental_webgpu": "True"},
+)
 
 wd_cc_library(
     name = "io",
@@ -38,23 +51,34 @@ wd_cc_library(
             "worker-interface.h",
         ],
     ) + ["//src/workerd/api:hdrs"],
+    defines = select({
+        ":set_enable_experimental_webgpu": ["WORKERD_EXPERIMENTAL_ENABLE_WEBGPU"],
+        "//conditions:default": [],
+    }),
+    implementation_deps = [
+        "@capnp-cpp//src/kj/compat:kj-brotli",
+        "@capnp-cpp//src/kj/compat:kj-gzip",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":capnp",
         ":observer",
         ":trace",
         ":worker-interface",
+        "//src/cloudflare",
         "//src/node",
         "//src/workerd/api:analytics-engine_capnp",
         "//src/workerd/api:r2-api_capnp",
         "//src/workerd/jsg",
         "//src/workerd/util:sqlite",
-        "@capnp-cpp//src/kj:kj-async",
-        "@capnp-cpp//src/kj/compat:kj-gzip",
-        "@capnp-cpp//src/capnp/compat:http-over-capnp",
+        "//src/workerd/util:duration-exceeded-logger",
         "@capnp-cpp//src/capnp:capnp-rpc",
-        "@com_cloudflare_lol_html//:lolhtml",
-    ],
+        "@capnp-cpp//src/capnp/compat:http-over-capnp",
+        "@capnp-cpp//src/kj:kj-async",
+    ] + select({
+        ":set_enable_experimental_webgpu": ["@dawn"],
+        "//conditions:default": [],
+    }),
 )
 
 wd_cc_library(
@@ -64,7 +88,9 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":capnp",
+        "//src/workerd/jsg:memory-tracker",
         "//src/workerd/util:own-util",
+        "//src/workerd/util:perfetto",
         "//src/workerd/util:thread-scopes",
         "@capnp-cpp//src/kj:kj-async",
         "@capnp-cpp//src/kj/compat:kj-http",
@@ -75,7 +101,16 @@ wd_cc_library(
     name = "observer",
     hdrs = ["observer.h"],
     visibility = ["//visibility:public"],
-    deps = [":trace"],
+    deps = [
+        ":trace",
+        "//src/workerd/jsg:observer",
+    ],
+)
+
+wd_cc_library(
+    name = "limit-enforcer",
+    hdrs = ["limit-enforcer.h"],
+    visibility = ["//visibility:public"],
 )
 
 wd_cc_library(
@@ -89,17 +124,37 @@ wd_cc_library(
     ],
 )
 
+genrule(
+    name = "trimmed-supported-compatibility-date-gen",
+    srcs = ["supported-compatibility-date.txt"],
+    outs = ["trimmed-supported-compatibility-date.txt"],
+    cmd = "tr -d '\n' < $(location supported-compatibility-date.txt) > $(location trimmed-supported-compatibility-date.txt)",
+    cmd_ps = "(Get-Content $(location supported-compatibility-date.txt) -Raw -Encoding Ascii).TrimEnd() | Set-Content $(location trimmed-supported-compatibility-date.txt) -NoNewLine -Encoding Ascii",
+)
+
+capnp_embed(
+    name = "trimmed-supported-compatibility-date",
+    src = ":trimmed-supported-compatibility-date-gen",
+)
+
+# TODO(cleanup): Split this target up further, as many depnedents don't need all the files here.
+#   Avoiding the dependency on supported-compatibility-date.capnp is often helpful due to the
+#   transitive dependency on `trimmed-supported-compatibility-date.txt` which is dynamically
+#   generated.
 wd_cc_capnp_library(
     name = "capnp",
     srcs = [
         "actor-storage.capnp",
         "cdp.capnp",
-        "compatibility-date.capnp",
+        "supported-compatibility-date.capnp",
         "worker-interface.capnp",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":outcome_capnp",
+        ":script_version_capnp",
+        ":compatibility_date_capnp",
+        ":trimmed-supported-compatibility-date",
         "@capnp-cpp//src/capnp/compat:http-over-capnp_capnp",
     ],
 )
@@ -107,6 +162,18 @@ wd_cc_capnp_library(
 wd_cc_capnp_library(
     name = "outcome_capnp",
     srcs = ["outcome.capnp"],
+    visibility = ["//visibility:public"],
+)
+
+wd_cc_capnp_library(
+    name = "script_version_capnp",
+    srcs = ["script-version.capnp"],
+    visibility = ["//visibility:public"],
+)
+
+wd_cc_capnp_library(
+    name = "compatibility_date_capnp",
+    srcs = ["compatibility-date.capnp"],
     visibility = ["//visibility:public"],
 )
 

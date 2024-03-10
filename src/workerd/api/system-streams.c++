@@ -6,6 +6,7 @@
 #include "util.h"
 #include <kj/one-of.h>
 #include <kj/compat/gzip.h>
+#include <kj/compat/brotli.h>
 
 namespace workerd::api {
 
@@ -14,31 +15,31 @@ namespace workerd::api {
 
 namespace {
 
+// A wrapper around a native `kj::AsyncInputStream` which knows the underlying encoding of the
+// stream and whether or not it requires pending event registration.
 class EncodedAsyncInputStream final: public ReadableStreamSource {
-  // A wrapper around a native `kj::AsyncInputStream` which knows the underlying encoding of the
-  // stream and whether or not it requires pending event registration.
-
 public:
   explicit EncodedAsyncInputStream(kj::Own<kj::AsyncInputStream> inner, StreamEncoding encoding,
                                    IoContext& context);
 
-  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override;
   // Read bytes in identity encoding. If the stream is not already in identity encoding, it will be
   // converted to identity encoding via an appropriate stream wrapper.
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override;
 
-  kj::Maybe<uint64_t> tryGetLength(StreamEncoding outEncoding) override;
   // Return the number of bytes, if known, which this input stream will produce if the sink is known
   // to be of a particular encoding.
   //
   // It is likely an error to call this function without immediately following it with a pumpTo()
   // to a EncodedAsyncOutputStream of that exact encoding.
+  kj::Maybe<uint64_t> tryGetLength(StreamEncoding outEncoding) override;
 
-  kj::Maybe<Tee> tryTee(uint64_t limit) override;
   // Consume this stream and return two streams with the same encoding that read the exact same
   // data.
   //
   // This implementation of `tryTee()` is not technically required for correctness, but prevents
-  // re-encoding (and converting Content-Length responses to chunk-encoded responses) gzip streams.
+  // re-encoding (and converting Content-Length responses to chunk-encoded responses) gzip and
+  // brotli streams.
+  kj::Maybe<Tee> tryTee(uint64_t limit) override;
 
 private:
   friend class EncodedAsyncOutputStream;
@@ -63,13 +64,27 @@ kj::Promise<size_t> EncodedAsyncInputStream::tryRead(
     return inner->tryRead(buffer, minBytes, maxBytes)
       .attach(ioContext.registerPendingEvent());
   }).catch_([](kj::Exception&& exception) -> kj::Promise<size_t> {
-    KJ_IF_MAYBE(e, translateKjException(exception, {
+    KJ_IF_SOME(e, translateKjException(exception, {
       { "gzip compressed stream ended prematurely"_kj,
         "Gzip compressed stream ended prematurely."_kj },
       { "gzip decompression failed"_kj,
         "Gzip decompression failed." },
+      { "brotli state allocation failed"_kj,
+        "Brotli state allocation failed." },
+      { "invalid brotli window size"_kj,
+        "Invalid brotli window size." },
+      { "invalid brotli compression level"_kj,
+        "Invalid brotli compression level." },
+      { "brotli window size too big"_kj,
+        "Brotli window size too big." },
+      { "brotli decompression failed"_kj,
+        "Brotli decompression failed." },
+      { "brotli compression failed"_kj,
+        "Brotli compression failed." },
+      { "brotli compressed stream ended prematurely"_kj,
+        "Brotli compressed stream ended prematurely." },
     })) {
-      return kj::mv(*e);
+      return kj::mv(e);
     }
 
     // Let the original exception pass through, since it is likely already a jsg.TypeError.
@@ -82,7 +97,7 @@ kj::Maybe<uint64_t> EncodedAsyncInputStream::tryGetLength(StreamEncoding outEnco
     return inner->tryGetLength();
   } else {
     // We have no idea what the length will be once encoded/decoded.
-    return nullptr;
+    return kj::none;
   }
 }
 
@@ -102,11 +117,15 @@ kj::Maybe<ReadableStreamSource::Tee> EncodedAsyncInputStream::tryTee(uint64_t li
 }
 
 void EncodedAsyncInputStream::ensureIdentityEncoding() {
+  // Decompression gets added to the stream here if needed based on the content encoding.
   if (encoding == StreamEncoding::GZIP) {
     inner = kj::heap<kj::GzipAsyncInputStream>(*inner).attach(kj::mv(inner));
     encoding = StreamEncoding::IDENTITY;
+  } else if (encoding == StreamEncoding::BROTLI) {
+    inner = kj::heap<kj::BrotliAsyncInputStream>(*inner).attach(kj::mv(inner));
+    encoding = StreamEncoding::IDENTITY;
   } else {
-    // gzip is the only non-identity encoding we currently support.
+    // We currently support gzip and brotli as non-identity content encodings.
     KJ_ASSERT(encoding == StreamEncoding::IDENTITY);
   }
 }
@@ -114,19 +133,18 @@ void EncodedAsyncInputStream::ensureIdentityEncoding() {
 // =======================================================================================
 // EncodedAsyncOutputStream
 
+// A wrapper around a native `kj::AsyncOutputStream` which knows the underlying encoding of the
+// stream and optimizes pumps from `EncodedAsyncInputStream`.
+//
+// The inner will be held on to right up until either end() or abort() is called.
+// This is important because some AsyncOutputStream implementations perform cleanup
+// operations equivalent to end() in their destructors (for instance HttpChunkedEntityWriter).
+// If we wait to clear the kj::Own when the EncodedAsyncOutputStream is destroyed, and the
+// EncodedAsyncOutputStream is owned (for instance) by an IoOwn, then the lifetime of the
+// inner may be extended past when it should. Eventually, kj::AsyncOutputStream should
+// probably have a distinct end() method of its own that we can defer to, but until it
+// does, it is important for us to release it as soon as end() or abort() are called.
 class EncodedAsyncOutputStream final: public WritableStreamSink {
-  // A wrapper around a native `kj::AsyncOutputStream` which knows the underlying encoding of the
-  // stream and optimizes pumps from `EncodedAsyncInputStream`.
-  //
-  // The inner will be held on to right up until either end() or abort() is called.
-  // This is important because some AsyncOutputStream implementations perform cleanup
-  // operations equivalent to end() in their destructors (for instance HttpChunkedEntityWriter).
-  // If we wait to clear the kj::Own when the EncodedAsyncOutputStream is destroyed, and the
-  // EncodedAsyncOutputStream is owned (for instance) by an IoOwn, then the lifetime of the
-  // inner may be extended past when it should. Eventually, kj::AsyncOutputStream should
-  // probably have a distinct end() method of its own that we can defer to, but until it
-  // does, it is important for us to release it as soon as end() or abort() are called.
-
 public:
   explicit EncodedAsyncOutputStream(kj::Own<kj::AsyncOutputStream> inner, StreamEncoding encoding,
                                     IoContext& context);
@@ -144,19 +162,18 @@ public:
 private:
   void ensureIdentityEncoding();
 
-  kj::AsyncOutputStream& getInner();
   // Unwrap `inner` as a `kj::AsyncOutputStream`.
-  //
+  kj::AsyncOutputStream& getInner();
   // TODO(cleanup): Obviously this is polymorphism. We should be able to do better.
 
-  struct Ended {
-    // A sentinel indicating that the EncodedOutputStream has ended and is no longer usable.
-  };
+  // A sentinel indicating that the EncodedOutputStream has ended and is no longer usable.
+  struct Ended {};
 
-  kj::OneOf<kj::Own<kj::AsyncOutputStream>, kj::Own<kj::GzipAsyncOutputStream>, Ended> inner;
   // I use a OneOf here rather than probing with downcasts because end() must be called for
   // correctness rather than for optimization. I "know" this code will never be compiled w/o RTTI,
   // but I'm paranoid.
+  kj::OneOf<kj::Own<kj::AsyncOutputStream>, kj::Own<kj::GzipAsyncOutputStream>,
+            kj::Own<kj::BrotliAsyncOutputStream>, Ended> inner;
 
   StreamEncoding encoding;
 
@@ -198,7 +215,7 @@ kj::Maybe<kj::Promise<DeferredProxy<void>>> EncodedAsyncOutputStream::tryPumpFro
     return kj::Promise<DeferredProxy<void>>(DeferredProxy<void> { kj::READY_NOW });
   }
 
-  KJ_IF_MAYBE(nativeInput, kj::dynamicDowncastIfAvailable<EncodedAsyncInputStream>(input)) {
+  KJ_IF_SOME(nativeInput, kj::dynamicDowncastIfAvailable<EncodedAsyncInputStream>(input)) {
     // We can avoid putting our inner streams into identity encoding if the input and output both
     // have the same encoding. Since ReadableStreamSource/WritableStreamSink always pump everything
     // (there is no `amount` parameter like in the KJ equivalents), we can assume that we will
@@ -208,15 +225,18 @@ kj::Maybe<kj::Promise<DeferredProxy<void>>> EncodedAsyncOutputStream::tryPumpFro
     // We can still optimize the pump a little by registering only a single pending event rather
     // than falling back to the heavier weight algorithm in ReadableStreamSource, which depends on
     // tryRead() and write() registering their own individual events on every call.
-    if (nativeInput->encoding != encoding) {
+    if (nativeInput.encoding != encoding) {
       ensureIdentityEncoding();
-      nativeInput->ensureIdentityEncoding();
+      nativeInput.ensureIdentityEncoding();
     }
 
-    auto promise = nativeInput->inner->pumpTo(getInner()).ignoreResult();
+    auto promise = nativeInput.inner->pumpTo(getInner()).ignoreResult();
     if (end) {
-      KJ_IF_MAYBE(gz, inner.tryGet<kj::Own<kj::GzipAsyncOutputStream>>()) {
-        promise = promise.then([&gz = *gz]() { return gz->end(); });
+      KJ_IF_SOME(gz, inner.tryGet<kj::Own<kj::GzipAsyncOutputStream>>()) {
+        promise = promise.then([&gz = gz]() { return gz->end(); });
+      }
+      KJ_IF_SOME(br, inner.tryGet<kj::Own<kj::BrotliAsyncOutputStream>>()) {
+        promise = promise.then([&br = br]() { return br->end(); });
       }
     }
 
@@ -225,7 +245,7 @@ kj::Maybe<kj::Promise<DeferredProxy<void>>> EncodedAsyncOutputStream::tryPumpFro
     return kj::Promise<DeferredProxy<void>>(DeferredProxy<void> { kj::mv(promise) });
   }
 
-  return nullptr;
+  return kj::none;
 }
 
 kj::Promise<void> EncodedAsyncOutputStream::end() {
@@ -233,15 +253,18 @@ kj::Promise<void> EncodedAsyncOutputStream::end() {
 
   kj::Promise<void> promise = kj::READY_NOW;
 
-  KJ_IF_MAYBE(gz, inner.tryGet<kj::Own<kj::GzipAsyncOutputStream>>()) {
-    promise = (*gz)->end().attach(kj::mv(*gz));
+  KJ_IF_SOME(gz, inner.tryGet<kj::Own<kj::GzipAsyncOutputStream>>()) {
+    promise = gz->end().attach(kj::mv(gz));
+  }
+  KJ_IF_SOME(br, inner.tryGet<kj::Own<kj::BrotliAsyncOutputStream>>()) {
+    promise = br->end().attach(kj::mv(br));
   }
 
-  KJ_IF_MAYBE(stream, inner.tryGet<kj::Own<kj::AsyncOutputStream>>()) {
-    if (auto casted = dynamic_cast<kj::AsyncIoStream*>(stream->get())) {
+  KJ_IF_SOME(stream, inner.tryGet<kj::Own<kj::AsyncOutputStream>>()) {
+    if (auto casted = dynamic_cast<kj::AsyncIoStream*>(stream.get())) {
       casted->shutdownWrite();
     }
-    promise = promise.attach(kj::mv(*stream));
+    promise = promise.attach(kj::mv(stream));
   }
 
   inner.init<Ended>();
@@ -254,6 +277,7 @@ void EncodedAsyncOutputStream::abort(kj::Exception reason) {
 }
 
 void EncodedAsyncOutputStream::ensureIdentityEncoding() {
+  // Compression gets added to the stream here if needed based on the content encoding.
   KJ_DASSERT(!inner.is<Ended>(), "the EncodedAsyncOutputStream has been ended or aborted");
   if (encoding == StreamEncoding::GZIP) {
     // This is safe because only a kj::AsyncOutputStream can have non-identity encoding.
@@ -261,8 +285,13 @@ void EncodedAsyncOutputStream::ensureIdentityEncoding() {
 
     inner = kj::heap<kj::GzipAsyncOutputStream>(*stream).attach(kj::mv(stream));
     encoding = StreamEncoding::IDENTITY;
+  } else if (encoding == StreamEncoding::BROTLI) {
+    auto& stream = inner.get<kj::Own<kj::AsyncOutputStream>>();
+
+    inner = kj::heap<kj::BrotliAsyncOutputStream>(*stream).attach(kj::mv(stream));
+    encoding = StreamEncoding::IDENTITY;
   } else {
-    // gzip is the only non-identity encoding we currently support.
+    // We currently support gzip and brotli as non-identity content encodings.
     KJ_ASSERT(encoding == StreamEncoding::IDENTITY);
   }
 }
@@ -274,6 +303,9 @@ kj::AsyncOutputStream& EncodedAsyncOutputStream::getInner() {
     }
     KJ_CASE_ONEOF(gz, kj::Own<kj::GzipAsyncOutputStream>) {
       return *gz;
+    }
+    KJ_CASE_ONEOF(br, kj::Own<kj::BrotliAsyncOutputStream>) {
+      return *br;
     }
     KJ_CASE_ONEOF(ended, Ended) {
       KJ_FAIL_ASSERT("the EncodedAsyncOutputStream has been ended or aborted.");
@@ -306,14 +338,20 @@ SystemMultiStream newSystemMultiStream(
   };
 }
 
+ContentEncodingOptions::ContentEncodingOptions(CompatibilityFlags::Reader flags)
+    : brotliEnabled(flags.getBrotliContentEncoding()) {}
+
 StreamEncoding getContentEncoding(IoContext& context, const kj::HttpHeaders& headers,
-                                  Response::BodyEncoding bodyEncoding) {
+                                  Response::BodyEncoding bodyEncoding,
+                                  ContentEncodingOptions options) {
   if (bodyEncoding == Response::BodyEncoding::MANUAL) {
     return StreamEncoding::IDENTITY;
   }
-  KJ_IF_MAYBE(encodingStr, headers.get(context.getHeaderIds().contentEncoding)) {
-    if (*encodingStr == "gzip") {
+  KJ_IF_SOME(encodingStr, headers.get(context.getHeaderIds().contentEncoding)) {
+    if (encodingStr == "gzip") {
       return StreamEncoding::GZIP;
+    } else if (options.brotliEnabled && encodingStr == "br") {
+      return StreamEncoding::BROTLI;
     }
   }
   return StreamEncoding::IDENTITY;

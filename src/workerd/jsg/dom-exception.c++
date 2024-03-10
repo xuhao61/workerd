@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "dom-exception.h"
+#include <workerd/jsg/memory.h>
 #include <kj/string.h>
 #include <map>
 
@@ -41,8 +42,7 @@ int DOMException::getCode() {
 }
 
 v8::Local<v8::Value> DOMException::getStack(Lock& js) {
-  return check(errorForStack.getHandle(js)->Get(
-      js.v8Context(), v8StrIntern(js.v8Isolate, "stack")));
+  return js.v8Get(errorForStack.getHandle(js), "stack"_kj);
 }
 
 void DOMException::visitForGc(GcVisitor& visitor) {

@@ -1,11 +1,20 @@
+# TODO(later): llvm-toolchain-16 is expected to be backported to Bullseye with the 11.9 point
+# release (https://tracker.debian.org/pkg/llvm-toolchain-16). Switch to using the regular packages
+# instead of packages from LLVM's APT repo once 11.9 is available and we have upgraded to LLVM 16.
 FROM node:bullseye AS builder
 
 WORKDIR /workerd
 
 RUN apt-get update
-RUN apt-get install -y curl clang libc++-dev libc++abi-dev
+RUN apt-get install -y curl build-essential git lsb-release wget software-properties-common gnupg
 
+RUN wget https://apt.llvm.org/llvm.sh
+RUN chmod +x llvm.sh
+RUN ./llvm.sh 15 all
 COPY . .
+
+RUN echo "build:linux --action_env=CC=/usr/lib/llvm-15/bin/clang --action_env=CXX=/usr/lib/llvm-15/bin/clang++" >> .bazelrc
+RUN echo "build:linux --host_action_env=CC=/usr/lib/llvm-15/bin/clang --host_action_env=CXX=/usr/lib/llvm-15/bin/clang++" >> .bazelrc
 COPY .bazel-cache /bazel-disk-cache
 RUN npm install -g pnpm@latest-7
 RUN pnpm install

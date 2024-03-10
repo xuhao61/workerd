@@ -34,6 +34,9 @@
 # afraid to fall back to code for anything the config cannot express, as Workers are very fast
 # to execute!
 
+# Any capnp files imported here must be:
+# 1. embedded into workerd-meta.capnp
+# 2. added to `tryImportBulitin` in workerd.c++ (grep for '"/workerd/workerd.capnp"').
 using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("workerd::server::config");
 $Cxx.allowCancellation;
@@ -76,6 +79,11 @@ struct Config {
   extensions @3 :List(Extension);
   # Extensions provide capabilities to all workers. Extensions are usually prepared separately
   # and are late-linked with the app using this config field.
+
+  autogates @4 :List(Text);
+  # A list of gates which are enabled.
+  # These are used to gate features/changes in workerd and in our internal repo. See the equivalent
+  # config definition in our internal repo for more details.
 }
 
 # ========================================================================================
@@ -254,6 +262,15 @@ struct Worker {
       # (a) allows for importing Node.js-compat built-ins without the node: specifier-prefix
       # (b) exposes the subset of common Node.js globals such as process, Buffer, etc that
       #     we implement in the workerd runtime.
+
+      pythonModule @8 :Text;
+      # A Python module. All bundles containing this value type are converted into a JS/WASM Worker
+      # Bundle prior to execution.
+
+      pythonRequirement @9 :Text;
+      # A Python package that is required by this bundle. The package must be supported by
+      # Pyodide (https://pyodide.org/en/stable/usage/packages-in-pyodide.html). All packages listed
+      # will be installed prior to the execution of the worker.
     }
   }
 
@@ -345,7 +362,42 @@ struct Worker {
       # namespace will be converted into HTTP requests targetting the given
       # service name.
 
-      # TODO(someday): dispatch, analyticsEngine, other new features
+      fromEnvironment @16 :Text;
+      # Takes the value of an environment variable from the system. The value specified here is
+      # the name of a system environment variable. The value of the binding is obtained by invoking
+      # `getenv()` with that name. If the environment variable isn't set, the binding value is
+      # `null`.
+
+      analyticsEngine @17 :ServiceDesignator;
+      # A binding for Analytics Engine. Allows workers to store information through Analytics Engine Events.
+      # workerd will forward AnalyticsEngineEvents to designated service in the body of HTTP requests
+      # This binding is subject to change and requires the `--experimental` flag
+
+      hyperdrive :group {
+        designator @18 :ServiceDesignator;
+        database @19 :Text;
+        user @20 :Text;
+        password @21 :Text;
+        scheme @22 :Text;
+      }
+      # A binding for Hyperdrive. Allows workers to use Hyperdrive caching & pooling for Postgres
+      # databases.
+
+      unsafeEval @23 :Void;
+      # A simple binding that enables access to the UnsafeEval API.
+
+      memoryCache :group {
+        # A binding representing access to an in-memory cache.
+
+        id @24 :Text;
+        # The identifier associated with this cache. Any number of isolates
+        # can access the same in-memory cache (within the same process), and
+        # each worker may use any number of in-memory caches.
+
+        limits @25 :MemoryCacheLimits;
+      }
+
+      # TODO(someday): dispatch, other new features
     }
 
     struct Type {
@@ -366,6 +418,8 @@ struct Worker {
         r2Bucket @9 :Void;
         r2Admin @10 :Void;
         queue @11 :Void;
+        analyticsEngine @12 : Void;
+        hyperdrive @13: Void;
       }
     }
 
@@ -440,6 +494,12 @@ struct Worker {
       }
     }
 
+    struct MemoryCacheLimits {
+      maxKeys @0 :UInt32;
+      maxValueSize @1 :UInt32;
+      maxTotalValueSize @2 :UInt64;
+    }
+
     struct WrappedBinding {
       # A binding that wraps a group of (lower-level) bindings in a common API.
 
@@ -508,6 +568,13 @@ struct Worker {
       #   anything. An object that hasn't stored anything will not consume any storage space on
       #   disk.
     }
+
+    preventEviction @3 :Bool;
+    # By default, Durable Objects are evicted after 10 seconds of inactivity, and expire 70 seconds
+    # after all clients have disconnected. Some applications may want to keep their Durable Objects
+    # pinned to memory forever, so we provide this flag to change the default behavior.
+    #
+    # Note that this is only supported in Workerd; production Durable Objects cannot toggle eviction.
   }
 
   durableObjectUniqueKeyModifier @8 :Text;
@@ -548,6 +615,9 @@ struct Worker {
 
   # TODO(someday): Support distributing objects across a cluster. At present, objects are always
   #   local to one instance of the runtime.
+
+  moduleFallback @13 :Text;
+
 }
 
 struct ExternalServer {
@@ -595,6 +665,13 @@ struct ExternalServer {
       certificateHost @4 :Text;
       # If present, expect the host to present a certificate authenticating it as this hostname.
       # If `certificateHost` is not provided, then the certificate is checked against `address`.
+    }
+
+    tcp :group {
+      # Connect to the server over raw TCP. Bindings to this service will only support the
+      # `connect()` method; `fetch()` will throw an exception.
+      tlsOptions @5 :TlsOptions;
+      certificateHost @6 :Text;
     }
 
     # TODO(someday): Cap'n Proto RPC
@@ -744,6 +821,12 @@ struct HttpOptions {
     # If null, the header will be removed.
   }
 
+  capnpConnectHost @5 :Text;
+  # A CONNECT request for this host+port will be treated as a request to form a Cap'n Proto RPC
+  # connection. The server will expose a WorkerdBootstrap as the bootstrap interface, allowing
+  # events to be delivered to the target worker via capnp. Clients will use capnp for non-HTTP
+  # event types (especially JSRPC).
+
   # TODO(someday): When we support TCP, include an option to deliver CONNECT requests to the
   #   TCP handler.
 }
@@ -791,7 +874,7 @@ struct TlsOptions {
 
   minVersion @4 :Version = goodDefault;
   # Minimum TLS version that will be allowed. Generally you should not override this unless you
-  # have unusual backwards-compatibilty needs.
+  # have unusual backwards-compatibility needs.
 
   enum Version {
     goodDefault @0;

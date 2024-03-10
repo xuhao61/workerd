@@ -20,42 +20,38 @@ namespace {
 
 jsg::V8System v8System;
 
-struct BasicsContext: public jsg::Object {
+struct BasicsContext: public jsg::Object, public jsg::ContextGlobal {
 
   bool test(jsg::Lock& js) {
 
     auto target = jsg::alloc<api::EventTarget>();
 
     int called = 0;
+    bool onceCalled = false;
 
     // Should be invoked multiple times.
-    auto handler = EventTarget::NativeHandler(
+    auto handler = target->newNativeHandler(
         js,
-        *target,
         kj::str("foo"),
         [&called](jsg::Lock& js, jsg::Ref<api::Event> event) {
           called++;
         }, false);
 
     // Should only be invoked once.
-    auto handlerOnce = EventTarget::NativeHandler(
+    auto handlerOnce = target->newNativeHandler(
         js,
-        *target,
         kj::str("foo"),
-        [&called](jsg::Lock& js, jsg::Ref<api::Event> event) {
-          called++;
+        [&](jsg::Lock& js, jsg::Ref<api::Event> event) {
+          KJ_ASSERT(!onceCalled);
+          onceCalled = true;
+          // Recursively dispatching the event here should not cause this handler to
+          // be invoked again.
+          target->dispatchEventImpl(js, jsg::alloc<api::Event>(kj::str("foo")));
         }, true);
 
-    KJ_ASSERT(handler.isAttached());
-    KJ_ASSERT(handlerOnce.isAttached());
-
     KJ_ASSERT(target->dispatchEventImpl(js, jsg::alloc<api::Event>(kj::str("foo"))));
-
-    KJ_ASSERT(handler.isAttached());
-    KJ_ASSERT(!handlerOnce.isAttached());
-
     KJ_ASSERT(target->dispatchEventImpl(js, jsg::alloc<api::Event>(kj::str("foo"))));
-
+    KJ_ASSERT(onceCalled);
     return called == 3;
   }
 

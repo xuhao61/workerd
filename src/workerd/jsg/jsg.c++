@@ -4,6 +4,7 @@
 
 #include "jsg.h"
 #include "setup.h"
+#include "workerd/jsg/util.h"
 #include <workerd/util/thread-scopes.h>
 
 namespace workerd::jsg {
@@ -13,16 +14,16 @@ kj::String stringifyHandle(v8::Local<v8::Value> value) {
   // hard to avoid since we want `kj::str(handle)` to work, which doesn't give us a chance to
   // pass in a `Lock` or whatever.
   // TODO(cleanup): Perhaps we should require you to call `js.toString(handle)`?
-  auto isolate = v8::Isolate::GetCurrent();
-  v8::HandleScope scope(isolate);
-  v8::Local<v8::String> str =
-      workerd::jsg::check(value->ToDetailString(isolate->GetCurrentContext()));
-  v8::String::Utf8Value utf8(isolate, str);
-  if (*utf8 == nullptr) {
-    return kj::str("(couldn't stringify)");
-  } else {
-    return kj::str(*utf8);
-  }
+  auto& js = jsg::Lock::from(v8::Isolate::GetCurrent());
+  return js.withinHandleScope([&] {
+    v8::Local<v8::String> str = workerd::jsg::check(value->ToDetailString(js.v8Context()));
+    v8::String::Utf8Value utf8(js.v8Isolate, str);
+    if (*utf8 == nullptr) {
+      return kj::str("(couldn't stringify)");
+    } else {
+      return kj::str(*utf8);
+    }
+  });
 }
 
 JsExceptionThrown::JsExceptionThrown() {
@@ -43,7 +44,7 @@ void Data::destroy() {
       handle.Reset();
 
       // If we have a TracedReference, Reset() it too, to let V8 know that this value is no longer
-      // used. Note that merely detroying the TracedReference does nothing -- only explicitly
+      // used. Note that merely destroying the TracedReference does nothing -- only explicitly
       // calling Reset() has an effect.
       //
       // In particular, this permits `Data` values to be collected by minor (non-tracing) GC, as
@@ -59,9 +60,9 @@ void Data::destroy() {
       // - If the `Data` is being destroyed _not_ as part of GC, e.g. it's being destroyed because
       //   the data structure holding it is being modified in a way that drops the reference, then
       //   that implies that the reference is still reachable, so must still be valid.
-      KJ_IF_MAYBE(t, tracedHandle) {
+      KJ_IF_SOME(t, tracedHandle) {
         if (!HeapTracer::isInCppgcDestructor()) {
-          t->Reset();
+          t.Reset();
         }
       }
     } else {
@@ -91,11 +92,13 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   // Verify the handle was not garbage-collected by trying to read it. The intention is for this
   // to crash if the handle was GC'd before being moved away.
   {
-    v8::HandleScope scope(isolate);
-    auto local = handle.Get(isolate);
-    if (local->IsValue()) {
-      local.As<v8::Value>()->IsArrayBufferView();
-    }
+    auto& js = jsg::Lock::from(isolate);
+    js.withinHandleScope([&] {
+      auto local = handle.Get(js.v8Isolate);
+      if (local->IsValue()) {
+        local.As<v8::Value>()->IsArrayBufferView();
+      }
+    });
   }
 
   // `other` is a traced `Data`, but once moved, we don't assume the new location is traced.
@@ -109,7 +112,7 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   // `TracedReference` so that V8 knows it's gone, which might make minor GCs more effective.
   otherTracedRef.Reset();
 
-  other.tracedHandle = nullptr;
+  other.tracedHandle = kj::none;
 }
 
 Lock::Lock(v8::Isolate* v8Isolate)
@@ -139,16 +142,26 @@ Lock::~Lock() noexcept(false) {
   v8Isolate->SetData(2, previousData);
 }
 
-Value Lock::parseJson(kj::StringPtr text) {
-  v8::HandleScope scope(v8Isolate);
-  return jsg::Value(v8Isolate,
-      jsg::check(v8::JSON::Parse(v8Isolate->GetCurrentContext(), v8Str(v8Isolate, text))));
+Value Lock::parseJson(kj::ArrayPtr<const char> data) {
+  return withinHandleScope([&] {
+    return v8Ref(jsg::check(v8::JSON::Parse(v8Context(), v8Str(v8Isolate, data))));
+  });
+}
+
+Value Lock::parseJson(v8::Local<v8::String> text) {
+  return withinHandleScope([&] {
+    return v8Ref(jsg::check(v8::JSON::Parse(v8Context(), text)));
+  });
 }
 
 kj::String Lock::serializeJson(v8::Local<v8::Value> value) {
-  v8::HandleScope scope(v8Isolate);
-  return toString(jsg::check(
-      v8::JSON::Stringify(v8Isolate->GetCurrentContext(), value)));
+  return withinHandleScope([&] {
+    return toString(jsg::check(v8::JSON::Stringify(v8Context(), value)));
+  });
+}
+
+void Lock::recursivelyFreeze(Value& value) {
+  jsg::recursivelyFreeze(v8Context(), value.getHandle(*this));
 }
 
 v8::Local<v8::String> Lock::wrapString(kj::StringPtr text) {
@@ -196,8 +209,46 @@ void Lock::requestGcForTesting() const {
     v8::Isolate::GarbageCollectionType::kFullGarbageCollection);
 }
 
+void Lock::v8Set(v8::Local<v8::Object> obj,
+                 kj::StringPtr name,
+                 v8::Local<v8::Value> value) {
+  KJ_ASSERT(check(obj->Set(v8Context(), v8StrIntern(v8Isolate, name), value)));
+}
+
+void Lock::v8Set(v8::Local<v8::Object> obj, kj::StringPtr name, Value& value) {
+  v8Set(obj, name, value.getHandle(*this));
+}
+
+void Lock::v8Set(v8::Local<v8::Object> obj, V8Ref<v8::String>& name, Value& value) {
+  KJ_ASSERT(check(obj->Set(v8Context(), name.getHandle(*this), value.getHandle(*this))));
+}
+
+v8::Local<v8::Value> Lock::v8Get(v8::Local<v8::Object> obj, kj::StringPtr name) {
+  return check(obj->Get(v8Context(), v8StrIntern(v8Isolate, name)));
+}
+
+v8::Local<v8::Value> Lock::v8Get(v8::Local<v8::Array> obj, uint idx) {
+  return check(obj->Get(v8Context(), idx));
+}
+
+bool Lock::v8Has(v8::Local<v8::Object> obj, kj::StringPtr name) {
+  return check(obj->Has(v8Context(), v8StrIntern(v8Isolate, name)));
+}
+
+bool Lock::v8HasOwn(v8::Local<v8::Object> obj, kj::StringPtr name) {
+  return check(obj->HasOwnProperty(v8Context(), v8StrIntern(v8Isolate, name)));
+}
+
 kj::StringPtr Lock::getUuid() const {
   return IsolateBase::from(v8Isolate).getUuid();
+}
+
+void Lock::runMicrotasks() {
+  v8Isolate->PerformMicrotaskCheckpoint();
+}
+
+void Lock::terminateExecution() {
+  v8Isolate->TerminateExecution();
 }
 
 Name Lock::newSymbol(kj::StringPtr symbol) {
@@ -210,6 +261,13 @@ Name Lock::newSharedSymbol(kj::StringPtr symbol) {
 
 Name Lock::newApiSymbol(kj::StringPtr symbol) {
   return Name(*this, v8::Symbol::ForApi(v8Isolate, v8StrIntern(v8Isolate, symbol)));
+}
+
+JsSymbol Lock::symbolDispose() {
+  return IsolateBase::from(v8Isolate).getSymbolDispose();
+}
+JsSymbol Lock::symbolAsyncDispose() {
+  return IsolateBase::from(v8Isolate).getSymbolAsyncDispose();
 }
 
 Name::Name(kj::String string)
@@ -245,8 +303,32 @@ void Name::visitForGc(GcVisitor& visitor) {
   }
 }
 
-V8StackScope::V8StackScope() {
-  kj::requireOnStack(this, "V8StackScope must be allocated on the stack");
+Name Name::clone(jsg::Lock& js) {
+  KJ_SWITCH_ONEOF(inner) {
+    KJ_CASE_ONEOF(str, kj::String) {
+      return Name(kj::str(str));
+    }
+    KJ_CASE_ONEOF(symbol, V8Ref<v8::Symbol>) {
+      return Name(js, symbol.getHandle(js));
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::String Name::toString(jsg::Lock& js) {
+  KJ_SWITCH_ONEOF(inner) {
+    KJ_CASE_ONEOF(str, kj::String) {
+      return kj::str(str);
+    }
+    KJ_CASE_ONEOF(sym, V8Ref<v8::Symbol>) {
+      return kj::str("Symbol(", sym.getHandle(js)->Description(js.v8Isolate), ")");
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+bool isInGcDestructor() {
+  return HeapTracer::isInCppgcDestructor();
 }
 
 }  // namespace workerd::jsg

@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "writable.h"
+#include <workerd/io/features.h>
 
 namespace workerd::api {
 
@@ -10,11 +11,11 @@ WritableStreamDefaultWriter::WritableStreamDefaultWriter()
     : ioContext(tryGetIoContext()) {}
 
 WritableStreamDefaultWriter::~WritableStreamDefaultWriter() noexcept(false) {
-  KJ_IF_MAYBE(stream, state.tryGet<Attached>()) {
+  KJ_IF_SOME(stream, state.tryGet<Attached>()) {
     // Because this can be called during gc or other cleanup, it is important
     // that releasing the writer does not cause the closed promise be resolved
     // since that requires v8 heap allocations.
-    (*stream)->getController().releaseWriter(*this, nullptr);
+    stream->getController().releaseWriter(*this, kj::none);
   }
 }
 
@@ -179,7 +180,26 @@ jsg::Promise<void> WritableStreamDefaultWriter::write(jsg::Lock& js, v8::Local<v
   KJ_UNREACHABLE;
 }
 
+jsg::JsString WritableStream::inspectState(jsg::Lock& js) {
+  if (controller->isErrored()) {
+    return js.strIntern("errored");
+  } else if (controller->isErroring(js) != kj::none) {
+    return js.strIntern("erroring");
+  } else if (controller->isClosedOrClosing()) {
+    return js.strIntern("closed");
+  } else {
+    return js.strIntern("writable");
+  }
+}
+
+bool WritableStream::inspectExpectsBytes() {
+  return controller->isByteOriented();
+}
+
 void WritableStreamDefaultWriter::visitForGc(jsg::GcVisitor& visitor) {
+  KJ_IF_SOME(writable, state.tryGet<Attached>()) {
+    visitor.visit(writable);
+  }
   visitor.visit(closedPromise, readyPromise);
 }
 
@@ -188,9 +208,10 @@ void WritableStreamDefaultWriter::visitForGc(jsg::GcVisitor& visitor) {
 WritableStream::WritableStream(
     IoContext& ioContext,
     kj::Own<WritableStreamSink> sink,
-    kj::Maybe<uint64_t> maybeHighWaterMark)
+    kj::Maybe<uint64_t> maybeHighWaterMark,
+    kj::Maybe<jsg::Promise<void>> maybeClosureWaitable)
     : WritableStream(newWritableStreamInternalController(ioContext, kj::mv(sink),
-                                                         maybeHighWaterMark)) {}
+        maybeHighWaterMark, kj::mv(maybeClosureWaitable))) {}
 
 WritableStream::WritableStream(kj::Own<WritableStreamController> controller)
     : ioContext(tryGetIoContext()),
@@ -248,15 +269,27 @@ jsg::Ref<WritableStreamDefaultWriter> WritableStream::getWriter(jsg::Lock& js) {
 jsg::Ref<WritableStream> WritableStream::constructor(
     jsg::Lock& js,
     jsg::Optional<UnderlyingSink> underlyingSink,
-    jsg::Optional<StreamQueuingStrategy> queuingStrategy,
-    CompatibilityFlags::Reader flags) {
-  JSG_REQUIRE(flags.getStreamsJavaScriptControllers(),
+    jsg::Optional<StreamQueuingStrategy> queuingStrategy) {
+  JSG_REQUIRE(FeatureFlags::get(js).getStreamsJavaScriptControllers(),
                Error,
                "To use the new WritableStream() constructor, enable the "
-               "streams_enable_constructors feature flag.");
+               "streams_enable_constructors compatibility flag. "
+               "Refer to the docs for more information: https://developers.cloudflare.com/workers/platform/compatibility-dates/#compatibility-flags");
   auto stream = jsg::alloc<WritableStream>(newWritableStreamJsController());
   stream->getController().setup(js, kj::mv(underlyingSink), kj::mv(queuingStrategy));
   return kj::mv(stream);
+}
+
+void WritableStreamDefaultWriter::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+  KJ_IF_SOME(ref, state.tryGet<Attached>()) {
+    tracker.trackField("attached", ref);
+  }
+  tracker.trackField("closedPromise", closedPromise);
+  tracker.trackField("readyPromise", readyPromise);
+}
+
+void WritableStream::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+  tracker.trackField("controller", controller);
 }
 
 }  // namespace workerd::api

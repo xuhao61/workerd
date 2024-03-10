@@ -5,6 +5,7 @@
 #pragma once
 
 #include <kj/debug.h>
+#include <kj/time.h>
 
 #include <workerd/io/worker-interface.capnp.h>
 #include <workerd/io/worker-interface.h>
@@ -22,25 +23,30 @@ public:
 
   static jsg::Ref<HibernatableWebSocketEvent> constructor(kj::String type) = delete;
 
+  // When we call a close or error event, we need to move the owned websocket and the tags back into
+  // the api::WebSocket to extend their lifetimes. This is because the HibernatableWebSocket, which
+  // has owned these things for the entire duration of the connection, is free to go away after we
+  // dispatch the final event. JS may still want to access the underlying kj::WebSocket or the tags,
+  // so we have to transfer ownership to JS-land.
   struct ItemsForRelease {
-    // When we call a close or error event, we need to move the owned websocket back into the
-    // api::WebSocket to extend its lifetime. The way we obtain the websocket from the
-    // HibernationManager is somewhat fragile, so it's better if we group the reference and owned
-    // websocket together.
     jsg::Ref<WebSocket> webSocketRef;
     kj::Own<kj::WebSocket> ownedWebSocket;
+    kj::Array<kj::String> tags;
 
-    explicit ItemsForRelease(jsg::Ref<WebSocket> ref, kj::Own<kj::WebSocket> owned)
-        : webSocketRef(kj::mv(ref)), ownedWebSocket(kj::mv(owned)) {}
+    explicit ItemsForRelease(
+        jsg::Ref<WebSocket> ref,
+        kj::Own<kj::WebSocket> owned,
+        kj::Array<kj::String> tags);
   };
 
-  ItemsForRelease prepareForRelease(jsg::Lock& lock, kj::StringPtr websocketId);
-  // Only call this once (when transferring ownership of the websocket back to the api::WebSocket).
+  // Call this when transferring ownership of the kj::WebSocket and tags to the api::WebSocket.
+  //
   // Gets a reference to the api::WebSocket, and moves the owned kj::WebSocket out of the
   // HibernatableWebSocket whose event we are currently delivering.
+  ItemsForRelease prepareForRelease(jsg::Lock& lock, kj::StringPtr websocketId);
 
-  jsg::Ref<WebSocket> claimWebSocket(jsg::Lock& lock, kj::StringPtr websocketId);
   // Should only be called once per event, see definition for details.
+  jsg::Ref<WebSocket> claimWebSocket(jsg::Lock& lock, kj::StringPtr websocketId);
 
   JSG_RESOURCE_TYPE(HibernatableWebSocketEvent) {
     JSG_INHERIT(ExtendableEvent);
@@ -56,14 +62,12 @@ public:
       uint16_t typeId,
       kj::TaskSet& waitUntilTasks,
       kj::Own<HibernationReader> params,
-      kj::Maybe<Worker::Actor::HibernationManager&> manager=nullptr)
-    : typeId(typeId), waitUntilTasks(waitUntilTasks), params(kj::mv(params)) {}
+      kj::Maybe<Worker::Actor::HibernationManager&> manager=kj::none);
   HibernatableWebSocketCustomEventImpl(
       uint16_t typeId,
       kj::TaskSet& waitUntilTasks,
       HibernatableSocketParams params,
-      Worker::Actor::HibernationManager& manager)
-    : typeId(typeId), waitUntilTasks(waitUntilTasks), params(kj::mv(params)), manager(manager) {}
+      Worker::Actor::HibernationManager& manager);
 
   kj::Promise<Result> run(
       kj::Own<IoContext_IncomingRequest> incomingRequest,
@@ -80,47 +84,14 @@ public:
   }
 
 private:
-  HibernatableSocketParams consumeParams() {
-    // Returns `params`, but if we have a HibernationReader we convert it to a
-    // HibernatableSocketParams first.
-    KJ_IF_MAYBE(p, params.tryGet<kj::Own<HibernationReader>>()) {
-      kj::Maybe<HibernatableSocketParams> eventParameters;
-      auto websocketId = kj::str((*p)->getMessage().getWebsocketId());
-      auto payload = (*p)->getMessage().getPayload();
-      switch(payload.which()) {
-        case rpc::HibernatableWebSocketEventMessage::Payload::TEXT: {
-          eventParameters.emplace(kj::str(payload.getText()), kj::mv(websocketId));
-          break;
-        }
-        case rpc::HibernatableWebSocketEventMessage::Payload::DATA: {
-          kj::Array<byte> b = kj::heapArray(payload.getData().asBytes());
-          eventParameters.emplace(kj::mv(b), kj::mv(websocketId));
-          break;
-        }
-        case rpc::HibernatableWebSocketEventMessage::Payload::CLOSE: {
-          auto close = payload.getClose();
-          eventParameters.emplace(
-              close.getCode(),
-              kj::str(close.getReason()),
-              close.getWasClean(),
-              kj::mv(websocketId));
-          break;
-        }
-        case rpc::HibernatableWebSocketEventMessage::Payload::ERROR: {
-          eventParameters.emplace(
-              KJ_EXCEPTION(FAILED, kj::str(payload.getError())),
-              kj::mv(websocketId));
-          break;
-        }
-      }
-      return kj::mv(KJ_REQUIRE_NONNULL(eventParameters));
-    }
-    return kj::mv(KJ_REQUIRE_NONNULL(params.tryGet<HibernatableSocketParams>()));
-  }
+  // Returns `params`, but if we have a HibernationReader we convert it to a
+  // HibernatableSocketParams first.
+  HibernatableSocketParams consumeParams();
 
   uint16_t typeId;
   kj::TaskSet& waitUntilTasks;
   kj::OneOf<HibernatableSocketParams, kj::Own<HibernationReader>> params;
+  kj::Maybe<uint32_t> timeoutMs;
   kj::Maybe<Worker::Actor::HibernationManager&> manager;
 };
 

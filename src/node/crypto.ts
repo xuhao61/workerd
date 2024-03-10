@@ -4,12 +4,6 @@
 //
 /* eslint-disable */
 
-// TODO(soon): Remove this once assert is out of experimental
-import { default as CompatibilityFlags } from 'workerd:compatibility-flags';
-if (!CompatibilityFlags.workerdExperimental) {
-  throw new Error('node:crypto is experimental.');
-}
-
 import {
   ERR_METHOD_NOT_IMPLEMENTED
 } from 'node-internal:internal_errors';
@@ -18,6 +12,14 @@ export const getRandomValues = crypto.getRandomValues;
 export const subtle = crypto.subtle;
 export const timingSafeEqual = (crypto as any).timingSafeEqual;
 export const webcrypto = crypto;
+
+import {
+  DiffieHellman,
+  DiffieHellmanGroup,
+  createDiffieHellman,
+  createDiffieHellmanGroup,
+  getDiffieHellman,
+} from 'node-internal:crypto_dh';
 
 import {
   randomBytes,
@@ -33,6 +35,19 @@ import {
   checkPrime,
   checkPrimeSync,
 } from 'node-internal:crypto_random';
+
+import {
+  createHash,
+  createHmac,
+  Hash,
+  HashOptions,
+  Hmac,
+} from 'node-internal:crypto_hash';
+
+import {
+  hkdf,
+  hkdfSync,
+} from 'node-internal:crypto_hkdf';
 
 import {
   pbkdf2,
@@ -55,6 +70,12 @@ import {
 } from 'node-internal:crypto_keys';
 
 export {
+  // DH
+  DiffieHellman,
+  DiffieHellmanGroup,
+  createDiffieHellman,
+  createDiffieHellmanGroup,
+  getDiffieHellman,
   // Random
   randomBytes,
   randomFillSync,
@@ -69,6 +90,15 @@ export {
   generatePrimeSync,
   checkPrime,
   checkPrimeSync,
+  // Hash and Hmac
+  createHash,
+  createHmac,
+  Hash,
+  HashOptions,
+  Hmac,
+  // Hkdf
+  hkdf,
+  hkdfSync,
   // Pbkdf2
   pbkdf2,
   pbkdf2Sync,
@@ -85,6 +115,26 @@ export {
   createPrivateKey,
   createPublicKey,
   createSecretKey,
+}
+
+export function getCiphers() {
+  return ["aes-128-cbc", "aes-192-cbc", "aes-256-cbc", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+  "aes-128-ecb", "aes-192-ecb", "aes-256-ecb", "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
+  "aes-128-ofb", "aes-192-ofb", "aes-256-ofb", "des-ecb", "des-ede", "des-ede-cbc", "rc2-cbc"];
+}
+
+export function getCurves() {
+  // Hardcoded list of supported curves. Note that prime256v1 is equivalent to secp256r1, we follow
+  // OpenSSL's and bssl's nomenclature here.
+  return ['secp224r1', 'prime256v1', 'secp384r1', 'secp521r1'];
+}
+
+export function getHashes() {
+  // Hardcoded list of hashes supported in boringssl, node's approach looks pretty clunky. This is
+  // expected to change infrequently based of bssl's stability-focused approach.
+  return ['md4', 'md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512', 'md5-sha1', 'RSA-MD5',
+          'RSA-SHA1', 'RSA-SHA224', 'RSA-SHA256', 'RSA-SHA384', 'RSA-SHA512', 'DSA-SHA',
+          'DSA-SHA1', 'ecdsa-with-SHA1'];
 }
 
 // We do not implement the openssl secure heap.
@@ -112,6 +162,12 @@ export const fips = true;
 export function getFips() { return fips; }
 
 export default {
+  // DH
+  DiffieHellman,
+  DiffieHellmanGroup,
+  createDiffieHellman,
+  createDiffieHellmanGroup,
+  getDiffieHellman,
   // Keys,
   KeyObject,
   PublicKeyObject,
@@ -135,10 +191,21 @@ export default {
   generatePrimeSync,
   checkPrime,
   checkPrimeSync,
+  // Hash and Hmac
+  Hash,
+  Hmac,
+  createHash,
+  createHmac,
+  getHashes,
+  // Hkdf
+  hkdf,
+  hkdfSync,
   // Pbkdf2
   pbkdf2,
   pbkdf2Sync,
   // Misc
+  getCiphers,
+  getCurves,
   secureHeapUsed,
   setEngine,
   timingSafeEqual,
@@ -156,11 +223,11 @@ export default {
 //   * [ ] crypto.Certificate
 //   * [ ] crypto.Cipher
 //   * [ ] crypto.Decipher
-//   * [ ] crypto.DiffieHellman
-//   * [ ] crypto.DiffieHellmanGroup
+//   * [x] crypto.DiffieHellman
+//   * [x] crypto.DiffieHellmanGroup
 //   * [ ] crypto.ECDH
-//   * [ ] crypto.Hash
-//   * [ ] crypto.Hmac
+//   * [x] crypto.Hash
+//   * [x] crypto.Hmac
 //   * [ ] crypto.KeyObject
 //   * [ ] crypto.Sign
 //   * [ ] crypto.Verify
@@ -182,24 +249,24 @@ export default {
 //   * [ ] crypto.publicDecrypt(key, buffer)
 //   * [ ] crypto.publicEncrypt(key, buffer)
 // * DiffieHellman
-//   * [ ] crypto.createDiffieHellman(prime[, primeEncoding][, generator][, generatorEncoding])
-//   * [ ] crypto.createDiffieHellman(primeLength[, generator])
-//   * [ ] crypto.createDiffieHellmanGroup(name)
+//   * [x] crypto.createDiffieHellman(prime[, primeEncoding][, generator][, generatorEncoding])
+//   * [x] crypto.createDiffieHellman(primeLength[, generator])
+//   * [x] crypto.createDiffieHellmanGroup(name)
 //   * [ ] crypto.createECDH(curveName)
 //   * [ ] crypto.diffieHellman(options)
-//   * [ ] crypto.getDiffieHellman(groupName)
+//   * [x] crypto.getDiffieHellman(groupName)
 // * Hash
-//   * [ ] crypto.createHash(algorithm[, options])
-//   * [ ] crypto.createHmac(algorithm, key[, options])
-//   * [ ] crypto.getHashes()
+//   * [x] crypto.createHash(algorithm[, options])
+//   * [x] crypto.createHmac(algorithm, key[, options])
+//   * [x] crypto.getHashes()
 // * Keys
 //   * [ ] crypto.createPrivateKey(key)
 //   * [ ] crypto.createPublicKey(key)
-//   * [ ] crypto.createSecretKey(key[, encoding])
-//   * [ ] crypto.generateKey(type, options, callback)
-//   * [ ] crypto.generateKeyPair(type, options, callback)
-//   * [ ] crypto.generateKeyPairSync(type, options)
-//   * [ ] crypto.generateKeySync(type, options)
+//   * [x] crypto.createSecretKey(key[, encoding])
+//   * [x] crypto.generateKey(type, options, callback)
+//   * [x] crypto.generateKeyPair(type, options, callback)
+//   * [x] crypto.generateKeyPairSync(type, options)
+//   * [x] crypto.generateKeySync(type, options)
 // * Sign/Verify
 //   * [ ] crypto.createSign(algorithm[, options])
 //   * [ ] crypto.createVerify(algorithm[, options])
@@ -207,8 +274,8 @@ export default {
 //   * [ ] crypto.verify(algorithm, data, key, signature[, callback])
 // * Misc
 //   * [ ] crypto.getCipherInfo(nameOrNid[, options])
-//   * [ ] crypto.getCiphers()
-//   * [ ] crypto.getCurves()
+//   * [x] crypto.getCiphers()
+//   * [x] crypto.getCurves()
 //   * [x] crypto.secureHeapUsed()
 //   * [x] crypto.setEngine(engine[, flags])
 //   * [x] crypto.timingSafeEqual(a, b)
@@ -224,8 +291,8 @@ export default {
 //   * [x] crypto.randomInt([min, ]max[, callback])
 //   * [x] crypto.randomUUID([options])
 // * Key Derivation
-//   * [ ] crypto.hkdf(digest, ikm, salt, info, keylen, callback)
-//   * [ ] crypto.hkdfSync(digest, ikm, salt, info, keylen)
+//   * [.] crypto.hkdf(digest, ikm, salt, info, keylen, callback) (* still needs KeyObject support)
+//   * [.] crypto.hkdfSync(digest, ikm, salt, info, keylen) (* still needs KeyObject support)
 //   * [x] crypto.pbkdf2(password, salt, iterations, keylen, digest, callback)
 //   * [x] crypto.pbkdf2Sync(password, salt, iterations, keylen, digest)
 //   * [ ] crypto.scrypt(password, salt, keylen[, options], callback)

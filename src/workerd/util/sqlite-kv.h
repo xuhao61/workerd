@@ -8,44 +8,43 @@
 
 namespace workerd {
 
+// Class which implements KV storage on top of SQLite. This is intended to be used for Durable
+// Object storage.
+//
+// The table is named `_cf_KV`. The naming is designed so that if the application is allowed to
+// perform direct SQL queries, we can block it from accessing any table prefixed with `_cf_`.
+// (Ideally this class would allow configuring the table name, but this would require a somewhat
+// obnoxious amount of string allocation.)
 class SqliteKv {
-  // Class which implements KV storage on top of SQLite. This is intended to be used for Durable
-  // Object storage.
-  //
-  // The table is named `_cf_KV`. The naming is designed so that if the application is allowed to
-  // perform direct SQL queries, we can block it from accessing any table prefixed with `_cf_`.
-  // (Ideally this class would allow configuring the table name, but this would require a somewhat
-  // obnoxious amount of string allocation.)
-
 public:
   explicit SqliteKv(SqliteDatabase& db): SqliteKv(ensureInitialized(db), true) {}
 
   typedef kj::StringPtr KeyPtr;
   typedef kj::ArrayPtr<const kj::byte> ValuePtr;
 
-  template <typename Func>
-  bool get(KeyPtr key, Func&& callback);
   // Search for a match for the given key. Calls the callback function with the result (a ValuePtr)
   // if found. This is intended to avoid the need to copy the bytes, if the caller would just parse
   // them and drop them immediately anyway. Returns true if there was a match, false if not.
+  template <typename Func>
+  bool get(KeyPtr key, Func&& callback);
 
   enum Order {
     FORWARD,
     REVERSE
   };
 
-  template <typename Func>
-  uint list(KeyPtr begin, kj::Maybe<KeyPtr> end, kj::Maybe<uint> limit, Order order,
-            Func&& callback);
   // Search for all knows keys and values in a range, calling the callback (with KeyPtr and
   // ValuePtr parameters) for each one seen. `end` and `limit` can be null to request no constraint
   // be enforced.
+  template <typename Func>
+  uint list(KeyPtr begin, kj::Maybe<KeyPtr> end, kj::Maybe<uint> limit, Order order,
+            Func&& callback);
 
-  void put(KeyPtr key, ValuePtr value);
   // Store a value into the table.
+  void put(KeyPtr key, ValuePtr value);
 
-  bool delete_(KeyPtr key);
   // Delete the key and return whether it was matched.
+  bool delete_(KeyPtr key);
 
   uint deleteAll();
 
@@ -154,29 +153,29 @@ uint SqliteKv::list(KeyPtr begin, kj::Maybe<KeyPtr> end, kj::Maybe<uint> limit, 
   };
 
   if (order == Order::FORWARD) {
-    KJ_IF_MAYBE(e, end) {
-      KJ_IF_MAYBE(l, limit) {
-        return iterate(stmtListEndLimit.run(begin, *e, (int64_t)*l));
+    KJ_IF_SOME(e, end) {
+      KJ_IF_SOME(l, limit) {
+        return iterate(stmtListEndLimit.run(begin, e, (int64_t)l));
       } else {
-        return iterate(stmtListEnd.run(begin, *e));
+        return iterate(stmtListEnd.run(begin, e));
       }
     } else {
-      KJ_IF_MAYBE(l, limit) {
-        return iterate(stmtListLimit.run(begin, (int64_t)*l));
+      KJ_IF_SOME(l, limit) {
+        return iterate(stmtListLimit.run(begin, (int64_t)l));
       } else {
         return iterate(stmtList.run(begin));
       }
     }
   } else {
-    KJ_IF_MAYBE(e, end) {
-      KJ_IF_MAYBE(l, limit) {
-        return iterate(stmtListEndLimitReverse.run(begin, *e, (int64_t)*l));
+    KJ_IF_SOME(e, end) {
+      KJ_IF_SOME(l, limit) {
+        return iterate(stmtListEndLimitReverse.run(begin, e, (int64_t)l));
       } else {
-        return iterate(stmtListEndReverse.run(begin, *e));
+        return iterate(stmtListEndReverse.run(begin, e));
       }
     } else {
-      KJ_IF_MAYBE(l, limit) {
-        return iterate(stmtListLimitReverse.run(begin, (int64_t)*l));
+      KJ_IF_SOME(l, limit) {
+        return iterate(stmtListLimitReverse.run(begin, (int64_t)l));
       } else {
         return iterate(stmtListReverse.run(begin));
       }

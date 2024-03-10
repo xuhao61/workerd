@@ -29,37 +29,47 @@
 
 namespace workerd {
 
+// Like KJ_REQUIRE() but give the Regulator a chance to report the error. `errorMessage` is either
+// the return value of sqlite3_errmsg() or a string literal containing a similarly
+// application-approriate error message. A reference called `regulator` must be in-scope.
 #define SQLITE_REQUIRE(condition, errorMessage, ...) \
     if (!(condition)) { \
       regulator.onError(errorMessage); \
       KJ_FAIL_REQUIRE("SQLite failed", errorMessage, ##__VA_ARGS__); \
     }
-// Like KJ_REQUIRE() but give the Regulator a chance to report the error. `errorMessage` is either
-// the return value of sqlite3_errmsg() or a string literal containing a similarly
-// application-approriate error message. A reference called `regulator` must be in-scope.
 
+// Make a SQLite call and check the returned error code. Use this version when the call is not
+// associated with an open DB connection.
 #define SQLITE_CALL_NODB(code, ...) do { \
     int _ec = code; \
     KJ_ASSERT(_ec == SQLITE_OK, sqlite3_errstr(_ec), " " #code, ##__VA_ARGS__); \
   } while (false)
-// Make a SQLite call and check the returned error code. Use this version when the call is not
-// associated with an open DB connection.
 
+// This version requires the scope to contain a variable named `db` which is of type sqlite3*, or
+// can convert to it.
 #define SQLITE_CALL(code, ...) do { \
     int _ec = code; \
     /* SQLITE_MISUSE doesn't put error info on the database object, so check it separately */ \
     KJ_ASSERT(_ec != SQLITE_MISUSE, "SQLite misused: " #code, ##__VA_ARGS__); \
-    SQLITE_REQUIRE(_ec == SQLITE_OK, sqlite3_errmsg(db), " " #code, ##__VA_ARGS__); \
+    kj::String msg = kj::str(sqlite3_errmsg(db)); \
+    int offset = sqlite3_error_offset(db); \
+    if (offset != -1) { \
+      msg = kj::str(msg, " at offset ", offset); \
+    } \
+    SQLITE_REQUIRE(_ec == SQLITE_OK, msg, " " #code, ##__VA_ARGS__); \
   } while (false)
-// This version requires the scope to contain a variable named `db` which is of type sqlite3*, or
-// can convert to it.
 
-#define SQLITE_CALL_FAILED(code, error, ...) do { \
-    KJ_ASSERT(error != SQLITE_MISUSE, "SQLite misused: " code, ##__VA_ARGS__); \
-    SQLITE_REQUIRE(error == SQLITE_OK, sqlite3_errmsg(db), " " code, ##__VA_ARGS__); \
-  } while (false);
 // Version of `SQLITE_CALL` that can be called after inspecting the error code, in case some codes
 // aren't really errors.
+#define SQLITE_CALL_FAILED(code, error, ...) do { \
+    KJ_ASSERT(error != SQLITE_MISUSE, "SQLite misused: " code, ##__VA_ARGS__); \
+    kj::String msg = kj::str(sqlite3_errmsg(db)); \
+    int offset = sqlite3_error_offset(db); \
+    if (offset != -1) { \
+      msg = kj::str(msg, " at offset ", offset); \
+    } \
+    SQLITE_REQUIRE(error == SQLITE_OK, msg, " " code, ##__VA_ARGS__); \
+  } while (false);
 
 namespace {
 
@@ -106,20 +116,21 @@ static kj::Path getPathFromWin32Handle(HANDLE handle) {
 
 kj::Maybe<kj::StringPtr> toMaybeString(const char* cstr) {
   if (cstr == nullptr) {
-    return nullptr;
+    return kj::none;
   } else {
     return kj::StringPtr(cstr);
   }
 }
 
+// We allowlist these SQLite functions.
 static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
-  // We allowlist these SQLite functions.
-
   // https://www.sqlite.org/lang_corefunc.html
   "abs"_kj,
   "changes"_kj,
   "char"_kj,
   "coalesce"_kj,
+  "concat"_kj,
+  "concat_ws"_kj,
   "format"_kj,
   "glob"_kj,
   "hex"_kj,
@@ -137,6 +148,7 @@ static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
   "max_scalar"_kj,
   "min_scalar"_kj,
   "nullif"_kj,
+  "octet_length"_kj,
   "printf"_kj,
   "quote"_kj,
   "random"_kj,
@@ -169,6 +181,7 @@ static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
   "julianday"_kj,
   "unixepoch"_kj,
   "strftime"_kj,
+  "timediff"_kj,
   "current_date"_kj,
   "current_time"_kj,
   "current_timestamp"_kj,
@@ -179,6 +192,7 @@ static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
   "group_concat"_kj,
   "max"_kj,
   "min"_kj,
+  "string_agg"_kj,
   "sum"_kj,
   "total"_kj,
 
@@ -249,21 +263,30 @@ static constexpr kj::StringPtr ALLOWED_SQLITE_FUNCTIONS[] = {
   "highlight"_kj,
   "bm25"_kj,
   "snippet"_kj,
+
+  // https://www.sqlite.org/lang_altertable.html
+  // Functions declared in https://sqlite.org/src/file?name=src/alter.c&ci=trunk
+  "sqlite_rename_column"_kj,
+  "sqlite_rename_table"_kj,
+  "sqlite_rename_test"_kj,
+  "sqlite_drop_column"_kj,
+  "sqlite_rename_quotefix"_kj,
 };
 
 enum class PragmaSignature {
   NO_ARG,
   BOOLEAN,
-  OBJECT_NAME
+  OBJECT_NAME,
+  NULL_NUMBER_OR_OBJECT_NAME
 };
 struct PragmaInfo {
   kj::StringPtr name;
   PragmaSignature signature;
 };
 
+// We allowlist these SQLite pragmas (for read only, never with arguments).
 // https://www.sqlite.org/pragma.html
 static constexpr PragmaInfo ALLOWED_PRAGMAS[] = {
-  // We allowlist these SQLite pragmas (for read only, never with arguments).
   { "data_version"_kj, PragmaSignature::NO_ARG },
 
   // We allowlist some SQLite pragmas for changing internal state
@@ -282,6 +305,9 @@ static constexpr PragmaInfo ALLOWED_PRAGMAS[] = {
   { "index_info"_kj, PragmaSignature::OBJECT_NAME },
   { "index_list"_kj, PragmaSignature::OBJECT_NAME },
   { "index_xinfo"_kj, PragmaSignature::OBJECT_NAME },
+
+  // Takes an argument of table name/index name OR a max number of results, or nothing
+  { "quick_check"_kj, PragmaSignature::NULL_NUMBER_OR_OBJECT_NAME }
 };
 
 }  // namespace
@@ -291,10 +317,10 @@ static constexpr PragmaInfo ALLOWED_PRAGMAS[] = {
 SqliteDatabase::Regulator SqliteDatabase::TRUSTED;
 
 SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path) {
-  KJ_IF_MAYBE(rootedPath, vfs.tryAppend(path)) {
+  KJ_IF_SOME(rootedPath, vfs.tryAppend(path)) {
     // If we can get the path rooted in the VFS's directory, use the system's default VFS instead
     // TODO(bug): This doesn't honor vfs.options. (This branch is only used on Windows.)
-    SQLITE_CALL_NODB(sqlite3_open_v2(rootedPath->toString().cStr(), &db,
+    SQLITE_CALL_NODB(sqlite3_open_v2(rootedPath.toString().cStr(), &db,
                                     SQLITE_OPEN_READONLY, nullptr));
   } else {
     SQLITE_CALL_NODB(sqlite3_open_v2(path.toString().cStr(), &db,
@@ -319,10 +345,10 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs, kj::PathPtr path, kj::WriteMode m
   }
   KJ_REQUIRE(kj::has(mode, kj::WriteMode::MODIFY), "SQLite doesn't support create-exclusive mode");
 
-  KJ_IF_MAYBE(rootedPath, vfs.tryAppend(path)) {
+  KJ_IF_SOME(rootedPath, vfs.tryAppend(path)) {
     // If we can get the path rooted in the VFS's directory, use the system's default VFS instead
     // TODO(bug): This doesn't honor vfs.options. (This branch is only used on Windows.)
-    SQLITE_CALL_NODB(sqlite3_open_v2(rootedPath->toString().cStr(), &db,
+    SQLITE_CALL_NODB(sqlite3_open_v2(rootedPath.toString().cStr(), &db,
                                     flags, nullptr));
   } else {
     SQLITE_CALL_NODB(sqlite3_open_v2(path.toString().cStr(), &db,
@@ -347,23 +373,23 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
 }
 
 void SqliteDatabase::notifyWrite() {
-  KJ_IF_MAYBE(cb, onWriteCallback) {
-    (*cb)();
+  KJ_IF_SOME(cb, onWriteCallback) {
+    cb();
   }
 }
 
 kj::StringPtr SqliteDatabase::getCurrentQueryForDebug() {
-  KJ_IF_MAYBE(s, currentStatement) {
-    return sqlite3_normalized_sql(s);
+  KJ_IF_SOME(s, currentStatement) {
+    return sqlite3_normalized_sql(&s);
   } else {
     return "(no statement is running)";
   }
 }
 
+// Set up the regulator that will be used for authorizer callbacks while preparing this
+// statement.
 kj::Own<sqlite3_stmt> SqliteDatabase::prepareSql(
     Regulator& regulator, kj::StringPtr sqlCode, uint prepFlags, Multi multi) {
-  // Set up the regulator that will be used for authorizer callbacks while preparing this
-  // statement.
   KJ_ASSERT(currentRegulator == nullptr, "recursive prepareSql()?");
   KJ_DEFER(currentRegulator = nullptr);
   currentRegulator = regulator;
@@ -386,9 +412,22 @@ kj::Own<sqlite3_stmt> SqliteDatabase::prepareSql(
 
       case MULTI:
         if (tail != sqlCode.end()) {
+          // There are more statements after this one, so execute this statement now.
+
           SQLITE_REQUIRE(sqlite3_bind_parameter_count(result) == 0,
               "When executing multiple SQL statements in a single call, only the last statement "
               "can have parameters.");
+
+          // Be sure to call the onWrite callback if necessary for this statement.
+          KJ_IF_SOME(cb, onWriteCallback) {
+            if (!sqlite3_stmt_readonly(result)) {
+              // The callback is allowed to invoke queries of its own, so we have to un-set the
+              // regulator while we call it.
+              currentRegulator = nullptr;
+              KJ_DEFER(currentRegulator = regulator);
+              cb();
+            }
+          }
 
           // This isn't the last statement in the code. Execute it immediately.
           int err = sqlite3_step(result);
@@ -421,11 +460,11 @@ bool SqliteDatabase::isAuthorized(int actionCode,
     return false;
   });
 
-  KJ_IF_MAYBE(t, triggerName) {
-    if (!regulator.isAllowedTrigger(*t)) {
+  KJ_IF_SOME(t, triggerName) {
+    if (!regulator.isAllowedTrigger(t)) {
       // Log an error because it seems really suspicious if a trigger runs when it's not allowed.
       // I want to understand if this can even happen.
-      KJ_LOG(ERROR, "disallowed trigger somehow ran in trusted scope?", *t, kj::getStackTrace());
+      KJ_LOG(ERROR, "disallowed trigger somehow ran in trusted scope?", t, kj::getStackTrace());
 
       // TODO(security): Is it better to return SQLITE_IGNORE to ignore the trigger? I don't fully
       //   understand the implications of SQLITE_IGNORE. The documentation mentions that in the
@@ -436,10 +475,28 @@ bool SqliteDatabase::isAuthorized(int actionCode,
     }
   }
 
-  KJ_IF_MAYBE(d, dbName) {
-    if (*d != "main"_kj) {
-      // We don't allow opening multiple databases (including temporary databases), as our storage
-      // engine is not designed for this at present.
+  // For some reason, for these two operations, SQLite sends the DB Name through as param1, with
+  // the table name (for ALTER_TABLE) in param2 instead of param1 like all other table operations.
+  // For simplicity, and because the following comment precedes sqlite3_set_authorizer in sqlite.h:
+  //
+  //     > The 5th parameter to the authorizer callback is the name of the database
+  //     > ("main", "temp", etc.) if applicable.
+  //
+  // we are treating this as an SQLite bug and swapping the values around.
+  if (actionCode == SQLITE_ALTER_TABLE || actionCode == SQLITE_DETACH) {
+    auto swap = param1; // contains dbName
+    param1 = param2; // contains table name (for SQLITE_ALTER_TABLE, null otherwise)
+    param2 = dbName; // should always be null
+    dbName = swap;
+  }
+
+  KJ_IF_SOME(d, dbName) {
+    if (d == "temp"_kj) {
+      return isAuthorizedTemp(actionCode, param1, param2, regulator);
+    } else if (d != "main"_kj) {
+      // We don't allow opening multiple databases (except for 'main' and the 'temp'
+      // temporary database), as our storage engine is not designed to track multiple
+      // files on-disk.
       return false;
     }
   }
@@ -471,10 +528,8 @@ bool SqliteDatabase::isAuthorized(int actionCode,
       KJ_ASSERT(param2 == nullptr);
       return regulator.isAllowedName(KJ_ASSERT_NONNULL(param1));
 
-    case SQLITE_ALTER_TABLE        :   /* Database Name   Table Name      */
-      // Why is the database name passed redundantly here? Weird.
-      KJ_ASSERT(KJ_ASSERT_NONNULL(param1) == "main"_kj);
-      return regulator.isAllowedName(KJ_ASSERT_NONNULL(param2));
+    case SQLITE_ALTER_TABLE        :   /* Table Name      NULL (modified) */
+      return regulator.isAllowedName(KJ_ASSERT_NONNULL(param1));
 
     case SQLITE_READ               :   /* Table Name      Column Name     */
     case SQLITE_UPDATE             :   /* Table Name      Column Name     */
@@ -517,10 +572,10 @@ bool SqliteDatabase::isAuthorized(int actionCode,
           // TODO function_list & pragma_list should be authorized but return
           // ALLOWED_SQLITE_FUNCTIONS & ALLOWED_[READ|WRITE]_PRAGMAS
           // respectively
-        } else if (pragma == "table_info") {
+        } else if (pragma == "table_info" || pragma == "table_xinfo") {
           // Allow if the specific named table is not protected.
-          KJ_IF_MAYBE (name, param2) {
-            return regulator.isAllowedName(*name);
+          KJ_IF_SOME (name, param2) {
+            return regulator.isAllowedName(name);
           } else {
             return false; // shouldn't happen?
           }
@@ -537,7 +592,7 @@ bool SqliteDatabase::isAuthorized(int actionCode,
         PragmaSignature sig = KJ_UNWRAP_OR(allowedPragmas.find(pragma), return false);
         switch (sig) {
           case PragmaSignature::NO_ARG:
-            return param2 == nullptr;
+            return param2 == kj::none;
           case PragmaSignature::BOOLEAN: {
             // We allow omitting the argument in order to read back the current value.
             auto val = KJ_UNWRAP_OR(param2, return true).asArray();
@@ -566,6 +621,14 @@ bool SqliteDatabase::isAuthorized(int actionCode,
             auto val = KJ_UNWRAP_OR(param2, return false);
             return regulator.isAllowedName(val);
           }
+          case PragmaSignature::NULL_NUMBER_OR_OBJECT_NAME: {
+            // Argument is not required
+            auto val = KJ_UNWRAP_OR(param2, return true);
+            // val is allowed if it parses to an integer
+            if (val.tryParseAs<uint>() != kj::none) return true;
+            // Otherwise, val must be the name of an object the user has access to
+            return regulator.isAllowedName(val);
+          }
         }
         KJ_UNREACHABLE;
       }
@@ -591,8 +654,8 @@ bool SqliteDatabase::isAuthorized(int actionCode,
     case SQLITE_DROP_VTABLE        :   /* Table Name      Module Name     */
       // Virtual tables are tables backed by some native-code callbacks. We don't support these except for FTS5 (Full Text Search) https://www.sqlite.org/fts5.html
       {
-        KJ_IF_MAYBE (moduleName, param2) {
-          if (*moduleName == "fts5") {
+        KJ_IF_SOME (moduleName, param2) {
+          if (moduleName == "fts5") {
             return true;
           }
         }
@@ -600,7 +663,7 @@ bool SqliteDatabase::isAuthorized(int actionCode,
       }
 
     case SQLITE_ATTACH             :   /* Filename        NULL            */
-    case SQLITE_DETACH             :   /* Database Name   NULL            */
+    case SQLITE_DETACH             :   /* Table Name      NULL (modified) */
       // We do not support attached databases. It seems unlikely that we ever will.
       return false;
 
@@ -631,10 +694,23 @@ bool SqliteDatabase::isAuthorized(int actionCode,
   }
 }
 
-void SqliteDatabase::setupSecurity() {
-  // Set up security restrictions.
-  // See: https://www.sqlite.org/security.html
+// Temp databases have very restricted operations
+bool SqliteDatabase::isAuthorizedTemp(int actionCode,
+    const kj::Maybe<kj::StringPtr> &param1, const kj::Maybe<kj::StringPtr> &param2,
+    Regulator &regulator) {
 
+  switch (actionCode) {
+    case SQLITE_READ               :   /* Table Name      Column Name     */
+    case SQLITE_UPDATE             :   /* Table Name      Column Name     */
+      return regulator.isAllowedName(KJ_ASSERT_NONNULL(param1));
+    default:
+      return false;
+  }
+}
+
+// Set up security restrictions.
+// See: https://www.sqlite.org/security.html
+void SqliteDatabase::setupSecurity() {
   // 1. Set defensive mode.
   SQLITE_CALL_NODB(sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr));
 
@@ -644,8 +720,10 @@ void SqliteDatabase::setupSecurity() {
   sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 1000000);
   sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, 100000);
   sqlite3_limit(db, SQLITE_LIMIT_COLUMN, 100);
-  sqlite3_limit(db, SQLITE_LIMIT_EXPR_DEPTH, 20);
-  sqlite3_limit(db, SQLITE_LIMIT_COMPOUND_SELECT, 3);
+  sqlite3_limit(db, SQLITE_LIMIT_EXPR_DEPTH, 100);
+  // Enforces limits on UNION/UNION ALL/INTERSECT/etc
+  // https://www.sqlite.org/limits.html#max_compound_select
+  sqlite3_limit(db, SQLITE_LIMIT_COMPOUND_SELECT, 5);
   sqlite3_limit(db, SQLITE_LIMIT_VDBE_OP, 25000);
   sqlite3_limit(db, SQLITE_LIMIT_FUNCTION_ARG, 32);
   sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0);
@@ -707,6 +785,9 @@ SqliteDatabase::Statement SqliteDatabase::prepare(Regulator& regulator, kj::Stri
 SqliteDatabase::Query::Query(SqliteDatabase& db, Regulator& regulator, Statement& statement,
                              kj::ArrayPtr<const ValuePtr> bindings)
     : db(db), regulator(regulator), statement(statement) {
+  // If the statement was used for a previous query, then its row counters contain data from that
+  // query's execution. Reset them to zero.
+  resetRowCounters();
   init(bindings);
 }
 
@@ -738,9 +819,9 @@ void SqliteDatabase::Query::checkRequirements(size_t size) {
   SQLITE_REQUIRE(size == sqlite3_bind_parameter_count(statement),
       "Wrong number of parameter bindings for SQL query.");
 
-  KJ_IF_MAYBE(cb, db.onWriteCallback) {
+  KJ_IF_SOME(cb, db.onWriteCallback) {
     if (!sqlite3_stmt_readonly(statement)) {
-      (*cb)();
+      cb();
     }
   }
 }
@@ -773,6 +854,22 @@ void SqliteDatabase::Query::bind(uint i, ValuePtr value) {
       SQLITE_CALL(sqlite3_bind_null(statement, i+1));
     }
   }
+}
+
+uint64_t SqliteDatabase::Query::getRowsRead() {
+  KJ_REQUIRE(statement != nullptr);
+  return sqlite3_stmt_status(statement, LIBSQL_STMTSTATUS_ROWS_READ, 0);
+}
+
+uint64_t SqliteDatabase::Query::getRowsWritten() {
+  KJ_REQUIRE(statement != nullptr);
+  return sqlite3_stmt_status(statement, LIBSQL_STMTSTATUS_ROWS_WRITTEN, 0);
+}
+
+void SqliteDatabase::Query::resetRowCounters() {
+  KJ_REQUIRE(statement != nullptr);
+  sqlite3_stmt_status(statement, LIBSQL_STMTSTATUS_ROWS_READ, 1);
+  sqlite3_stmt_status(statement, LIBSQL_STMTSTATUS_ROWS_WRITTEN, 1);
 }
 
 void SqliteDatabase::Query::bind(uint i, kj::ArrayPtr<const byte> value) {
@@ -933,9 +1030,8 @@ static int replaced_lstat(const char* path, struct stat* stats) {
 
 };
 
+// The sqlite3_file implementation we use when wrapping the native filesystem.
 struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
-  // The sqlite3_file implementation we use when wrapping the native filesystem.
-
   const Vfs* vfs;
   int rootFd;
 
@@ -945,15 +1041,14 @@ struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
   static const sqlite3_io_methods METHOD_TABLE;
 };
 
+// This completely nutso template generates wrapper functions for each of the function pointer
+// members of sqlite3_vfs. The wrapper function temporarily sets `currentVfsRoot` to the FD
+// of the directory from the SqliteDatabase::Vfs instance in use, then invokes the same function
+// on the underlying native VFS.
 template <typename Result, typename... Params,
           Result (*sqlite3_vfs::*slot)(sqlite3_vfs* vfs, Params...)>
 struct SqliteDatabase::Vfs::MethodWrapperHack<
     Result (*sqlite3_vfs::*)(sqlite3_vfs* vfs, Params...), slot> {
-  // This completely nutso template generates wrapper functions for each of the function pointer
-  // members of sqlite3_vfs. The wrapper function temporarily sets `currentVfsRoot` to the FD
-  // of the directory from the SqliteDatabase::Vfs instance in use, then invokes the same function
-  // on the underlying native VFS.
-
   static Result wrapper(sqlite3_vfs* vfs, Params... params) noexcept {
     auto& self = *reinterpret_cast<SqliteDatabase::Vfs*>(vfs->pAppData);
     KJ_ASSERT(currentVfsRoot == AT_FDCWD);
@@ -963,15 +1058,14 @@ struct SqliteDatabase::Vfs::MethodWrapperHack<
   }
 };
 
+// Specialization of MethodWrapperHack for wrapping methods of sqlite_file, aka
+// sqlite3_io_methods. Unfortunately, some file methods go back and perform filesystem ops. In
+// particular, accessing shared memory associated with a file actually opens another adjacent
+// file.
 template <typename Result, typename... Params,
           Result (*sqlite3_io_methods::*slot)(sqlite3_file* file, Params...)>
 struct SqliteDatabase::Vfs::MethodWrapperHack<
     Result (*sqlite3_io_methods::*)(sqlite3_file* file, Params...), slot> {
-  // Specialization of MethodWrapperHack for wrapping methods of sqlite_file, aka
-  // sqlite3_io_methods. Unfortunately, some file methods go back and perform filesystem ops. In
-  // particular, accessing shared memory associated with a file actually opens another adjacent
-  //file.
-
   static Result wrapper(sqlite3_file* file, Params... params) noexcept {
     auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
     file = wrapper->getWrapped();
@@ -1020,17 +1114,17 @@ const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABL
 #undef WRAP
 };
 
+// The native VFS gives us the ability to override its syscalls. We need to do so, in
+// particular to force them to use the *at() versions of the calls that accept a directory FD
+// to use as the root.
+//
+// Unfortunately, these overrides are global for the process, with no ability to pass down any
+// context to them. So, we stash the current root FD in `currentVfsRoot` whenever we call into
+// the native VFS. We also don't want to interfere with anything else in the process that is
+// using SQLite directly, so we make sure that when we're not specifically trying to invoke
+// our wrapper, then `currentVfsRoot` is `AT_FDCWD`, which causes the *at() syscalls to match
+// their non-at() versions.
 sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
-  // The native VFS gives us the ability to override its syscalls. We need to do so, in
-  // particular to force them to use the *at() versions of the calls that accept a directory FD
-  // to use as the root.
-  //
-  // Unfortunately, these overrides are global for the process, with no ability to pass down any
-  // context to them. So, we stash the current root FD in `currentVfsRoot` whenever we call into
-  // the native VFS. We also don't want to interfere with anything else in the process that is
-  // using SQLite directly, so we make sure that when we're not specifically trying to invoke
-  // our wrapper, then `currentVfsRoot` is `AT_FDCWD`, which causes the *at() syscalls to match
-  // their non-at() versions.
   static bool registerOnce KJ_UNUSED = ([&]() {
 #define REPLACE_SYSCALL(name) \
     native.xSetSystemCall(&native, #name, (sqlite3_syscall_ptr)replaced_##name);
@@ -1135,15 +1229,14 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
 // one where `getFd()` returns null. This is mainly used for unit tests which want to use in-memory
 // directories.
 
+// Implementation of sqlite3_file.
+//
+// Weirdly, for sqlite3_file, SQLite uses a C++-like inheritance approach, with a separate
+// virtual table that can be shared among all files of the same type. This is different from the
+// way sqlite3_vfs works, where the function pointers are inlined into the sqlite3_vfs struct.
+// In any case, as a result, `FileImpl`, unlike `VfsImpl`, is NOT just a namespace struct, but
+// an actual instance.
 struct SqliteDatabase::Vfs::FileImpl: public sqlite3_file {
-  // Implementation of sqlite3_file.
-  //
-  // Weirdly, for sqlite3_file, SQLite uses a C++-like inheritance approach, with a separate
-  // virtual table that can be shared among all files of the same type. This is different from the
-  // way sqlite3_vfs works, where the function pointers are inlined into the sqlite3_vfs struct.
-  // In any case, as a result, `FileImpl`, unlike `VfsImpl`, is NOT just a namespace struct, but
-  // an actual instance.
-
   const Vfs& vfs;
   kj::Maybe<const kj::File&> writableFile;
   kj::Own<const kj::ReadableFile> file;
@@ -1370,13 +1463,12 @@ const sqlite3_io_methods SqliteDatabase::Vfs::FileImpl::FILE_METHOD_TABLE = {
 #undef WRAP_METHOD
 };
 
+// SQLite VFS implementation based on abstract `kj::Directory`. This is used only when the
+// directory is NOT a true disk directory.
+//
+// This is a namespace-struct defining static methods to fill in the function pointers of
+// sqlite3_vfs.
 sqlite3_vfs SqliteDatabase::Vfs::makeKjVfs() {
-  // SQLite VFS implementation based on abstract `kj::Directory`. This is used only when the
-  // directory is NOT a true disk directory.
-  //
-  // This is a namespace-struct defining static methods to fill in the function pointers of
-  // sqlite3_vfs.
-
   return {
     .iVersion = kj::min(3, native.iVersion),
     .szOsFile = sizeof(FileImpl),
@@ -1753,8 +1845,8 @@ SqliteDatabase::Vfs::Vfs(const kj::Directory& directory, Options options)
 #if _WIN32
   vfs = kj::heap(makeKjVfs());
 #else
-  KJ_IF_MAYBE(fd, directory.getFd()) {
-    rootFd = *fd;
+  KJ_IF_SOME(fd, directory.getFd()) {
+    rootFd = fd;
     vfs = kj::heap(makeWrappedNativeVfs());
   } else {
     vfs = kj::heap(makeKjVfs());
@@ -1792,7 +1884,7 @@ kj::Maybe<kj::Path> SqliteDatabase::Vfs::tryAppend(kj::PathPtr suffix) const {
 #else
 kj::Maybe<kj::Path> SqliteDatabase::Vfs::tryAppend(kj::PathPtr suffix) const {
   // TODO(someday): consider implementing this on other platforms
-  return nullptr;
+  return kj::none;
 }
 #endif
 

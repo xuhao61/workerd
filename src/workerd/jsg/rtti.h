@@ -9,6 +9,8 @@
 // Can be used to generate typescript type, dynamically invoke methods, fuzz, check backward
 // compatibility etc.
 
+#include <kj/map.h>
+#include <capnp/message.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/rtti.capnp.h>
 #include <kj/map.h>
@@ -17,22 +19,21 @@ namespace workerd::jsg::rtti {
 
 namespace impl {
 
+// Struct for partial specialization.
 template <typename Configuration, typename T, typename Enable = void>
 struct BuildRtti;
-// Struct for partial specialization.
 
 } // namespace impl
 
+// User's entry point into rtti.
+// Builder owns capnp builder for all the objects it returns, so usual capnp builder
+// rules apply.
+// The rtti describes object structure and their types.
+// All structure references in rtti are stored by name. The builder maintains a symbol table
+// which can be used to resolve them. It is guaranteed that the table is full enough to
+// interpret all types passed through a given builder.
 template<typename MetaConfiguration>
 class Builder {
-  // User's entry point into rtti.
-  // Builder owns capnp builder for all the objects it returns, so usual capnp builder
-  // rules apply.
-  // The rtti describes object structure and their types.
-  // All structure references in rtti are stored by name. The builder maintains a symbol table
-  // which can be used to resolve them. It is guaranteed that the table is full enough to
-  // interpret all types passed through a given builder.
-
 public:
   const MetaConfiguration config;
 
@@ -48,8 +49,8 @@ public:
   template<typename T>
   Structure::Reader structure() {
     auto name = jsg::fullyQualifiedTypeName(typeid(T));
-    KJ_IF_MAYBE(builder, symbols.find(name)) {
-      return (*builder)->template getRoot<Structure>();
+    KJ_IF_SOME(builder, symbols.find(name)) {
+      return builder->template getRoot<Structure>();
     }
 
     auto& builder = symbols.insert(
@@ -140,9 +141,48 @@ struct BuildRtti<Configuration, bool> {
 };
 
 template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsBoolean> {
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setBoolt(); }
+};
+
+template<typename Configuration>
 struct BuildRtti<Configuration, v8::Value> {
   static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setUnknown(); }
 };
+
+template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsValue> {
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setUnknown(); }
+};
+
+template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsRegExp> {
+  // This isn't really unknown but we currently do not expose these types at all, so
+  // this is ok for now.
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setUnknown(); }
+};
+
+template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsMap> {
+  // This isn't really unknown but we currently do not expose these types at all, so
+  // this is ok for now.
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setUnknown(); }
+};
+
+template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsSet> {
+  // This isn't really unknown but we currently do not expose these types at all, so
+  // this is ok for now.
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setUnknown(); }
+};
+
+template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsSymbol> {
+  // This isn't really unknown but we currently do not expose these types at all, so
+  // this is ok for now.
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setUnknown(); }
+};
+
 
 // Numbers
 
@@ -164,7 +204,11 @@ struct BuildRtti<Configuration, T> { \
   F(unsigned long) \
   F(long long) \
   F(unsigned long long) \
-  F(double)
+  F(double) \
+  F(jsg::JsNumber) \
+  F(jsg::JsInt32) \
+  F(jsg::JsUint32) \
+  F(jsg::JsBigInt)
 
 FOR_EACH_NUMBER_TYPE(DECLARE_NUMBER_TYPE)
 
@@ -184,8 +228,7 @@ struct BuildRtti<Configuration, T> { \
   F(kj::StringPtr) \
   F(v8::String) \
   F(ByteString) \
-  F(UsvString) \
-  F(UsvStringPtr)
+  F(jsg::JsString)
 
 FOR_EACH_STRING_TYPE(DECLARE_STRING_TYPE)
 
@@ -204,6 +247,11 @@ struct BuildRtti<Configuration, jsg::Object> {
   static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setObject(); }
 };
 
+template<typename Configuration>
+struct BuildRtti<Configuration, jsg::JsObject> {
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) { builder.setObject(); }
+};
+
 // References
 
 template<typename Configuration, typename T>
@@ -215,6 +263,13 @@ struct BuildRtti<Configuration, Ref<T>> {
 
 template<typename Configuration, typename T>
 struct BuildRtti<Configuration, V8Ref<T>> {
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) {
+    BuildRtti<Configuration, T>::build(builder, rtti);
+  }
+};
+
+template<typename Configuration, typename T>
+struct BuildRtti<Configuration, JsRef<T>> {
   static void build(Type::Builder builder, Builder<Configuration>& rtti) {
     BuildRtti<Configuration, T>::build(builder, rtti);
   }
@@ -301,6 +356,15 @@ struct BuildRtti<Configuration, T<V>> { \
   F(kj::ArrayPtr) \
   F(jsg::Sequence)
 
+template<typename Configuration> \
+struct BuildRtti<Configuration, jsg::JsArray> { \
+  static void build(Type::Builder builder, Builder<Configuration>& rtti) {
+    auto array = builder.initArray();
+    BuildRtti<Configuration, JsValue>::build(array.initElement(), rtti);
+    array.setName("jsg::JsArray");
+  }
+};
+
 FOR_EACH_ARRAY_TYPE(DECLARE_ARRAY_TYPE)
 
 #undef FOR_EACH_ARRAY_TYPE
@@ -378,8 +442,10 @@ struct BuildRtti<Configuration, T> { \
   F(jsg::BufferSource, BuiltinType::Type::JSG_BUFFER_SOURCE) \
   F(kj::Date, BuiltinType::Type::KJ_DATE) \
   F(v8::ArrayBufferView, BuiltinType::Type::V8_ARRAY_BUFFER_VIEW) \
+  F(v8::ArrayBuffer, BuiltinType::Type::V8_ARRAY_BUFFER) \
   F(v8::Function, BuiltinType::Type::V8_FUNCTION) \
-  F(v8::Uint8Array, BuiltinType::Type::V8_UINT8_ARRAY)
+  F(v8::Uint8Array, BuiltinType::Type::V8_UINT8_ARRAY) \
+  F(jsg::JsDate, BuiltinType::Type::KJ_DATE)
 
 FOR_EACH_BUILTIN_TYPE(DECLARE_BUILTIN_TYPE)
 
@@ -398,6 +464,7 @@ struct BuildRtti<Configuration, T> { \
 
 #define FOR_EACH_JSG_IMPL_TYPE(F, ...) \
   F(jsg::Lock, JsgImplType::Type::JSG_LOCK) \
+  F(jsg::Name, JsgImplType::Type::JSG_NAME) \
   F(jsg::SelfRef, JsgImplType::Type::JSG_SELF_REF) \
   F(jsg::Unimplemented, JsgImplType::Type::JSG_UNIMPLEMENTED) \
   F(jsg::Varargs, JsgImplType::Type::JSG_VARARGS) \
@@ -478,11 +545,13 @@ struct BuildRtti<Configuration, const T&> {
 
 // Structs
 
+// count all members in the structure
 struct MemberCounter {
-  // count all members in the structure
+  template <typename Type, typename GetNamedMethod, GetNamedMethod getNamedMethod>
+  inline void registerWildcardProperty() { /* not a member */}
 
   template<const char* name, typename Method, Method method>
-  inline void registerMethod() { ++count; }
+  inline void registerMethod() { ++members; }
 
   template<typename Method, Method method>
   inline void registerCallable() { /* not a member */ }
@@ -499,35 +568,47 @@ struct MemberCounter {
   template<const char* name, typename Method, Method method>
   inline void registerAsyncIterable() { /* not a member */ }
 
-  template<typename Type, const char* name>
-  inline void registerNestedType() { ++count; }
-
-  template<const char* name, typename Property, auto property>
-  inline void registerStructProperty() { ++count; }
-
-  template<const char* name, typename Getter, Getter getter>
-  inline void registerReadonlyPrototypeProperty() { ++count; }
-
-  template<const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
-  inline void registerPrototypeProperty() { ++count; }
-
-  template<const char* name, typename Getter, Getter getter>
-  inline void registerReadonlyInstanceProperty() { ++count; }
-
-  template<typename T>
-  inline void registerReadonlyInstanceProperty(kj::StringPtr, T value) { ++count; }
-
-  template<const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
-  inline void registerInstanceProperty() { ++count; }
-
-  template<const char* name, typename Getter, Getter getter, bool readOnly>
-  inline void registerLazyInstanceProperty() { ++count; }
-
-  template<const char* name, typename T>
-  inline void registerStaticConstant(T value) { ++count; }
+  template<const char* name, typename Method, Method method>
+  inline void registerDispose() { /* not a member */ }
 
   template<const char* name, typename Method, Method method>
-  inline void registerStaticMethod() { ++count; }
+  inline void registerAsyncDispose() { /* not a member */ }
+
+  template<typename Type, const char* name>
+  inline void registerNestedType() { ++members; }
+
+  template<const char* name, typename Property, auto property>
+  inline void registerStructProperty() { ++members; }
+
+  template<const char* name, typename Getter, Getter getter>
+  inline void registerReadonlyPrototypeProperty() { ++members; }
+
+  template<const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
+  inline void registerPrototypeProperty() { ++members; }
+
+  template<const char* name, typename Getter, Getter getter>
+  inline void registerReadonlyInstanceProperty() { ++members; }
+
+  template<typename T>
+  inline void registerReadonlyInstanceProperty(kj::StringPtr, T value) { ++members; }
+
+  template<const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
+  inline void registerInstanceProperty() { ++members; }
+
+  template<const char* name, typename Getter, Getter getter, bool readOnly>
+  inline void registerLazyInstanceProperty() { ++members; }
+
+  template<const char* name, const char* moduleName, bool readOnly>
+  inline void registerLazyJsInstanceProperty() { ++members; }
+
+  template<const char* name, typename Getter, Getter getter>
+  inline void registerInspectProperty() { /* not included */ }
+
+  template<const char* name, typename T>
+  inline void registerStaticConstant(T value) { ++members; }
+
+  template<const char* name, typename Method, Method method>
+  inline void registerStaticMethod() { ++members; }
 
   inline void registerTypeScriptRoot() { /* not a member */ }
 
@@ -537,20 +618,28 @@ struct MemberCounter {
   template<const char* tsDefine>
   inline void registerTypeScriptDefine() { /* not a member */ }
 
-  size_t count = 0;
+  inline void registerJsBundle(Bundle::Reader bundle) {
+    modules += bundle.getModules().size();
+  }
+
+  size_t members = 0;
+  size_t modules = 0;
 };
 
 template<typename Self, typename Configuration>
 struct MembersBuilder {
   Structure::Builder structure;
   capnp::List<Member>::Builder members;
+  capnp::List<Module>::Builder modules;
   Builder<Configuration>& rtti;
-  uint index = 0;
+  uint memberIndex = 0;
+  uint moduleIndex = 0;
 
   MembersBuilder(Structure::Builder structure,
                  capnp::List<Member>::Builder members,
+                 capnp::List<Module>::Builder modules,
                  Builder<Configuration>& rtti)
-    : structure(structure), members(members), rtti(rtti) { }
+    : structure(structure), members(members), modules(modules), rtti(rtti) { }
 
   template<typename Type>
   inline void registerInherit() {
@@ -564,14 +653,14 @@ struct MembersBuilder {
 
   template<typename Type, const char* name>
   inline void registerNestedType() {
-    auto nested = members[index++].initNested();
+    auto nested = members[memberIndex++].initNested();
     nested.setName(name);
     BuildRtti<Configuration, Type>::build(nested.initStructure(), rtti);
   }
 
   template<const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
   inline void registerInstanceProperty() {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     using GetterTraits = FunctionTraits<Getter>;
     BuildRtti<Configuration, typename GetterTraits::ReturnType>::build(prop.initType(), rtti);
@@ -579,7 +668,7 @@ struct MembersBuilder {
 
   template<const char* name, typename Getter, Getter getter>
   inline void registerReadonlyInstanceProperty() {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     prop.setReadonly(true);
     using GetterTraits = FunctionTraits<Getter>;
@@ -588,7 +677,7 @@ struct MembersBuilder {
 
   template<typename T>
   inline void registerReadonlyInstanceProperty(kj::StringPtr name, T value) {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     prop.setReadonly(true);
     BuildRtti<Configuration, T>::build(prop.initType(), rtti);
@@ -596,7 +685,7 @@ struct MembersBuilder {
 
   template<const char* name, typename Getter, Getter getter, bool readOnly>
   inline void registerLazyInstanceProperty() {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     prop.setReadonly(readOnly);
     prop.setLazy(true);
@@ -604,9 +693,21 @@ struct MembersBuilder {
     BuildRtti<Configuration, typename GetterTraits::ReturnType>::build(prop.initType(), rtti);
   }
 
+
+  template<const char* name, const char* moduleName, bool readOnly>
+  inline void registerLazyJsInstanceProperty() {
+    auto prop = members[memberIndex++].initProperty();
+    prop.setName(name);
+    prop.setReadonly(readOnly);
+    prop.setLazy(true);
+    auto jsBuiltin = prop.initType().initJsBuiltin();
+    jsBuiltin.setModule(moduleName);
+    jsBuiltin.setExport(name);
+  }
+
   template<const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
   inline void registerPrototypeProperty() {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     prop.setPrototype(true);
     using GetterTraits = FunctionTraits<Getter>;
@@ -615,7 +716,7 @@ struct MembersBuilder {
 
   template<const char* name, typename Getter, Getter getter>
   inline void registerReadonlyPrototypeProperty() {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     prop.setPrototype(true);
     prop.setReadonly(true);
@@ -623,9 +724,12 @@ struct MembersBuilder {
     BuildRtti<Configuration, typename GetterTraits::ReturnType>::build(prop.initType(), rtti);
   }
 
+  template<const char* name, typename Getter, Getter getter>
+  inline void registerInspectProperty() { }
+
   template<const char* name, typename T>
   inline void registerStaticConstant(T value) {
-    auto constant = members[index++].initConstant();
+    auto constant = members[memberIndex++].initConstant();
     constant.setName(name);
     constant.setValue(value);
     // BuildRtti<Configuration, T>::build(constant.initType());
@@ -633,14 +737,14 @@ struct MembersBuilder {
 
   template<const char* name, typename Property, Property Self::*property>
   void registerStructProperty() {
-    auto prop = members[index++].initProperty();
+    auto prop = members[memberIndex++].initProperty();
     prop.setName(name);
     BuildRtti<Configuration, Property>::build(prop.initType(), rtti);
   }
 
   template<const char* name, typename Method, Method>
   inline void registerMethod() {
-    auto method = members[index++].initMethod();
+    auto method = members[memberIndex++].initMethod();
 
     method.setName(name);
     using Traits = FunctionTraits<Method>;
@@ -661,7 +765,7 @@ struct MembersBuilder {
 
   template<const char* name, typename Method, Method>
   inline void registerStaticMethod() {
-    auto method = members[index++].initMethod();
+    auto method = members[memberIndex++].initMethod();
 
     method.setName(name);
     method.setStatic(true);
@@ -695,6 +799,30 @@ struct MembersBuilder {
     TupleRttiBuilder<Configuration, Args>::build(method.initArgs(std::tuple_size_v<Args>), rtti);
   }
 
+  template<const char* name, typename Method, Method>
+  inline void registerDispose() {
+    structure.setDisposable(true);
+
+    auto method = structure.initDispose();
+    method.setName(name);
+    using Traits = FunctionTraits<Method>;
+    BuildRtti<Configuration, typename Traits::ReturnType>::build(method.initReturnType(), rtti);
+    using Args = typename Traits::ArgsTuple;
+    TupleRttiBuilder<Configuration, Args>::build(method.initArgs(std::tuple_size_v<Args>), rtti);
+  }
+
+  template<const char* name, typename Method, Method>
+  inline void registerAsyncDispose() {
+    structure.setAsyncDisposable(true);
+
+    auto method = structure.initAsyncDispose();
+    method.setName(name);
+    using Traits = FunctionTraits<Method>;
+    BuildRtti<Configuration, typename Traits::ReturnType>::build(method.initReturnType(), rtti);
+    using Args = typename Traits::ArgsTuple;
+    TupleRttiBuilder<Configuration, Args>::build(method.initArgs(std::tuple_size_v<Args>), rtti);
+  }
+
   inline void registerTypeScriptRoot() {
     structure.setTsRoot(true);
   }
@@ -708,18 +836,31 @@ struct MembersBuilder {
   inline void registerTypeScriptDefine() {
     structure.setTsDefine(tsDefine);
   }
+
+  inline void registerJsBundle(Bundle::Reader bundle) {
+    for (auto module: bundle.getModules()) {
+      auto m = modules[moduleIndex++];
+      m.setSpecifier(module.getName());
+      m.setTsDeclarations(module.getTsDeclaration());
+    }
+  }
+
+  template <typename Type, typename GetNamedMethod, GetNamedMethod getNamedMethod>
+  inline void registerWildcardProperty() {
+    // Nothing to do in this case.
+  }
 };
 
+// true when the T has registerMembers() function generated by JSG_RESOURCE/JSG_STRUCT
 template <typename T, typename = int>
 struct HasRegisterMembers : std::false_type {};
-// true when the T has registerMembers() function generated by JSG_RESOURCE/JSG_STRUCT
 
 template <typename T>
 struct HasRegisterMembers<T, decltype(T::template registerMembers<MemberCounter, T>, 0)> : std::true_type { };
 
+// true when the T has constructor() function
 template <typename T, typename = int>
 struct HasConstructor : std::false_type {};
-// true when the T has constructor() function
 
 template <typename T>
 struct HasConstructor<T, decltype(T::constructor, 0)> : std::true_type { };
@@ -743,14 +884,15 @@ struct BuildRtti<Configuration, T, std::enable_if_t<HasRegisterMembers<T>::value
     } else {
       T::template registerMembers<decltype(counter), T>(counter);
     }
-    auto count = counter.count;
+    auto membersCount = counter.members;
 
     if constexpr (HasConstructor<T>::value) {
-      count++;
+      membersCount++;
     }
 
-    auto members = builder.initMembers(count);
-    MembersBuilder<T, Configuration> membersBuilder(builder, members, rtti);
+    auto members = builder.initMembers(membersCount);
+    auto modules = counter.modules > 0 ? builder.initBuiltinModules(counter.modules) : capnp::List<Module>::Builder();
+    MembersBuilder<T, Configuration> membersBuilder(builder, members, modules, rtti);
     if constexpr (isDetected<GetConfiguration, T>()) {
       T::template registerMembers<decltype(membersBuilder), T>(membersBuilder, rtti.config);
     } else {
@@ -758,7 +900,7 @@ struct BuildRtti<Configuration, T, std::enable_if_t<HasRegisterMembers<T>::value
     }
 
     if constexpr (HasConstructor<T>::value) {
-      auto constructor = members[membersBuilder.index++].initConstructor();
+      auto constructor = members[membersBuilder.memberIndex++].initConstructor();
       using Traits = FunctionTraits<decltype(T::constructor)>;
       using Args = typename Traits::ArgsTuple;
       TupleRttiBuilder<Configuration, Args>::build(constructor.initArgs(std::tuple_size_v<Args>), rtti);

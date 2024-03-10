@@ -65,15 +65,15 @@ kj::String typeName(const std::type_info& type) {
   auto result = fullyQualifiedTypeName(type);
 
   // Strip namespace, if any.
-  KJ_IF_MAYBE(pos, result.findLast(':')) {
-    result = kj::str(result.slice(*pos + 1));
+  KJ_IF_SOME(pos, result.findLast(':')) {
+    result = kj::str(result.slice(pos + 1));
   }
 
   // Strip template args, if any.
   //
   // TODO(someday): Maybe just strip namespaces from each arg?
-  KJ_IF_MAYBE(pos, result.findFirst('<')) {
-    result = kj::str(result.slice(0, *pos));
+  KJ_IF_SOME(pos, result.findFirst('<')) {
+    result = kj::str(result.slice(0, pos));
   }
 
   return kj::mv(result);
@@ -114,20 +114,19 @@ kj::Maybe<v8::Local<v8::Value>> tryMakeDomException(v8::Isolate* isolate,
     return check(value->ToObject(context));
   };
   const auto getInterned = [isolate, context](v8::Local<v8::Object> object, const char* s) {
-    auto name = v8StrIntern(isolate, s);
-    return check(object->Get(context, name));
+    return check(object->Get(context, v8StrIntern(isolate, s)));
   };
 
   if (auto domException = getInterned(global, "DOMException"); domException->IsObject()) {
     if (auto domExceptionCtor = toObject(domException); domExceptionCtor->IsConstructor()) {
       v8::Local<v8::Value> args[2] = {
-        message, v8Str(isolate, errorName)
+        message, v8StrIntern(isolate, errorName)
       };
       return check(domExceptionCtor->CallAsConstructor(context, 2, args));
     }
   }
 
-  return nullptr;
+  return kj::none;
 }
 
 v8::Local<v8::Value> tryMakeDomExceptionOrDefaultError(
@@ -226,9 +225,9 @@ DecodedException decodeTunneledException(v8::Isolate* isolate,
       if (errorType.startsWith("DOMException(")) {
         errorType = errorType.slice(strlen("DOMException("));
         // Check for closing brace
-        KJ_IF_MAYBE(closeParen, errorType.findFirst(')')) {
-          auto errorName = kj::str(errorType.slice(0, *closeParen));
-          auto message = appMessage(errorType.slice(1 + *closeParen));
+        KJ_IF_SOME(closeParen, errorType.findFirst(')')) {
+          auto errorName = kj::str(errorType.slice(0, closeParen));
+          auto message = appMessage(errorType.slice(1 + closeParen));
           result.handle = tryMakeDomExceptionOrDefaultError(isolate, message, errorName);
           break;
         }
@@ -269,6 +268,12 @@ v8::Local<v8::Value> makeInternalError(v8::Isolate* isolate, kj::Exception&& exc
   auto tunneledException = decodeTunneledException(isolate, desc);
 
   if (tunneledException.isInternal) {
+    auto& observer = IsolateBase::from(isolate).getObserver();
+    observer.reportInternalException(exception, {
+      .isInternal = tunneledException.isInternal,
+      .isFromRemote = tunneledException.isFromRemote,
+      .isDurableObjectReset = tunneledException.isDurableObjectReset,
+    });
     // Don't log exceptions that have been explicitly marked with worker_do_not_log or are
     // DISCONNECTED exceptions as these are unlikely to represent bugs worth tracking.
     if (exception.getType() != kj::Exception::Type::DISCONNECTED &&
@@ -279,7 +284,7 @@ v8::Local<v8::Value> makeInternalError(v8::Isolate* isolate, kj::Exception&& exc
     }
 
     if (exception.getType() == kj::Exception::Type::DISCONNECTED) {
-      auto exception = v8::Exception::Error(v8Str(isolate, "Network connection lost."_kj));
+      auto exception = v8::Exception::Error(v8StrIntern(isolate, "Network connection lost."_kj));
       if (tunneledException.isFromRemote) {
         setRemoteError(isolate, exception);
       }
@@ -296,13 +301,29 @@ v8::Local<v8::Value> makeInternalError(v8::Isolate* isolate, kj::Exception&& exc
 }
 
 Value Lock::exceptionToJs(kj::Exception&& exception) {
-  v8::HandleScope scope(v8Isolate);
-  return Value(v8Isolate, makeInternalError(v8Isolate, kj::mv(exception)));
+  return withinHandleScope([&] {
+    return Value(v8Isolate, makeInternalError(v8Isolate, kj::mv(exception)));
+  });
+}
+
+JsRef<JsValue> Lock::exceptionToJsValue(kj::Exception&& exception) {
+  return withinHandleScope([&] {
+    JsValue val = JsValue(makeInternalError(v8Isolate, kj::mv(exception)));
+    return val.addRef(*this);
+  });
 }
 
 void Lock::throwException(Value&& exception) {
-  v8::HandleScope scope(v8Isolate);
-  v8Isolate->ThrowException(exception.getHandle(v8Isolate));
+  withinHandleScope([&] {
+    v8Isolate->ThrowException(exception.getHandle(*this));
+  });
+  throw JsExceptionThrown();
+}
+
+void Lock::throwException(const JsValue& exception) {
+  withinHandleScope([&] {
+    v8Isolate->ThrowException(exception);
+  });
   throw JsExceptionThrown();
 }
 
@@ -311,7 +332,7 @@ void throwInternalError(v8::Isolate* isolate, kj::StringPtr internalMessage) {
 }
 
 void throwInternalError(v8::Isolate* isolate, kj::Exception&& exception) {
-  KJ_IF_MAYBE(renderingError, kj::runCatchingExceptions([&]() {
+  KJ_IF_SOME(renderingError, kj::runCatchingExceptions([&]() {
     isolate->ThrowException(makeInternalError(isolate, kj::mv(exception)));
   })) {
     KJ_LOG(ERROR, "error rendering exception", renderingError);
@@ -323,8 +344,8 @@ void throwInternalError(v8::Isolate* isolate, kj::Exception&& exception) {
 static kj::String typeErrorMessage(TypeErrorContext c, const char* expectedType) {
   kj::String type;
 
-  KJ_IF_MAYBE(t, c.type) {
-    type = typeName(*t);
+  KJ_IF_SOME(t, c.type) {
+    type = typeName(t);
   }
 
   switch (c.kind) {
@@ -376,8 +397,8 @@ static kj::String typeErrorMessage(TypeErrorContext c, const char* expectedType)
 static kj::String unimplementedErrorMessage(TypeErrorContext c) {
   kj::String type;
 
-  KJ_IF_MAYBE(t, c.type) {
-    type = typeName(*t);
+  KJ_IF_SOME(t, c.type) {
+    type = typeName(t);
   }
 
   switch (c.kind) {
@@ -436,18 +457,19 @@ void throwTypeError(v8::Isolate* isolate,
 void throwTypeError(v8::Isolate* isolate,
     TypeErrorContext errorContext, const std::type_info& expectedType) {
   if (expectedType == typeid(Unimplemented)) {
-    isolate->ThrowException(v8::Exception::Error(
-        v8Str(isolate, unimplementedErrorMessage(errorContext))));
+    isolate->ThrowError(v8StrIntern(isolate, unimplementedErrorMessage(errorContext)));
     throw JsExceptionThrown();
   } else {
     throwTypeError(isolate, errorContext, typeName(expectedType).cStr());
   }
 }
 
+static constexpr auto kIllegalConstructorMessage = "Illegal constructor";
+
 void throwIllegalConstructor(const v8::FunctionCallbackInfo<v8::Value>& args) {
   auto isolate = args.GetIsolate();
-  kj::StringPtr message = "Illegal constructor";
-  isolate->ThrowException(v8::Exception::TypeError(v8Str(isolate, message)));
+  isolate->ThrowException(
+      v8::Exception::TypeError(v8StrIntern(isolate, kIllegalConstructorMessage)));
 }
 
 void throwTunneledException(v8::Isolate* isolate, v8::Local<v8::Value> exception) {
@@ -460,8 +482,15 @@ kj::Exception createTunneledException(v8::Isolate* isolate, v8::Local<v8::Value>
 }
 
 kj::Exception Lock::exceptionToKj(Value&& exception) {
-  v8::HandleScope scope(v8Isolate);
-  return createTunneledException(v8Isolate, exception.getHandle(v8Isolate));
+  return withinHandleScope([&] {
+    return createTunneledException(v8Isolate, exception.getHandle(*this));
+  });
+}
+
+kj::Exception Lock::exceptionToKj(const JsValue& exception) {
+  return withinHandleScope([&] {
+    return createTunneledException(v8Isolate, exception);
+  });
 }
 
 static kj::byte DUMMY = 0;
@@ -661,12 +690,12 @@ private:
 using ExternOneByteString = ExternString<v8::String::ExternalOneByteStringResource, char>;
 using ExternTwoByteString = ExternString<v8::String::ExternalStringResource, uint16_t>;
 
-v8::MaybeLocal<v8::String> newExternalOneByteString(Lock& js, kj::ArrayPtr<const char> buf) {
-  return ExternOneByteString::createExtern(js.v8Isolate, buf);
+v8::Local<v8::String> newExternalOneByteString(Lock& js, kj::ArrayPtr<const char> buf) {
+  return check(ExternOneByteString::createExtern(js.v8Isolate, buf));
 }
 
-v8::MaybeLocal<v8::String> newExternalTwoByteString(Lock& js, kj::ArrayPtr<const uint16_t> buf) {
-  return ExternTwoByteString::createExtern(js.v8Isolate, buf);
+v8::Local<v8::String> newExternalTwoByteString(Lock& js, kj::ArrayPtr<const uint16_t> buf) {
+  return check(ExternTwoByteString::createExtern(js.v8Isolate, buf));
 }
 
 }  // namespace workerd::jsg

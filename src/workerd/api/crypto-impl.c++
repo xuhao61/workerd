@@ -10,6 +10,7 @@
 #include <openssl/ec.h>
 #include <openssl/rsa.h>
 #include <openssl/crypto.h>
+#include <workerd/jsg/setup.h>
 
 namespace workerd::api {
 namespace {
@@ -56,10 +57,9 @@ void SslArrayDisposer::disposeImpl(void* firstElement, size_t elementSize, size_
   OPENSSL_free(firstElement);
 }
 
+// Call when an OpenSSL function returns an error code to convert that into an exception and
+// throw it.
 void throwOpensslError(const char* file, int line, kj::StringPtr code) {
-  // Call when an OpenSSL function returns an error code to convert that into an exception and
-  // throw it.
-
   // Some error codes that we know are the application's fault are converted to app errors.
   // We only attempt to convert the most-recent error in the queue this way, because other errors
   // in the queue might have been accidentally left there by previous, unrelated operations.
@@ -207,4 +207,20 @@ bool CryptoKey::Impl::equals(const kj::Array<kj::byte>& other) const {
   KJ_FAIL_REQUIRE("Unable to compare raw key material for this key");
 }
 
+ZeroOnFree::~ZeroOnFree() noexcept(false) {
+  OPENSSL_cleanse(inner.begin(), inner.size());
+}
+
+void checkPbkdfLimits(jsg::Lock& js, size_t iterations) {
+  auto& limits = Worker::Isolate::from(js).getLimitEnforcer();
+  KJ_IF_SOME(max, limits.checkPbkdfIterations(js, iterations)) {
+    JSG_FAIL_REQUIRE(DOMNotSupportedError,
+        kj::str("Pbkdf2 failed: iteration counts above ", max ," are not supported (requested ",
+                iterations, ")."));
+  }
+}
+
+void CryptoKey::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+  tracker.trackField("impl", impl);
+}
 }  // namespace workerd::api

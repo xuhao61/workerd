@@ -11,20 +11,21 @@
 
 namespace workerd::api {
 
-using kj::uint;
-
 class URLSearchParams;
 
+// Implements the URL interface as prescribed by: https://url.spec.whatwg.org/#api
+// This is the legacy, non-standard implementation.
 class URL: public jsg::Object {
-  // Implements the URL interface as prescribed by: https://url.spec.whatwg.org/#api
-
 public:
   static jsg::Ref<URL> constructor(kj::String url, jsg::Optional<kj::String> base);
 
-  kj::String getHref();
-  void setHref(const v8::PropertyCallbackInfo<void>& info, kj::String value);
   // Href is the only setter that throws. All others ignore errors, leaving their values
   // unchanged.
+  kj::String getHref();
+
+  // Href is the only setter that throws. All others ignore errors, leaving their values
+  // unchanged.
+  void setHref(const v8::PropertyCallbackInfo<void>& info, kj::String value);
 
   kj::String getOrigin();
 
@@ -63,7 +64,7 @@ public:
   JSG_RESOURCE_TYPE(URL, CompatibilityFlags::Reader flags) {
     // Previously, we were setting all properties as instance properties,
     // which broke the ability to subclass the URL object. With the
-    // feature flag set, we instead attach the properties to the
+    // compatibility flag set, we instead attach the properties to the
     // prototype.
     if (flags.getJsgPropertyOnPrototypeTemplate()) {
       JSG_PROTOTYPE_PROPERTY(href, getHref, setHref);
@@ -102,8 +103,32 @@ public:
     // Allow URLs which get coerced to strings in either constructor parameter
   }
 
-  explicit URL(kj::Url&& u);
   // Treat as private -- needs to be public for jsg::alloc<T>()...
+  explicit URL(kj::Url&& u);
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    size_t size = 0;
+    size += url->scheme.size();
+    KJ_IF_SOME(ui, url->userInfo) {
+      size += ui.username.size();
+      KJ_IF_SOME(pwd, ui.password) {
+        size += pwd.size();
+      }
+    }
+    size += url->host.size();
+    for (const auto& p: url->path) {
+      size += p.size();
+    }
+    for (const auto& param : url->query) {
+      size += param.name.size();
+      size += param.value.size();
+    }
+    KJ_IF_SOME(frag, url->fragment) {
+      size += frag.size();
+    }
+    tracker.trackFieldWithSize("inner", size);
+    tracker.trackField("searchParams", searchParams);
+  }
 
 private:
   friend class URLSearchParams;
@@ -163,10 +188,9 @@ public:
                 IteratorState,
                 valueIteratorNext)
 
-  void forEach(
-      jsg::V8Ref<v8::Function> callback,
-      jsg::Optional<jsg::Value> thisArg,
-      v8::Isolate* isolate);
+  void forEach(jsg::Lock&,
+               jsg::Function<void(kj::StringPtr, kj::StringPtr, jsg::Ref<URLSearchParams>)>,
+               jsg::Optional<jsg::Value>);
 
   kj::String toString();
 
@@ -213,12 +237,16 @@ public:
     }
   }
 
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackFieldWithSize("url", url->toString().size());
+  }
+
 private:
   kj::Own<URL::RefcountedUrl> url;
 
   static kj::Maybe<kj::Array<kj::String>> entryIteratorNext(jsg::Lock& js, IteratorState& state) {
     if (state.index >= state.parent->url->query.size()) {
-      return nullptr;
+      return kj::none;
     }
     auto& [key, value] = state.parent->url->query[state.index++];
     return kj::arr(kj::str(key), kj::str(value));
@@ -226,7 +254,7 @@ private:
 
   static kj::Maybe<kj::String> keyIteratorNext(jsg::Lock& js, IteratorState& state) {
     if (state.index >= state.parent->url->query.size()) {
-      return nullptr;
+      return kj::none;
     }
     auto& [key, value] = state.parent->url->query[state.index++];
     return kj::str(key);
@@ -234,7 +262,7 @@ private:
 
   static kj::Maybe<kj::String> valueIteratorNext(jsg::Lock& js, IteratorState& state) {
     if (state.index >= state.parent->url->query.size()) {
-      return nullptr;
+      return kj::none;
     }
     auto& [key, value] = state.parent->url->query[state.index++];
     return kj::str(value);

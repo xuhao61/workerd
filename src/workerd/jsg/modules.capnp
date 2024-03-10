@@ -14,8 +14,26 @@ struct Module {
   # Javascript module with its source code.
 
   name @0 :Text;
-  src @1 :Data;
+  union {
+    src @1 :Data; # JS / TS code
+    wasm @4 :Data; # Wasm module
+    data @5 :Data; # Binary data module
+    json @6 :Text; # Json module
+  }
+  tsDeclaration @3 :Text;
 
-  internal @2 :Bool;
-  # internal modules can't be imported by user's code
+  type @2 :ModuleType;
+}
+
+
+enum ModuleType {
+  bundle @0;
+  # Provided by the worker bundle. TODO: rename this to e.g., user?
+
+  builtin @1;
+  # Provided by the runtime and can be imported by the worker bundle.
+  # Can be overridden by modules in the worker bundle.
+
+  internal @2;
+  # Provided by runtime but can only imported by builtin modules.
 }

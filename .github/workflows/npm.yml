@@ -21,22 +21,12 @@ jobs:
       release_version: ${{ steps.echo.outputs.release_version }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: bazelbuild/setup-bazelisk@v2
-      - name: Cache
-        id: cache
-        uses: actions/cache@v2
-        with:
-          path: ~/bazel-disk-cache
-          key: capnp-cache
-      - name: build capnp
-        run: |
-          bazel build --disk_cache=~/bazel-disk-cache --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev @capnp-cpp//src/capnp:capnp_tool
+      - uses: actions/checkout@v4
       - id: echo
         run: |
-          echo "date=$(bazel-bin/external/capnp-cpp/src/capnp/capnp_tool eval src/workerd/io/compatibility-date.capnp supportedCompatibilityDate | tr -d '"')" >> $GITHUB_OUTPUT;
-          echo "version=${{ inputs.prerelease == false && '1' || '0'}}.$(bazel-bin/external/capnp-cpp/src/capnp/capnp_tool eval src/workerd/io/compatibility-date.capnp supportedCompatibilityDate | tr -d '-' | tr -d '"').${{ inputs.patch }}" >> $GITHUB_OUTPUT;
-          echo "release_version=1.$(bazel-bin/external/capnp-cpp/src/capnp/capnp_tool eval src/workerd/io/compatibility-date.capnp supportedCompatibilityDate | tr -d '-' | tr -d '"').0" >> $GITHUB_OUTPUT;
+          echo "date=$(cat src/workerd/io/supported-compatibility-date.txt)" >> $GITHUB_OUTPUT;
+          echo "version=${{ inputs.prerelease == false && '1' || '0'}}.$(cat src/workerd/io/supported-compatibility-date.txt | tr -d '-').${{ inputs.patch }}" >> $GITHUB_OUTPUT;
+          echo "release_version=1.$(cat src/workerd/io/supported-compatibility-date.txt | tr -d '-').0" >> $GITHUB_OUTPUT;
   publish-arch-specific:
     # if: github.repository_owner == 'cloudflare'
     name: Publish arch-specific packages to npm
@@ -47,12 +37,12 @@ jobs:
         arch: [darwin-64, darwin-arm64, linux-64, linux-arm64, windows-64]
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Use Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 18
 
@@ -61,7 +51,7 @@ jobs:
         env:
           WORKERD_VERSION: ${{ needs.version.outputs.version }}
           LATEST_COMPATIBILITY_DATE: ${{ needs.version.outputs.date }}
-      - uses: robinraju/release-downloader@v1.5
+      - uses: robinraju/release-downloader@v1.9
         with:
           tag: v${{ needs.version.outputs.release_version }}
           fileName: workerd-${{ matrix.arch }}.gz
@@ -88,12 +78,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Use Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 18
 

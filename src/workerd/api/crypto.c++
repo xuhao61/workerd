@@ -124,9 +124,9 @@ static kj::Maybe<const CryptoAlgorithm&> lookupAlgorithm(kj::StringPtr name) {
 
   auto iter = ALGORITHMS.find(CryptoAlgorithm {name});
   if (iter == ALGORITHMS.end()) {
-    // No such built-in algorithm, so fall back to checking if the ApiIsolate has a custom
+    // No such built-in algorithm, so fall back to checking if the Api has a custom
     // algorithm registered.
-    return Worker::ApiIsolate::current().getCryptoAlgorithm(name);
+    return Worker::Api::current().getCryptoAlgorithm(name);
   } else {
     return *iter;
   }
@@ -135,13 +135,12 @@ static kj::Maybe<const CryptoAlgorithm&> lookupAlgorithm(kj::StringPtr name) {
 // =======================================================================================
 // Helper functions
 
+// Throws InvalidAccessError if the key is incompatible with the given normalized algorithm name,
+// or if it doesn't support the given usage.
 void validateOperation(
     const CryptoKey& key,
     kj::StringPtr requestedName,
     CryptoKeyUsageSet usage) {
-  // Throws InvalidAccessError if the key is incompatible with the given normalized algorithm name,
-  // or if it doesn't support the given usage.
-  //
   // TODO(someday): Throw a NotSupportedError? The Web Crypto API spec says InvalidAccessError, but
   //   Web IDL says that's deprecated.
   //
@@ -156,9 +155,9 @@ void validateOperation(
       usage.name(), "\" does not match any usage listed in this CryptoKey.");
 }
 
+// Helper for `deriveKey()`. This private crypto operation is actually defined by the spec as
+// the "get key length" operation.
 kj::Maybe<uint32_t> getKeyLength(const SubtleCrypto::ImportKeyAlgorithm& derivedKeyAlgorithm) {
-  // Helper for `deriveKey()`. This private crypto operation is actually defined by the spec as
-  // the "get key length" operation.
 
   kj::StringPtr algName = derivedKeyAlgorithm.name;
 
@@ -189,10 +188,10 @@ kj::Maybe<uint32_t> getKeyLength(const SubtleCrypto::ImportKeyAlgorithm& derived
     }
     return length;
   } else if (*algIter == "HMAC") {
-    KJ_IF_MAYBE(length, derivedKeyAlgorithm.length) {
+    KJ_IF_SOME(length, derivedKeyAlgorithm.length) {
       // If the user requested a specific HMAC key length, honor it.
-      if (*length > 0) {
-        return *length;
+      if (length > 0) {
+        return length;
       }
       JSG_FAIL_REQUIRE(TypeError, "HMAC key length must be a non-zero unsigned long integer.");
     }
@@ -207,12 +206,12 @@ kj::Maybe<uint32_t> getKeyLength(const SubtleCrypto::ImportKeyAlgorithm& derived
     // operations. This is the entire reason getKeyLength() returns a Maybe<uint32_t> rather than a
     // uint32_t (and also why we do not throw an OperationError here but rather later on in
     // deriveBitsPbkdf2Impl()).
-    return nullptr;
+    return kj::none;
   }
 }
 
 auto webCryptoOperationBegin(
-    const char *operation, kj::StringPtr algorithm, kj::Maybe<kj::StringPtr> context = nullptr) {
+    const char *operation, kj::StringPtr algorithm, kj::Maybe<kj::StringPtr> context = kj::none) {
   // This clears all OpenSSL errors & errno at the start & returns a deferred evaluation to make
   // sure that, when the WebCrypto entrypoint completes, there are no errors hanging around.
   // Context is used for adding contextual information (e.g. the algorithm name of the key being
@@ -238,8 +237,8 @@ auto webCryptoOperationBegin(
       };
 
       kj::String stringifiedOperation;
-      KJ_IF_MAYBE(c, context) {
-        stringifiedOperation = kj::str(operation, "(", *c, ")");
+      KJ_IF_SOME(c, context) {
+        stringifiedOperation = kj::str(operation, "(", c, ")");
       } else {
         stringifiedOperation = kj::str(operation);
       }
@@ -257,7 +256,7 @@ auto webCryptoOperationBegin(
 template <typename T, typename = kj::EnableIf<kj::isSameType<
     kj::String, decltype(kj::instance<T>().name)>()>>
 [[gnu::always_inline]] auto webCryptoOperationBegin(const char *operation, const T& algorithm,
-    kj::Maybe<kj::StringPtr> context = nullptr) {
+    kj::Maybe<kj::StringPtr> context = kj::none) {
   return kj::defer([operation, algorithm = kj::str(algorithm.name), context] {
     // We need a copy of the algorithm name as this defer runs after the EncryptAlgorithm struct
     // is destroyed.
@@ -273,7 +272,7 @@ template <typename T, typename = kj::EnableIf<kj::isSameType<
 CryptoKey::CryptoKey(kj::Own<Impl> impl): impl(kj::mv(impl)) {}
 CryptoKey::~CryptoKey() noexcept(false) {}
 kj::StringPtr CryptoKey::getAlgorithmName() const { return impl->getAlgorithmName(); }
-CryptoKey::AlgorithmVariant CryptoKey::getAlgorithm() const { return impl->getAlgorithm(); }
+CryptoKey::AlgorithmVariant CryptoKey::getAlgorithm(jsg::Lock& js) const { return impl->getAlgorithm(js); }
 kj::StringPtr CryptoKey::getType() const { return impl->getType(); }
 bool CryptoKey::getExtractable() const { return impl->isExtractable(); }
 kj::Array<kj::StringPtr> CryptoKey::getUsages() const {
@@ -394,7 +393,7 @@ jsg::Promise<kj::OneOf<jsg::Ref<CryptoKey>, CryptoKeyPair>> SubtleCrypto::genera
     JSG_REQUIRE(algoImpl.generateFunc != nullptr, DOMNotSupportedError,
         "Unrecognized key generation algorithm \"", algorithm.name, "\" requested.");
 
-    auto cryptoKeyOrPair = algoImpl.generateFunc(algoImpl.name, kj::mv(algorithm), extractable,
+    auto cryptoKeyOrPair = algoImpl.generateFunc(js, algoImpl.name, kj::mv(algorithm), extractable,
                                                  keyUsages);
     KJ_SWITCH_ONEOF(cryptoKeyOrPair) {
       KJ_CASE_ONEOF(cryptoKey, jsg::Ref<CryptoKey>) {
@@ -430,7 +429,7 @@ jsg::Promise<jsg::Ref<CryptoKey>> SubtleCrypto::deriveKey(
 
     auto length = getKeyLength(derivedKeyAlgorithm);
 
-    auto secret = baseKey.impl->deriveBits(kj::mv(algorithm), length);
+    auto secret = baseKey.impl->deriveBits(js, kj::mv(algorithm), length);
 
     // TODO(perf): For conformance, importKey() makes a copy of `secret`. In this case we really
     //   don't need to, but rather we ought to call the appropriate CryptoKey::Impl::import*()
@@ -457,7 +456,7 @@ jsg::Promise<kj::Array<kj::byte>> SubtleCrypto::deriveBits(
 
   return js.evalNow([&] {
     validateOperation(baseKey, algorithm.name, CryptoKeyUsageSet::deriveBits());
-    return baseKey.impl->deriveBits(kj::mv(algorithm), length);
+    return baseKey.impl->deriveBits(js, kj::mv(algorithm), length);
   });
 }
 
@@ -469,7 +468,6 @@ jsg::Promise<kj::Array<kj::byte>> SubtleCrypto::wrapKey(jsg::Lock& js,
       key.getAlgorithmName());
 
   return js.evalNow([&] {
-    auto isolate = js.v8Isolate;
     auto algorithm = interpretAlgorithmParam(kj::mv(wrapAlgorithm));
 
     validateOperation(wrappingKey, algorithm.name, CryptoKeyUsageSet::wrapKey());
@@ -484,34 +482,17 @@ jsg::Promise<kj::Array<kj::byte>> SubtleCrypto::wrapKey(jsg::Lock& js,
 
     auto exportedKey = key.impl->exportKey(kj::mv(format));
 
-    kj::Array<kj::byte> bytes;
     KJ_SWITCH_ONEOF(exportedKey) {
       KJ_CASE_ONEOF(k, kj::Array<kj::byte>) {
-        bytes = kj::mv(k);
+        return wrappingKey.impl->wrapKey(kj::mv(algorithm), k.asPtr().asConst());
       }
       KJ_CASE_ONEOF(jwk, JsonWebKey) {
-        auto jwkValue = jwkHandler.wrap(js, kj::mv(jwk));
-        auto stringified = jsg::check(v8::JSON::Stringify(js.v8Context(), jwkValue));
-        kj::Vector<kj::byte> converted;
-
-        auto serializedLength = stringified->Utf8Length(isolate);
-        // The WebCrypto spec would seem to indicate we need to pad AES-KW here. However, I can't
-        // find any conformance test that fails if we don't pad. I can't find anywhere within
-        // Chromium that has padding either.
-
-        converted.resize(serializedLength);
-
-        auto written = stringified->WriteUtf8(isolate, converted.asPtr().asChars().begin(),
-            serializedLength, nullptr, v8::String::NO_NULL_TERMINATION);
-
-        converted.resize(written);
-
-        bytes = converted.releaseAsArray();
+        auto stringified = js.serializeJson(jwkHandler.wrap(js, kj::mv(jwk)));
+        return wrappingKey.impl->wrapKey(kj::mv(algorithm), stringified.asBytes().asConst());
       }
     }
 
-    auto unwrappedKey = bytes.asPtr().asConst();
-    return wrappingKey.impl->wrapKey(kj::mv(algorithm), unwrappedKey);
+    KJ_UNREACHABLE;
   });
 }
 
@@ -523,7 +504,6 @@ jsg::Promise<jsg::Ref<CryptoKey>> SubtleCrypto::unwrapKey(jsg::Lock& js, kj::Str
     const jsg::TypeHandler<JsonWebKey>& jwkHandler) {
   auto operation = __func__;
   return js.evalNow([&]() -> jsg::Ref<CryptoKey> {
-    auto isolate = js.v8Isolate;
     auto normalizedAlgorithm = interpretAlgorithmParam(kj::mv(unwrapAlgorithm));
     auto normalizedUnwrapAlgorithm = interpretAlgorithmParam(kj::mv(unwrappedKeyAlgorithm));
 
@@ -540,12 +520,10 @@ jsg::Promise<jsg::Ref<CryptoKey>> SubtleCrypto::unwrapKey(jsg::Lock& js, kj::Str
     ImportKeyData importData;
 
     if (format == "jwk") {
-      auto jsonJwk = jsg::v8Str(isolate, bytes.asChars());
+      auto jwkDict = js.parseJson(bytes.asChars());
 
-      auto jwkDict = jsg::check(v8::JSON::Parse(js.v8Context(), jsonJwk));
-
-      importData = JSG_REQUIRE_NONNULL(jwkHandler.tryUnwrap(js, jwkDict), DOMDataError,
-          "Missing \"kty\" field or corrupt JSON unwrapping key?");
+      importData = JSG_REQUIRE_NONNULL(jwkHandler.tryUnwrap(js, jwkDict.getHandle(js)),
+          DOMDataError, "Missing \"kty\" field or corrupt JSON unwrapping key?");
     } else {
       importData = kj::mv(bytes);
     }
@@ -596,8 +574,8 @@ jsg::Ref<CryptoKey> SubtleCrypto::importKeySync(
   } else if (format == "jwk") {
     JSG_REQUIRE(keyData.is<JsonWebKey>(), TypeError,
         "Import data provided for \"jwk\" import format must be a JsonWebKey.");
-    KJ_IF_MAYBE(ext, keyData.get<JsonWebKey>().ext) {
-      JSG_REQUIRE(*ext || !extractable,
+    KJ_IF_SOME(ext, keyData.get<JsonWebKey>().ext) {
+      JSG_REQUIRE(ext || !extractable,
           DOMDataError, "JWK ext field for \"", algorithm.name, "\" is set to false but "
           "extractable is true");
     }
@@ -617,7 +595,7 @@ jsg::Ref<CryptoKey> SubtleCrypto::importKeySync(
   //   importing (importKeyAesImpl handles AES-CTR, -CBC, and -GCM, for instance), so they should
   //   rely on this value to set the imported CryptoKey's name.
   auto cryptoKey = jsg::alloc<CryptoKey>(
-      algoImpl.importFunc(algoImpl.name, format, kj::mv(keyData),
+      algoImpl.importFunc(js, algoImpl.name, format, kj::mv(keyData),
                           kj::mv(algorithm), extractable, keyUsages));
 
   if (cryptoKey->getUsageSet().size() == 0) {
@@ -656,23 +634,18 @@ bool SubtleCrypto::timingSafeEqual(kj::Array<kj::byte> a, kj::Array<kj::byte> b)
 // =======================================================================================
 // Crypto implementation
 
-v8::Local<v8::ArrayBufferView> Crypto::getRandomValues(v8::Local<v8::ArrayBufferView> bufferView) {
+jsg::BufferSource Crypto::getRandomValues(jsg::BufferSource buffer) {
   // NOTE: TypeMismatchError is deprecated (obviated by TypeError), but the spec and W3C tests still
   //   expect a TypeMismatchError here.
-  JSG_REQUIRE(
-      bufferView->IsInt8Array() || bufferView->IsUint8Array() || bufferView->IsUint8ClampedArray()
-          || bufferView->IsInt16Array() || bufferView->IsUint16Array()
-          || bufferView->IsInt32Array() || bufferView->IsUint32Array()
-          || bufferView->IsBigInt64Array() || bufferView->IsBigUint64Array(),
-      DOMTypeMismatchError, "ArrayBufferView argument to getRandomValues() must be an "
-      "integer-typed view.");
-
-  auto buffer = jsg::asBytes(bufferView);
-  JSG_REQUIRE(buffer.size() <= 0x10000, DOMQuotaExceededError,
-      "getRandomValues() only accepts buffers of size <= 64K but provided ", buffer.size(),
-      " bytes.");
-  IoContext::current().getEntropySource().generate(buffer);
-  return bufferView;
+  JSG_REQUIRE(buffer.isIntegerType(),
+              DOMTypeMismatchError,
+              "ArrayBufferView argument to getRandomValues() must be an integer-typed view.");
+  JSG_REQUIRE(buffer.size() <= 0x10000,
+              DOMQuotaExceededError,
+              "getRandomValues() only accepts buffers of size <= 64K but provided ",
+              buffer.size(), " bytes.");
+  IoContext::current().getEntropySource().generate(buffer.asArrayPtr());
+  return kj::mv(buffer);
 }
 
 kj::String Crypto::randomUUID() {
@@ -727,9 +700,8 @@ kj::Promise<void> DigestStreamSink::write(const void* buffer, size_t size) {
 
 kj::Promise<void> DigestStreamSink::write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) {
   for (auto& piece : pieces) {
-    write(piece.begin(), piece.size());
+    co_await write(piece.begin(), piece.size());
   }
-  return kj::READY_NOW;
 }
 
 kj::Promise<void> DigestStreamSink::end() {
@@ -767,11 +739,11 @@ DigestStream::DigestStream(
         kj::heap<DigestStreamSink>(kj::mv(algorithm), kj::mv(fulfiller))),
       promise(kj::mv(promise)) {}
 
-jsg::Ref<DigestStream> DigestStream::constructor(Algorithm algorithm) {
+jsg::Ref<DigestStream> DigestStream::constructor(jsg::Lock& js, Algorithm algorithm) {
   auto paf = kj::newPromiseAndFulfiller<kj::Array<kj::byte>>();
 
-  auto jsPromise = IoContext::current().awaitIoLegacy(kj::mv(paf.promise));
-  jsPromise.markAsHandled();
+  auto jsPromise = IoContext::current().awaitIoLegacy(js, kj::mv(paf.promise));
+  jsPromise.markAsHandled(js);
 
   return jsg::alloc<DigestStream>(
       interpretAlgorithmParam(kj::mv(algorithm)),

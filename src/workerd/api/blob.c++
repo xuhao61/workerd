@@ -5,12 +5,12 @@
 #include "blob.h"
 #include "streams.h"
 #include "util.h"
+#include <workerd/util/mimetype.h>
 
 namespace workerd::api {
 
+// Concatenate an array of segments (parameter to Blob constructor).
 static kj::Array<byte> concat(jsg::Optional<Blob::Bits> maybeBits) {
-  // Concatenate an array of segments (parameter to Blob constructor).
-  //
   // TODO(perf): Make it so that a Blob can keep references to the input data rather than copy it.
   //   Note that we can't keep references to ArrayBuffers since they are mutable, but we can
   //   reference other Blobs in the input.
@@ -59,6 +59,11 @@ static kj::Array<byte> concat(jsg::Optional<Blob::Bits> maybeBits) {
 }
 
 static kj::String normalizeType(kj::String type) {
+  // This does not properly parse mime types. We have the new workerd::MimeType impl
+  // but that handles mime types a bit more strictly than this. Ideally we'd be able to
+  // switch over to it but there's a non-zero risk of breaking running code. We might need
+  // a compat flag to switch at some point but for now we'll keep this as it is.
+
   // https://www.w3.org/TR/FileAPI/#constructorBlob step 3 inexplicably insists that if the
   // type contains non-printable-ASCII characters we should discard it, and otherwise we should
   // lower-case it.
@@ -76,9 +81,9 @@ static kj::String normalizeType(kj::String type) {
 
 jsg::Ref<Blob> Blob::constructor(jsg::Optional<Bits> bits, jsg::Optional<Options> options) {
   kj::String type;  // note: default value is intentionally empty string
-  KJ_IF_MAYBE(o, options) {
-    KJ_IF_MAYBE(t, o->type) {
-      type = normalizeType(kj::mv(*t));
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(t, o.type) {
+      type = normalizeType(kj::mv(t));
     }
   }
 
@@ -116,12 +121,12 @@ jsg::Ref<Blob> Blob::slice(jsg::Optional<int> maybeStart, jsg::Optional<int> may
       normalizeType(kj::mv(type).orDefault(nullptr)));
 }
 
-jsg::Promise<kj::Array<kj::byte>> Blob::arrayBuffer(v8::Isolate* isolate) {
+jsg::Promise<kj::Array<kj::byte>> Blob::arrayBuffer(jsg::Lock& js) {
   // TODO(perf): Find a way to avoid the copy.
-  return jsg::resolvedPromise(isolate, kj::heapArray<byte>(data));
+  return js.resolvedPromise(kj::heapArray<byte>(data));
 }
-jsg::Promise<kj::String> Blob::text(v8::Isolate* isolate) {
-  return jsg::resolvedPromise(isolate, kj::str(data.asChars()));
+jsg::Promise<kj::String> Blob::text(jsg::Lock& js) {
+  return js.resolvedPromise(kj::str(data.asChars()));
 }
 
 class Blob::BlobInputStream final: public ReadableStreamSource {
@@ -130,36 +135,48 @@ public:
       : unread(blob->data),
         blob(kj::mv(blob)) {}
 
+  // Attempt to read a maximum of maxBytes from the remaining unread content of the blob
+  // into the given buffer. It is the caller's responsibility to ensure that buffer has
+  // enough capacity for at least maxBytes.
+  // The minBytes argument is ignored in this implementation of tryRead.
+  // The buffer must be kept alive by the caller until the returned promise is fulfilled.
+  // The returned promise is fulfilled with the actual number of bytes read.
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     size_t amount = kj::min(maxBytes, unread.size());
-    memcpy(buffer, unread.begin(), amount);
-    unread = unread.slice(amount, unread.size());
+    if (amount > 0) {
+      memcpy(buffer, unread.begin(), amount);
+      unread = unread.slice(amount, unread.size());
+    }
     return amount;
   }
 
+  // Returns the number of bytes remaining to be read for the given encoding if that
+  // encoding is supported. This implementation only supports StreamEncoding::IDENTITY.
   kj::Maybe<uint64_t> tryGetLength(StreamEncoding encoding) override {
     if (encoding == StreamEncoding::IDENTITY) {
       return unread.size();
     } else {
-      return nullptr;
+      return kj::none;
     }
   }
 
+  // Write all of the remaining unread content of the blob to output.
+  // If end is true, output.end() will be called once the write has been completed.
+  // Importantly, the WritableStreamSink must be kept alive by the caller until the
+  // returned promise is fulfilled.
   kj::Promise<DeferredProxy<void>> pumpTo(WritableStreamSink& output, bool end) override {
-    if (unread.size() == 0) {
-      return addNoopDeferredProxy(kj::READY_NOW);
-    }
+    if (unread.size() != 0) {
+      auto promise = output.write(unread.begin(), unread.size());
+      unread = nullptr;
 
-    auto promise = output.write(unread.begin(), unread.size());
-    unread = nullptr;
+      co_await promise;
 
-    if (end) {
-      promise = promise.then([&output]() { return output.end(); });
+      if (end) co_await output.end();
     }
 
     // We can't defer the write to the proxy stage since it depends on `blob` which lives in the
-    // isolate.
-    return addNoopDeferredProxy(kj::mv(promise));
+    // isolate, so we don't `KJ_CO_MAGIC BEGIN_DEFERRED_PROXYING`.
+    co_return;
   }
 
 private:
@@ -167,7 +184,7 @@ private:
   jsg::Ref<Blob> blob;
 };
 
-jsg::Ref<ReadableStream> Blob::stream(v8::Isolate* isolate) {
+jsg::Ref<ReadableStream> Blob::stream() {
   return jsg::alloc<ReadableStream>(
       IoContext::current(),
       kj::heap<BlobInputStream>(JSG_THIS));
@@ -179,16 +196,16 @@ jsg::Ref<File> File::constructor(jsg::Optional<Bits> bits,
     kj::String name, jsg::Optional<Options> options) {
   kj::String type;  // note: default value is intentionally empty string
   kj::Maybe<double> maybeLastModified;
-  KJ_IF_MAYBE(o, options) {
-    KJ_IF_MAYBE(t, o->type) {
-      type = normalizeType(kj::mv(*t));
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(t, o.type) {
+      type = normalizeType(kj::mv(t));
     }
-    maybeLastModified = o->lastModified;
+    maybeLastModified = o.lastModified;
   }
 
   double lastModified;
-  KJ_IF_MAYBE(m, maybeLastModified) {
-    lastModified = *m;
+  KJ_IF_SOME(m, maybeLastModified) {
+    lastModified = m;
   } else {
     lastModified = dateNow();
   }

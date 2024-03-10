@@ -26,13 +26,18 @@ public:
       JSG_READONLY_INSTANCE_PROPERTY(cron, getCron);
       JSG_METHOD(noRetry);
   }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("cron", cron);
+  }
+
 private:
   double scheduledTime;
   kj::String cron;
 };
 
+// Type used when calling a module-exported scheduled event handler.
 class ScheduledController final: public jsg::Object {
-  // Type used when calling a module-exported scheduled event handler.
 public:
   ScheduledController(jsg::Ref<ScheduledEvent> event)
       : event(kj::mv(event)) {}
@@ -45,6 +50,10 @@ public:
     JSG_READONLY_INSTANCE_PROPERTY(scheduledTime, getScheduledTime);
     JSG_READONLY_INSTANCE_PROPERTY(cron, getCron);
     JSG_METHOD(noRetry);
+  }
+
+  void visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
+    tracker.trackField("event", event);
   }
 
 private:
